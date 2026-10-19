@@ -1,0 +1,3 @@
+anthropic
+# optional, only needed for MCP servers:
+# mcp

@@ -1,0 +1,14 @@
+# local state: conversation history and long-term memory live here
+aios.db
+aios.db-journal
+workspace/
+
+# secrets
+.env
+.env.*
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
