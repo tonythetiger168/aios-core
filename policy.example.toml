@@ -1,0 +1,46 @@
+# aios-core policy example.
+#   python aios.py chat --agent notes --policy policy.example.toml     (needs Python 3.11+)
+# Tools not listed under `permissions` are invisible to the agent.
+
+[agents.notes]
+permissions = ["now", "read_file", "write_file", "list_files", "remember", "recall"]
+
+# write_file: only inside workspace/notes/. Writes there need no [y/N] prompt,
+# unless the run has read untrusted content (then a person is always asked).
+[agents.notes.scopes.write_file]
+paths = ["notes/*"]
+auto_paths = ["notes/*"]
+max_calls = 20          # per run
+
+# read_file: any path inside the workspace (shown for the syntax; '*' matches everything).
+[agents.notes.scopes.read_file]
+paths = ["*"]
+
+# ---------------------------------------------------------------------------------
+# For MCP server mode:  python aios.py serve --agent gateway --policy policy.example.toml
+# Over stdio nobody can answer a [y/N] prompt, so risky tools are refused unless a
+# path is pre-allowed with auto_paths (and only while the session has read nothing untrusted).
+[agents.gateway]
+permissions = ["now", "read_file", "list_files", "write_file"]
+
+[agents.gateway.scopes.write_file]
+paths = ["out/*"]
+auto_paths = ["out/*"]
+max_calls = 50          # per server session
+
+# ---------------------------------------------------------------------------------
+# For scheduled jobs:  python aios.py jobs add digest "Summarise inbox.txt into reports/" \
+#                          --schedule "daily 09:00" --agent reporter
+#                      python aios.py daemon --policy policy.example.toml --provider openai --model llama3.1
+# Jobs run unattended, so nobody can answer a [y/N] prompt: risky tools are refused unless a path
+# is pre-allowed here. A job that READS a file is "tainted"; auto_when_tainted = true says you accept
+# that injected text in what it read could write (only) into reports/. Without it, such a job can
+# read and report but not write.
+[agents.reporter]
+permissions = ["now", "read_file", "list_files", "write_file"]
+
+[agents.reporter.scopes.write_file]
+paths = ["reports/*"]
+auto_paths = ["reports/*"]
+auto_when_tainted = true
+max_calls = 5           # per run

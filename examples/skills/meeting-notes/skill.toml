@@ -1,0 +1,3 @@
+name = "meeting-notes"
+version = "1.0.0"
+description = "Turns rough meeting text into short, structured notes"
