@@ -867,6 +867,107 @@ class ScopeTests(HardeningBase):
         self.assertEqual(tool_log(k)[0]["status"], "denied")
 
 
+class ArgScopeTests(HardeningBase):
+    """Per-argument value rules (`args`) and value-based auto-approval (`auto_args`), e.g. for MCP tools."""
+
+    WEB = {"web__fetch": {"args": {"url": {"allow": ["https://docs.python.org/*"], "deny": ["*localhost*"],
+                                           "max_len": 60}}}}
+
+    def kernel_with_fetch(self, *calls, approver=None, untrusted_read=False):
+        steps = []
+        if untrusted_read:
+            steps.append(Resp([tool_use("read_file", {"path": "doc.txt"}, "r1")], "tool_use"))
+        steps += [Resp([tool_use("web__fetch", a, f"f{i}")], "tool_use") for i, a in enumerate(calls)]
+        k = self.kernel(*steps, Resp([text("ok")], "end_turn"), approver=approver)
+        self.fetched = []
+
+        @k.tools.register("web__fetch", "fetch a url", {"url": {"type": "string"}}, untrusted=True)
+        async def fetch(url=None, **kw):
+            self.fetched.append(url)
+            return "page"
+
+        k.needs_approval.add("web__*")  # like every MCP tool
+        return k
+
+    def test_validation_rejects_typos_and_bad_types(self):
+        for bad in ({"t": {"args": ["url"]}},
+                    {"t": {"args": {"url": ["https://*"]}}},  # rule must be a table
+                    {"t": {"args": {"url": {}}}},
+                    {"t": {"args": {"url": {"alow": ["x"]}}}},  # typo
+                    {"t": {"args": {"url": {"allow": "x"}}}},
+                    {"t": {"args": {"url": {"max_len": -1}}}},
+                    {"t": {"args": {"url": {"max_len": True}}}},
+                    {"t": {"auto_args": {"url": "https://*"}}},
+                    {"t": {"auto_args": {}}}):
+            with self.subTest(scope=bad):
+                with self.assertRaises(ValueError):
+                    aios.Agent("a", set(), scopes=bad)
+        aios.Agent("a", set(), scopes={"t": {"args": {"url": {"deny": [], "max_len": 0}},
+                                             "auto_args": {"url": ["x"]}}})
+
+    def test_value_rules(self):
+        rules = self.WEB["web__fetch"]["args"]
+        v = aios._arg_violation
+        self.assertIsNone(v(rules, {"url": "https://docs.python.org/3/library/"}))
+        self.assertIn("not allowed", v(rules, {"url": "https://evil.example/"}))
+        self.assertIn("not allowed", v(rules, {"url": "HTTPS://DOCS.PYTHON.ORG/x"}))  # allow is case-sensitive
+        self.assertIn("denied", v(rules, {"url": "https://docs.python.org/LocalHost"}))  # deny ignores case
+        self.assertIn("longer than", v(rules, {"url": "https://docs.python.org/" + "a" * 60}))
+        self.assertIn("required", v(rules, {}))
+        self.assertIsNone(v({"n": {"deny": ["0"]}}, {}))  # deny/max_len alone: a missing argument is fine
+        # lists are checked element by element, other values as JSON
+        self.assertIn("not allowed", v(rules, {"url": ["https://docs.python.org/a", "https://evil/"]}))
+        self.assertIn("denied", v({"force": {"deny": ["true"]}}, {"force": True}))
+        self.assertIsNone(v({"n": {"allow": ["[1-5]"]}}, {"n": 3}))
+        self.assertTrue(aios._args_match({"url": ["https://a/*"]}, {"url": "https://a/x"}))
+        self.assertFalse(aios._args_match({"url": ["https://a/*"]}, {}))
+        self.assertFalse(aios._args_match({"url": ["https://a/*"]}, {"url": ["https://a/x", "https://b/"]}))
+
+    async def test_args_scope_blocks_bad_values_even_with_approval(self):
+        async def yes(*a, **kw):
+            return True
+
+        k = self.kernel_with_fetch({"url": "https://evil.example/?q=secrets"},
+                                   {"url": "https://docs.python.org/3/"}, approver=yes)
+        await k._run(aios.Agent("a", {"web__fetch"}, scopes=self.WEB), "go")
+        self.assertEqual([e["status"] for e in tool_log(k)], ["denied", "ok"])
+        self.assertEqual(self.fetched, ["https://docs.python.org/3/"])
+
+    async def test_auto_args_skip_the_prompt_only_for_matching_values(self):
+        asked = []
+
+        async def no(agent, tool, args, **kw):
+            asked.append(args["url"])
+            return False
+
+        scopes = {"web__*": {"auto_args": {"url": ["https://docs.python.org/*"]}}}
+        k = self.kernel_with_fetch({"url": "https://docs.python.org/3/"}, {"url": "https://other.example/"},
+                                   approver=no)
+        await k._run(aios.Agent("a", {"web__fetch"}, scopes=scopes), "go")
+        self.assertEqual(self.fetched, ["https://docs.python.org/3/"])  # no prompt needed
+        self.assertEqual(asked, ["https://other.example/"])  # outside auto_args -> asked -> refused
+
+    async def test_auto_args_do_not_apply_to_tainted_runs_unless_accepted(self):
+        for accept in (False, True):
+            with self.subTest(auto_when_tainted=accept):
+                sc = {"auto_args": {"url": ["https://docs.python.org/*"]}}
+                if accept:
+                    sc["auto_when_tainted"] = True
+                k = self.kernel_with_fetch({"url": "https://docs.python.org/3/"}, untrusted_read=True)
+                await k._run(aios.Agent("a", {"read_file", "web__fetch"}, scopes={"web__fetch": sc}), "go")
+                self.assertEqual(tool_log(k)[-1]["status"], "ok" if accept else "denied")
+
+    async def test_auto_paths_and_auto_args_must_both_match(self):
+        scopes = {"write_file": {"auto_paths": ["notes/*"], "auto_args": {"content": ["safe*"]}}}
+        for path, content, ok in (("notes/a.txt", "safe text", True), ("notes/b.txt", "other", False),
+                                  ("c.txt", "safe text", False)):
+            with self.subTest(path=path, content=content):
+                k = self.kernel(Resp([tool_use("write_file", {"path": path, "content": content})], "tool_use"),
+                                Resp([text("ok")], "end_turn"))
+                await k._run(aios.Agent("a", {"write_file"}, scopes=scopes), "go")
+                self.assertEqual(tool_log(k)[0]["status"], "ok" if ok else "denied")
+
+
 class MemoryProvenanceTests(HardeningBase):
     def test_sources_and_timestamps_are_recorded(self):
         st = aios.Store(":memory:")
@@ -1020,6 +1121,17 @@ class PolicyFileTests(unittest.TestCase):
             aios.load_policy(self.write('[agents.x]\npermissions = "write_file"\n'))
         with self.assertRaises(ValueError):  # broken TOML is a ValueError too
             aios.load_policy(self.write("[agents.x\n"))
+
+    def test_loads_argument_rules(self):
+        pol = aios.load_policy(self.write(
+            '[agents.web]\npermissions = ["web__*"]\n'
+            '[agents.web.scopes."web__fetch"]\nauto_args = { url = ["https://docs.python.org/*"] }\n'
+            '[agents.web.scopes."web__fetch".args.url]\nallow = ["https://*"]\nmax_len = 500\n'))
+        sc = pol["web"]["scopes"]["web__fetch"]
+        self.assertEqual(sc["args"]["url"]["max_len"], 500)
+        self.assertEqual(sc["auto_args"]["url"], ["https://docs.python.org/*"])
+        with self.assertRaises(ValueError):
+            aios.load_policy(self.write('[agents.x.scopes.t.args.url]\nallowed = ["a"]\n'))
 
     def test_shipped_example_is_valid(self):
         pol = aios.load_policy(str(Path(__file__).resolve().parent.parent / "policy.example.toml"))
