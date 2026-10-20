@@ -15,7 +15,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import uuid
 import fnmatch
+import functools
 import posixpath
 import re
 import urllib.error
@@ -37,6 +39,9 @@ WORKSPACE = Path("./workspace").resolve()
 DB_PATH = "aios.db"
 HISTORY_LIMIT = 40  # messages reloaded per agent
 MCP_MAX_RESULT = 20_000  # chars kept from one MCP tool result
+SANDBOXES = ("auto", "process", "docker", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
+SANDBOX_CHOICE = None  # set by the CLI's --sandbox; else $AIOS_SANDBOX; else "auto"
+DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself
 FILE_MAX_CHARS = 50_000  # max chars read/written by file tools
 LIST_MAX = 200  # max entries returned by list_files
 RUN_ENTRY = "(run)"  # audit tool name for per-run summaries
@@ -751,7 +756,15 @@ class Kernel:
 
 
 # ---- Sandbox: untrusted code runs in an isolated, resource-limited subprocess ----
+def _clip(text: str, max_out: int) -> str:
+    return text[:max_out] + "\n...(truncated)" if len(text) > max_out else text
+
+
 class Sandbox:
+    """run_python as a local child process: rlimits + no network on Linux, timeout only on Windows.
+    The code can still read whatever files the user can read."""
+    name = "process"
+
     def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000):
         self.timeout, self.cpu_s, self.mem = timeout, cpu_s, mem_mb * 1024 * 1024
         self.max_out = max_out
@@ -803,26 +816,104 @@ class Sandbox:
             except asyncio.TimeoutError:
                 await self._kill(proc)
                 return f"killed: timeout after {self.timeout}s"
-            text = out.decode(errors="replace")
-            if len(text) > self.max_out:
-                text = text[: self.max_out] + "\n...(truncated)"
-            return f"exit={proc.returncode}\n{text}"
+            return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
+
+
+class DockerSandbox:
+    """run_python in a throwaway container: no network, no host files (nothing is mounted), read-only
+    root with a small /tmp, unprivileged user, all capabilities dropped, memory/CPU/process caps.
+    Works the same on Linux, macOS and Windows (Docker Desktop with Linux containers)."""
+    name = "docker"
+
+    def __init__(self, image=DOCKER_IMAGE, timeout=10, cpus=1.0, mem_mb=256, pids=64,
+                 max_out=10_000, docker="docker"):
+        self.image, self.timeout, self.cpus, self.mem_mb = image, timeout, cpus, mem_mb
+        self.pids, self.max_out, self.docker = pids, max_out, docker
+
+    @staticmethod
+    @functools.lru_cache(maxsize=8)
+    def unavailable(image=DOCKER_IMAGE, docker="docker") -> str | None:
+        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image."""
+        exe = shutil.which(docker)
+        if not exe:
+            return "docker is not installed (or not on PATH)"
+        try:
+            r = subprocess.run([exe, "image", "inspect", "--format", "{{.Os}}", image],
+                               capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f"docker did not answer: {e}"
+        if r.returncode != 0:
+            err = (r.stderr or "").strip().splitlines()
+            if err and "no such image" not in err[0].lower():
+                return f"docker is not usable: {err[0][:200]}"
+            return f"image {image} is not present: run `docker pull {image}` first"
+        if r.stdout.strip() != "linux":
+            return f"image {image} is not a Linux image (switch Docker Desktop to Linux containers)"
+        return None
+
+    def command(self, container: str) -> list[str]:
+        return [self.docker, "run", "--rm", "-i", "--name", container, "--pull", "never",
+                "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
+                "--memory", f"{self.mem_mb}m", "--memory-swap", f"{self.mem_mb}m",
+                "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--user", "65534:65534", "--workdir", "/tmp", "--env", "HOME=/tmp",
+                self.image, "python", "-I", "-"]  # code arrives on stdin: nothing is mounted
+
+    async def run_python(self, code: str) -> str:
+        container = f"aios-sbx-{uuid.uuid4().hex[:12]}"
+        proc = await asyncio.create_subprocess_exec(
+            *self.command(container), stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(code.encode()), self.timeout)
+        except asyncio.TimeoutError:  # killing the CLI would leave the container running
+            killer = await asyncio.create_subprocess_exec(
+                self.docker, "kill", container,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await killer.wait()
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            return f"killed: timeout after {self.timeout}s"
+        return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
+
+
+def make_sandbox(choice: str | None = None):
+    """The run_python backend for `choice` (see SANDBOXES), or None when run_python stays off.
+    An explicit "docker" that cannot run raises RuntimeError (asked-for isolation must not degrade)."""
+    choice = choice or SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX") or "auto"
+    if choice not in SANDBOXES:
+        raise ValueError(f"sandbox must be one of {', '.join(SANDBOXES)}, not {choice!r}")
+    weak_ok = os.environ.get("AIOS_ALLOW_WEAK_SANDBOX") == "1"
+    if choice == "off":
+        return None
+    if choice == "docker":
+        why = DockerSandbox.unavailable()
+        if why:
+            raise RuntimeError(f"--sandbox docker: {why}")
+        return DockerSandbox()
+    if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable():
+        return DockerSandbox()  # the only real isolation on Windows
+    if IS_WINDOWS and not weak_ok:  # "process" on Windows is timeout-only: opt-in
+        print("[aios] run_python disabled on Windows (no real sandbox). Use --sandbox docker "
+              f"(after `docker pull {DOCKER_IMAGE}`), WSL2, or set AIOS_ALLOW_WEAK_SANDBOX=1 to enable "
+              "it unsafely.", file=sys.stderr)
+        return None
+    return Sandbox()
 
 
 # ---- Built-in tools ----
-def install_builtin_tools(k: Kernel):
-    # Windows has no real sandbox here, so run_python is opt-in there.
-    if not IS_WINDOWS or os.environ.get("AIOS_ALLOW_WEAK_SANDBOX") == "1":
-        sandbox = Sandbox()
-
-        @k.tools.register("run_python", "Run Python code in an isolated sandbox. "
-                          "10s timeout. Print results to stdout.",
+def install_builtin_tools(k: Kernel, sandbox: str | None = None):
+    """sandbox: run_python backend (see make_sandbox); default --sandbox / $AIOS_SANDBOX / auto."""
+    box = make_sandbox(sandbox)
+    if box is not None:
+        @k.tools.register("run_python", "Run Python code in an isolated sandbox (standard library "
+                          "only, no network, no access to your files). "
+                          f"{box.timeout}s timeout. Print results to stdout.",
                           {"code": {"type": "string"}}, required=["code"])
         async def run_python(code: str):
-            return await sandbox.run_python(code)
-    else:
-        print("[aios] run_python disabled on Windows (no real sandbox). "
-              "Use WSL2/Docker, or set AIOS_ALLOW_WEAK_SANDBOX=1 to enable it unsafely.", file=sys.stderr)
+            return await box.run_python(code)
     @k.tools.register("now", "Get the current local date and time.", {})
     async def now():
         return datetime.now().isoformat(timespec="seconds")
@@ -1471,8 +1562,20 @@ def cli():
     jb.add_argument("--agent", default="main", help="add: policy section whose permissions the job gets")
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
-    sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
+    dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
+    for p in (c, sv, dm, dmo):
+        p.add_argument("--sandbox", choices=SANDBOXES,
+                       help="run_python backend: process (local child process), docker (throwaway "
+                            f"container, needs `docker pull {DOCKER_IMAGE}`), off, or auto (default: "
+                            "process; docker on Windows when available). Also $AIOS_SANDBOX")
     a = ap.parse_args()
+    global SANDBOX_CHOICE
+    SANDBOX_CHOICE = getattr(a, "sandbox", None)
+    choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX")
+    if choice and choice not in SANDBOXES:
+        ap.error(f"AIOS_SANDBOX must be one of {', '.join(SANDBOXES)}, not {choice!r}")
+    if choice == "docker" and (why := DockerSandbox.unavailable()):  # fail before starting anything
+        ap.error(f"--sandbox docker: {why}")
     if a.cmd == "demo":
         return asyncio.run(demo())
     if a.cmd == "audit":

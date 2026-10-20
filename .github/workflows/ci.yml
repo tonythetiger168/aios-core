@@ -19,4 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt
+      - name: Prepare the Docker sandbox tests (Linux runners only)
+        if: runner.os == 'Linux'
+        run: |
+          docker pull python:3.12-slim
+          echo "AIOS_TEST_DOCKER=1" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
