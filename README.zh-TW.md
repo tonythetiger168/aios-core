@@ -20,7 +20,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇兩種後端：
   - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。
-  - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。Linux、macOS、Windows（Docker Desktop，Linux 容器）行為一致。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
+  - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台。目前只有 Ubuntu 有 real-Docker CI 證據。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
@@ -153,7 +153,8 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 - 技能信任的是**你審查過的內容**，不是作者。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
 - `serve` 沒有互動式審批（stdio 是協議通道）。請用 `auto_paths` 預先允許路徑，或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
-- **`process` 沙箱不是完整的安全邊界**：Linux 上限制了 CPU、記憶體與網路，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與主機共用核心，所以它是堅固的圍欄而不是虛擬機：核心或 Docker 的逃逸漏洞仍能突破它。每次呼叫都要啟動一個容器（約一秒），而且只有標準函式庫。
+- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
+- Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權。
 - 預算在每次模型呼叫之後才檢查，所以單次呼叫可能略微超出上限。費用上限需要你自己提供單價（價格會變，因此不內建預設值）。預算是每次執行的上限，不是每日上限。

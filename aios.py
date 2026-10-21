@@ -822,13 +822,15 @@ class Sandbox:
 class DockerSandbox:
     """run_python in a throwaway container: no network, no host files (nothing is mounted), read-only
     root with a small /tmp, unprivileged user, all capabilities dropped, memory/CPU/process caps.
-    Works the same on Linux, macOS and Windows (Docker Desktop with Linux containers)."""
+    Requires a trusted Docker daemon running Linux containers. Platform enforcement varies;
+    this is a container boundary, not microVM isolation."""
     name = "docker"
 
     def __init__(self, image=DOCKER_IMAGE, timeout=10, cpus=1.0, mem_mb=256, pids=64,
-                 max_out=10_000, docker="docker"):
+                 max_out=10_000, docker="docker", cleanup_timeout=3):
         self.image, self.timeout, self.cpus, self.mem_mb = image, timeout, cpus, mem_mb
         self.pids, self.max_out, self.docker = pids, max_out, docker
+        self.cleanup_timeout = cleanup_timeout
 
     @staticmethod
     @functools.lru_cache(maxsize=8)
@@ -852,7 +854,9 @@ class DockerSandbox:
         return None
 
     def command(self, container: str) -> list[str]:
-        return [self.docker, "run", "--rm", "-i", "--name", container, "--pull", "never",
+        # Create separately: once acknowledged, a delayed start cannot create a new container
+        # after cleanup. A timed-out create has an unknown outcome and is never called 'killed'.
+        return [self.docker, "create", "--rm", "-i", "--name", container, "--pull", "never",
                 "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
                 "--memory", f"{self.mem_mb}m", "--memory-swap", f"{self.mem_mb}m",
                 "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
@@ -860,23 +864,115 @@ class DockerSandbox:
                 "--user", "65534:65534", "--workdir", "/tmp", "--env", "HOME=/tmp",
                 self.image, "python", "-I", "-"]  # code arrives on stdin: nothing is mounted
 
-    async def run_python(self, code: str) -> str:
-        container = f"aios-sbx-{uuid.uuid4().hex[:12]}"
+    @staticmethod
+    async def _read_limited(stream, limit):
+        """Drain the pipe without retaining unbounded output (limit is UTF-8 bytes)."""
+        kept = bytearray()
+        truncated = False
+        while chunk := await stream.read(8192):
+            room = max(0, limit - len(kept))
+            kept.extend(chunk[:room])
+            truncated |= len(chunk) > room
+        return kept.decode(errors="replace") + ("\n...(truncated)" if truncated else "")
+
+    async def _invoke(self, args, data=b"", timeout=None, limit=4096):
         proc = await asyncio.create_subprocess_exec(
-            *self.command(container), stdin=asyncio.subprocess.PIPE,
+            *args, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+
+        async def send():
+            try:
+                proc.stdin.write(data)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                proc.stdin.close()
+
+        done = asyncio.gather(self._read_limited(proc.stdout, limit), send(), proc.wait())
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(code.encode()), self.timeout)
-        except asyncio.TimeoutError:  # killing the CLI would leave the container running
-            killer = await asyncio.create_subprocess_exec(
-                self.docker, "kill", container,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            await killer.wait()
-            if proc.returncode is None:
-                proc.kill()
-            await proc.wait()
+            out, _, rc = await asyncio.wait_for(asyncio.shield(done), timeout)
+            return rc, out
+        finally:
+            if not done.done():
+                if proc.returncode is None:
+                    try:
+                        proc.kill()  # only the local CLI; container cleanup is separate
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(done), self.cleanup_timeout)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    done.cancel()
+                    await asyncio.gather(done, return_exceptions=True)
+
+    async def _cleanup(self, container):
+        errors = []
+        for action in (["kill", container], ["rm", "--force", container]):
+            try:
+                rc, out = await self._invoke([self.docker, *action], timeout=self.cleanup_timeout)
+                if rc:
+                    errors.append(f"{action[0]}: {out[:200]}")
+            except (OSError, asyncio.TimeoutError) as e:
+                errors.append(f"{action[0]}: {type(e).__name__}")
+        try:
+            rc, out = await self._invoke(
+                [self.docker, "container", "inspect", container], timeout=self.cleanup_timeout)
+            if rc and ("no such container" in out.lower() or "no such object" in out.lower()):
+                return  # absence verified; --rm may already have removed it
+            errors.append(f"inspect: {out[:200]}")
+        except (OSError, asyncio.TimeoutError) as e:
+            errors.append(f"inspect: {type(e).__name__}")
+        raise RuntimeError(f"Docker cleanup unconfirmed for {container}: {'; '.join(errors)}")
+
+    async def run_python(self, code: str) -> str:
+        container = f"aios-sbx-{uuid.uuid4().hex}"
+        created = False
+        failure = None
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        try:
+            rc, out = await self._invoke(self.command(container), timeout=self.timeout)
+            if rc:
+                return f"exit={rc}\n{out}"
+            created = True
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            rc, out = await self._invoke(
+                [self.docker, "start", "--attach", "--interactive", container], code.encode(),
+                timeout=remaining, limit=self.max_out)
+            return f"exit={rc}\n{out}"
+        except asyncio.TimeoutError:
+            if not created:
+                raise RuntimeError(f"Docker create timed out; outcome unknown for {container}. "
+                                   "Check the daemon for a delayed container creation.")
             return f"killed: timeout after {self.timeout}s"
-        return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
+        except BaseException as e:
+            failure = e
+            if not created and isinstance(e, asyncio.CancelledError):
+                print(f"[sandbox] Docker create cancelled; outcome unknown for {container}. "
+                      "Check the daemon for a delayed container creation.", file=sys.stderr)
+            raise
+        finally:
+            # Complete bounded cleanup even if the caller cancels again during teardown.
+            cleanup = asyncio.create_task(self._cleanup(container))
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            try:
+                cleanup.result()
+            except Exception as e:
+                if isinstance(failure, asyncio.CancelledError) or cancelled:
+                    print(f"[sandbox] {e}", file=sys.stderr)
+                else:
+                    raise
+            if cancelled:
+                raise asyncio.CancelledError
 
 
 def make_sandbox(choice: str | None = None):
@@ -908,8 +1004,13 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
     """sandbox: run_python backend (see make_sandbox); default --sandbox / $AIOS_SANDBOX / auto."""
     box = make_sandbox(sandbox)
     if box is not None:
-        @k.tools.register("run_python", "Run Python code in an isolated sandbox (standard library "
-                          "only, no network, no access to your files). "
+        if box.name == "docker":
+            isolation = ("Docker Linux container; requests no network and no host directory mounts. "
+                         "Isolation depends on the Docker daemon and platform; not a microVM. ")
+        else:
+            network = "network namespace enabled" if box.net_isolated else "network NOT isolated"
+            isolation = f"Local process; can read files accessible to this user; {network}. "
+        @k.tools.register("run_python", "Run Python code. " + isolation +
                           f"{box.timeout}s timeout. Print results to stdout.",
                           {"code": {"type": "string"}}, required=["code"])
         async def run_python(code: str):
