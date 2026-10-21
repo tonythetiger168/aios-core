@@ -76,6 +76,27 @@ class GatewayTests(WorkspaceCase):
                 self.assertIn("permission denied", out)
         self.assertFalse((aios.WORKSPACE / "x").exists())
 
+    async def test_auto_args_pre_allow_values_over_stdio(self):
+        gw = self.gateway(perms=["web__fetch"],
+                          scopes={"web__fetch": {"auto_args": {"url": ["https://docs.python.org/*"]}}})
+        fetched = []
+
+        @gw.k.tools.register("web__fetch", "fetch", {"url": {"type": "string"}}, untrusted=True)
+        async def fetch(url):
+            fetched.append(url)
+            return "page"
+
+        gw.k.needs_approval.add("web__fetch")  # like every MCP tool
+        out, err = await gw.call("web__fetch", {"url": "https://evil.example/"})
+        self.assertTrue(err)
+        self.assertIn("auto_args", out)  # the hint names the fix
+        out, err = await gw.call("web__fetch", {"url": "https://docs.python.org/3/"})
+        self.assertFalse(err)
+        self.assertTrue(gw.agent.session_tainted)  # what it fetched is untrusted
+        out, err = await gw.call("web__fetch", {"url": "https://docs.python.org/3/x"})
+        self.assertTrue(err)  # tainted session: pre-allowed values no longer apply
+        self.assertEqual(fetched, ["https://docs.python.org/3/"])
+
     async def test_risky_tool_without_prescope_is_refused_with_a_hint(self):
         gw = self.gateway(perms=["write_file"])
         out, err = await gw.call("write_file", {"path": "a.txt", "content": "x"})
