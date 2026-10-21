@@ -18,13 +18,15 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
-- **沙箱程式執行**（`run_python`）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。Windows 預設停用。
+- **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇兩種後端：
+  - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。
+  - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台。目前只有 Ubuntu 有 real-Docker CI 證據。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
-- **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
+- **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策（見下）。
 - **技能：摘要固定與掃描**：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
@@ -49,6 +51,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # 接上 MCP 伺服
 python aios.py chat --provider openai --model llama3.1   # 用 Ollama 的本機模型
 python aios.py chat --max-tokens 20000 --max-steps 6     # 每次執行的硬性上限
 python aios.py chat --policy policy.example.toml --agent notes   # 每個代理的權限與路徑範圍
+python aios.py chat --sandbox docker          # run_python 改在用完即丟的容器裡執行（需先 `docker pull python:3.12-slim`）
 python aios.py chat --skill examples/skills/meeting-notes        # 載入你已固定的技能（見「技能」）
 python aios.py chat --embed-model nomic-embed-text               # 同時依語意搜尋記憶（需先 `ollama pull nomic-embed-text`）
 python aios.py chat --auto-approve          # 乾淨的執行略過 [y/N] 詢問（不安全）
@@ -137,7 +140,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
  你 ──> CLI ──> Kernel ──┬─> Claude API（工具呼叫迴圈，逐 agent 權限）
                          ├─> ToolRegistry ──> 內建工具 / MCP 伺服器
                          ├─> Store（SQLite）：歷史、長期事實
-                         └─> Sandbox：子行程 + rlimits + 無網路
+                         └─> Sandbox：子行程 + rlimits + 無網路，或 Docker 容器
 ```
 
 ## 內建工具
@@ -147,21 +150,22 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 | `now` | 目前本地日期與時間 |
 | `read_file`／`write_file`／`list_files` | 僅限工作區的檔案存取 |
 | `remember`／`recall`／`list_facts` | 每個 agent 各自的長期記憶 |
-| `run_python` | 沙箱化 Python（Linux；Windows 需自行啟用） |
+| `run_python` | 沙箱化 Python（`--sandbox process` 或 `docker`） |
 
 ## 安全現況
 
 目前**尚未**做到的事，如實列出：
 
 - **提示注入防禦只做到一部分。** 標記只是請模型守規矩；真正的保護是污染政策加範圍限制，它們能阻止「已被劫持的模型」在沒有人的情況下行動。但它**擋不住**不看提示就按 `y` 的人、只是誤導回答內容（沒有用到工具）的文字，或會說謊的惡意工具。我們的測試集模擬的是最壞情況（模型會服從所有注入的指令）；真實模型表現各異，我們還沒有量測。
-- 範圍限制目前只懂工作區路徑與呼叫次數，還沒有網路或參數值規則，MCP 工具也還是全有或全無。
+- 參數規則是針對頂層參數文字的萬用字元比對，不是解析器：`*` 也會比對到 `/`，所以請寫 `https://host/*`，不要寫 `https://host*`（它會比對到 `https://host.evil.com`）。它檢查的是工具「被要求做什麼」，不是實際做了什麼（例如 fetch 仍可能跟隨重新導向）。`allow` 區分大小寫，`deny` 不區分。目前仍沒有網路層級的對外連線控制。
 - 定時任務是最危險的執行方式：無人值守，異常行為不會有人當場發現。請盡量讓任務唯讀，把寫入限制在單一輸出資料夾，並偶爾看看 `aios audit`。`auto_when_tainted` 是刻意拿安全換實用。時間為本地時間（遇到夏令時間切換時，每日任務可能偏移一小時一次）。守護程式只是一個行程：它掛掉，任務就會停擺，直到你重新啟動。
 - 記憶檢索只涵蓋已儲存的記憶（不含對話歷史）。向量檢索會把每條記憶的文字送到你設定的嵌入伺服器：私人記憶請用本機的。它只用替身伺服器測過，還沒有用真實的 Ollama 或 OpenAI 端點試過；關鍵字檢索不需要任何設定。
 - 技能信任的是**你審查過的內容**，不是作者。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
-- `serve` 沒有互動式審批（stdio 是協議通道）。請用 `auto_paths` 預先允許路徑，或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
+- `serve` 沒有互動式審批（stdio 是協議通道）。請用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
-- **沙箱不是完整的安全邊界**：Linux 上限制了 CPU、記憶體與網路，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 WSL2、Docker 或 microVM。
-- **Windows**：`run_python` 預設停用（只有逾時的隔離並不安全）。可設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用。
+- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
+- Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
+- **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權。
 - 預算在每次模型呼叫之後才檢查，所以單次呼叫可能略微超出上限。費用上限需要你自己提供單價（價格會變，因此不內建預設值）。預算是每次執行的上限，不是每日上限。
 - 本機模型在工具使用與抵禦提示詞注入上，都比前沿模型弱很多，請保持人工審批開啟。
@@ -190,8 +194,8 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 | 階段 | 時間 | 目標 | 完成標準 |
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
-| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍 · ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | 多 agent 與 A2A · ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動觸發（webhook 尚未）· 本機 Web 控制台 · 可插拔沙箱後端（WSL2／Docker／microVM） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
+| **P2 擴展** | 第 3–4 月 | 多 agent 與 A2A · ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動觸發（webhook 尚未）· 本機 Web 控制台 · 可插拔沙箱後端（✅ Docker；microVM 尚未） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

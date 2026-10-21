@@ -44,3 +44,21 @@ paths = ["reports/*"]
 auto_paths = ["reports/*"]
 auto_when_tainted = true
 max_calls = 5           # per run
+
+# ---------------------------------------------------------------------------------
+# Argument rules: limit the VALUES a tool may be called with. Useful for MCP tools, which have no
+# workspace path. Start with: python aios.py chat --agent researcher --policy policy.example.toml \
+#                                --mcp "web=<command for your fetch MCP server>"
+[agents.researcher]
+permissions = ["now", "web__fetch"]
+
+[agents.researcher.scopes."web__fetch"]
+max_calls = 10
+# No [y/N] prompt for these URLs (clean runs only, like auto_paths). Write host/* rather than
+# host*: '*' matches anything, so "https://docs.python.org*" would also match docs.python.org.evil.com
+auto_args = { url = ["https://docs.python.org/*"] }
+
+[agents.researcher.scopes."web__fetch".args.url]
+allow = ["https://*"]                                       # case-sensitive; an allowed argument must be given
+deny = ["*localhost*", "*127.0.0.1*", "*169.254.169.254*"]  # ignores case
+max_len = 2000

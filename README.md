@@ -18,13 +18,15 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
-- **Sandboxed code execution** (`run_python`): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces). Disabled by default on Windows.
+- **Sandboxed code execution** (`run_python`), two backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
+  - `process` (default on Linux/macOS): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces).
+  - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
 - **MCP client**: attach stdio MCP servers; their tools are registered as `<server>__<tool>` and are *not* granted to agents unless you allow them.
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
 - **Budgets**: per-run limits on model calls (`--max-steps`), tokens (`--max-tokens`) and cost (`--max-cost` with `--price-in/--price-out`). A run that hits a limit stops *before* running more tools and says why. Each run's usage is written to the audit log.
 - **Human approval**: `write_file`, `run_python` and every MCP tool ask you `[y/N]` before running. With no approver configured (e.g. `demo`, library use) they are refused. `--auto-approve` turns the prompt off; unsafe.
 - **Untrusted-content tagging + taint policy**: output of `read_file`, `list_files`, `run_python` and every MCP tool is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
-- **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
+- **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Argument rules (`args`) allow or deny values of any argument with glob patterns and a length cap, so MCP tools are no longer all-or-nothing (for example a fetch tool limited to `https://docs.python.org/*`), and `auto_args` skips the prompt for pre-approved values the same way `auto_paths` does for paths. Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
 - **Skills with digest pinning and a scanner**: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
@@ -49,6 +51,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # attach an MCP ser
 python aios.py chat --provider openai --model llama3.1   # local model via Ollama (http://localhost:11434/v1)
 python aios.py chat --max-tokens 20000 --max-steps 6     # hard limits per run
 python aios.py chat --policy policy.example.toml --agent notes   # per-agent permissions and path scopes
+python aios.py chat --sandbox docker          # run_python in a throwaway container (after `docker pull python:3.12-slim`)
 python aios.py chat --skill examples/skills/meeting-notes        # load a skill you pinned (see Skills)
 python aios.py chat --embed-model nomic-embed-text               # also search notes by meaning (needs `ollama pull nomic-embed-text`)
 python aios.py chat --auto-approve          # skip the [y/N] prompts for clean runs (unsafe)
@@ -137,7 +140,7 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
  you ──> CLI ──> Kernel ──┬─> Claude API (tool-use loop, per-agent permissions)
                           ├─> ToolRegistry ──> built-in tools / MCP servers
                           ├─> Store (SQLite): history, long-term facts
-                          └─> Sandbox: subprocess + rlimits + no network
+                          └─> Sandbox: subprocess + rlimits + no network, or a Docker container
 ```
 
 ## Built-in tools
@@ -147,21 +150,22 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 | `now` | Current local date and time |
 | `read_file` / `write_file` / `list_files` | Workspace-only file access |
 | `remember` / `recall` / `list_facts` | Per-agent long-term memory |
-| `run_python` | Sandboxed Python (Linux; opt-in on Windows) |
+| `run_python` | Sandboxed Python (`--sandbox process` or `docker`) |
 
 ## Security status
 
 Honest list of what this does **not** do yet:
 
 - **Prompt-injection defense is partial.** Tagging only asks the model to behave; the real protection is the taint policy plus scopes, which stop a *hijacked* model from acting without a person. It does **not** stop a person who types `y` without reading the prompt, content that merely misleads the answer (no tool involved), or a malicious tool that lies. Our suite models the worst case (a model that obeys every injected instruction); real models vary and we have not measured them yet.
-- Scopes only understand workspace paths and call counts. There are no network or argument-value rules yet, and MCP tools are all-or-nothing.
+- Argument rules are glob patterns on the text of top-level arguments, not a parser: `*` also matches `/`, so write `https://host/*` rather than `https://host*` (which matches `https://host.evil.com`). They check what the tool is asked to do, not what it really does (a fetch can still follow a redirect). `allow` is case-sensitive, `deny` ignores case. There is still no network-level egress control.
 - Scheduled jobs are the riskiest way to run an agent: unattended, so nobody notices odd behavior live. Keep job permissions read-only where you can, scope writes to one output folder, and read `aios audit` now and then. `auto_when_tainted` trades safety for usefulness on purpose. Times are local wall-clock time (a daily job can shift by an hour once at a daylight-saving change). The daemon is one process: if it dies, jobs stop until you restart it.
 - Memory search covers the saved notes only (not chat history). Vector search sends each note's text to the embedding server you configure: use a local one for private notes. It has been tested against a stand-in server, not yet a real Ollama or OpenAI endpoint; keyword search needs no setup.
 - Skills are trusted by **content you reviewed**, not by author. The scanner catches obvious tricks and nothing subtle, and a skill you trust can still steer the model. Treat `--force` as "I read every line".
-- `serve` has no interactive approval (stdio is the protocol channel). Pre-allow paths with `auto_paths` or leave risky tools off. The session taint lasts until the server restarts.
+- `serve` has no interactive approval (stdio is the protocol channel). Pre-allow paths with `auto_paths` (or argument values with `auto_args`) or leave risky tools off. The session taint lasts until the server restarts.
 - The audit log records actions but is not tamper-proof: anyone with write access to `aios.db` can edit it.
-- **The sandbox is not a full security boundary.** It limits CPU, memory and network on Linux, but code can still read files its user can read, and process count is unlimited. For untrusted code use WSL2/Docker/a microVM.
-- **Windows**: `run_python` is disabled (timeout-only isolation is not safe). Set `AIOS_ALLOW_WEAK_SANDBOX=1` to enable it at your own risk.
+- **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
+- Docker output is drained in bounded chunks; at most 10,000 UTF-8 bytes are retained by default. Timeout/cancellation triggers bounded container kill, force removal and an absence check. Cleanup failure is reported, not treated as a confirmed kill. A create timeout has an unknown outcome: a delayed daemon operation may still create a container; check the named container on that daemon. See [validation scope](docs/docker-sandbox-validation.md).
+- **Windows**: without Docker, `run_python` is disabled (timeout-only isolation is not safe). Use `--sandbox docker`, or set `AIOS_ALLOW_WEAK_SANDBOX=1` to enable the weak one at your own risk.
 - Treat MCP servers as untrusted code and untrusted data sources; grant them per agent explicitly.
 - Budgets are checked after each model call, so one call can overshoot a limit. Cost limits need prices you supply (they change, so there are no built-in defaults). Budgets apply per run, not per day.
 - Local models are much weaker at tool use and at resisting prompt injection than frontier models. Keep approval on.
@@ -190,8 +194,8 @@ Months are relative estimates (month 1 = project start) and will move.
 | Phase | When | Goal | Exit criterion |
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
-| **P1 Secure core** | months 1–2 | ✅ capability scopes · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · local web console · pluggable sandbox backends (WSL2 / Docker / microVM) | Multi-agent in one command; real isolation on Windows |
+| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
+| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · local web console · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
