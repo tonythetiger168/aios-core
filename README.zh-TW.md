@@ -29,6 +29,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策（見下）。
 - **技能：摘要固定與掃描**：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
+- **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。目前還不能在瀏覽器裡審批。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。
@@ -100,6 +101,7 @@ python aios.py skills untrust meeting-notes
 pip install mcp
 python aios.py serve --home ~/aios-data --agent gateway --policy policy.example.toml
 python aios.py audit --home ~/aios-data      # 查看客戶端做了什麼
+python aios.py console --home ~/aios-data    # 或用瀏覽器看：會印出含存取權杖的本機連結
 ```
 
 MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的格式，請使用絕對路徑）：
@@ -150,6 +152,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 - 技能信任的是**你審查過的內容**，不是作者。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
 - `serve` 沒有互動式審批（stdio 是協議通道）。請用 `auto_paths` 預先允許路徑，或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
+- 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
 - **沙箱不是完整的安全邊界**：Linux 上限制了 CPU、記憶體與網路，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 WSL2、Docker 或 microVM。
 - **Windows**：`run_python` 預設停用（只有逾時的隔離並不安全）。可設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權。
@@ -181,7 +184,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍 · ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | 多 agent 與 A2A · ✅ 排程（`aios jobs`／`daemon`；事件觸發器尚未）· 本機 Web 控制台 · 可插拔沙箱後端（WSL2／Docker／microVM） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | 多 agent 與 A2A · ✅ 排程（`aios jobs`／`daemon`；事件觸發器尚未）· ✅ 本機 Web 控制台（唯讀；瀏覽器審批尚未）· 可插拔沙箱後端（WSL2／Docker／microVM） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

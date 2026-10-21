@@ -1440,6 +1440,10 @@ def cli():
     sv.add_argument("--agent", default="mcp", help="policy name to serve as (default: mcp)")
     sv.add_argument("--policy", help="TOML policy; without it only read-only tools are offered")
     sv.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
+    co = sub.add_parser("console", help="local read-only web console: audit log, jobs, memory, skills")
+    co.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    co.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765; 0 = any free port)")
+    co.add_argument("--open", action="store_true", help="open the console in your browser")
     au = sub.add_parser("audit", help="print the audit log")
     au.add_argument("--agent", help="only this agent (default: all)")
     au.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
@@ -1477,6 +1481,9 @@ def cli():
         return asyncio.run(demo())
     if a.cmd == "audit":
         return audit_cmd(a.agent, a.n, a.home)
+    if a.cmd == "console":
+        import aios_console
+        raise SystemExit(aios_console.run(a.home, a.port, a.open))
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":
