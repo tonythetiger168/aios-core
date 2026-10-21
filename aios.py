@@ -18,6 +18,7 @@ import tempfile
 import uuid
 import fnmatch
 import functools
+import hashlib
 import posixpath
 import re
 import urllib.error
@@ -231,6 +232,8 @@ class Store:
             self.db.execute("ALTER TABLE facts ADD COLUMN source TEXT DEFAULT 'unknown'")
         if "ts" not in cols:
             self.db.execute("ALTER TABLE facts ADD COLUMN ts TEXT")
+        if "watch" not in {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN watch TEXT")  # change-triggered jobs' state
         self.db.commit()
 
     def add_message(self, agent: str, msg: dict):
@@ -349,6 +352,14 @@ class Store:
     def finish_job(self, name: str, last_run: str, next_run: str, status: str, enabled: bool):
         self.db.execute("UPDATE jobs SET last_run=?, next_run=?, last_status=?, enabled=? WHERE name=?",
                         (last_run, next_run, status, int(enabled), name))
+        self.db.commit()
+
+    def watch_state(self, name: str) -> dict:
+        r = self.db.execute("SELECT watch FROM jobs WHERE name=?", (name,)).fetchone()
+        return json.loads(r[0]) if r and r[0] else {}
+
+    def set_watch_state(self, name: str, state: dict):
+        self.db.execute("UPDATE jobs SET watch=? WHERE name=?", (json.dumps(state), name))
         self.db.commit()
 
     def add_run(self, job: str, ts: str, status: str, output: str):
@@ -1426,6 +1437,36 @@ UNATTENDED_DEFAULT_TOOLS = ("now", "read_file", "list_files", "recall", "list_fa
 UNATTENDED_NOTE = ("This is an unattended scheduled run: nobody can answer questions or approve actions. "
                    "Do the task with the tools you have and finish with a short report.")
 JOB_OUTPUT_MAX = 4000
+WATCH_MAX_FILES = 5000  # files fingerprinted per watched pattern (a runaway folder cannot stall the daemon)
+
+
+def watch_fingerprint(root: Path, pattern: str) -> str:
+    """Digest of the files under `root` matching `pattern` (path, size, mtime). Symlinks are not followed.
+    Only the folder before the first wildcard is walked."""
+    lead = []
+    for part in pattern.split("/")[:-1]:
+        if any(c in part for c in "*?["):
+            break
+        lead.append(part)
+    start, entries = root.joinpath(*lead), []
+    for dirpath, dirs, files in os.walk(start):
+        dirs.sort()
+        for f in sorted(files):
+            full = Path(dirpath, f)
+            rel = full.relative_to(root).as_posix()
+            if not _path_matches(rel, [pattern]):
+                continue
+            try:
+                st = full.lstat()
+            except OSError:
+                continue
+            entries.append((rel, st.st_size, st.st_mtime_ns))
+            if len(entries) >= WATCH_MAX_FILES:
+                break
+        else:
+            continue
+        break
+    return hashlib.sha256(json.dumps(entries).encode()).hexdigest()
 
 
 class Scheduler:
@@ -1451,20 +1492,46 @@ class Scheduler:
     async def run_job(self, job: dict) -> tuple[str, str]:
         agent = self.agent_for(job)
         self.k.store.clear_messages(agent.name)  # every run starts fresh
+        task = job["task"]
+        if job["schedule"].startswith("on change "):  # only the person's own pattern, never file names
+            task += (f"\n\n(This run was started because files matching '{job['schedule'][10:]}' "
+                     "changed in the workspace.)")
         try:
-            out = await asyncio.wait_for(self.k._run(agent, job["task"], self.budget), self.timeout)
+            out = await asyncio.wait_for(self.k._run(agent, task, self.budget), self.timeout)
             return ("stopped" if out.startswith("(stopped:") or out == "(max steps reached)" else "ok"), out
         except asyncio.TimeoutError:
             return "timeout", f"timed out after {self.timeout:g}s"
         except Exception as e:
             return "error", f"{type(e).__name__}: {e}"
 
+    def changed_jobs(self) -> list[dict]:
+        """Change-triggered jobs whose files changed and then held still for one tick (so a file that
+        is still being written is not read half-way). The first look only records a baseline."""
+        out = []
+        for job in self.k.store.list_jobs():
+            if not (job["enabled"] and job["schedule"].startswith("on change ")):
+                continue
+            state = self.k.store.watch_state(job["name"])
+            cur = watch_fingerprint(WORKSPACE, job["schedule"][10:])
+            if "seen" not in state or cur == state["seen"]:
+                new = {"seen": state.get("seen", cur)}
+            elif state.get("pending") == cur:
+                out.append(job)
+                continue
+            else:
+                new = {"seen": state["seen"], "pending": cur}
+            if new != state:
+                self.k.store.set_watch_state(job["name"], new)
+        return out
+
     async def tick(self) -> list[dict]:
         """Run every job that is due. A job that was missed while the daemon was off runs once."""
         import aios_schedule as sch
         iso = lambda d: d.isoformat(timespec="seconds")
         results = []
-        for job in self.k.store.due_jobs(iso(self.now())):
+        due = self.k.store.due_jobs(iso(self.now()))
+        due += [j for j in self.changed_jobs() if j["name"] not in {d["name"] for d in due}]
+        for job in due:
             sched = sch.parse(job["schedule"])
             if self.k.store.runs_since(job["name"], iso(self.now() - timedelta(days=1))) >= self.max_runs_per_day:
                 status, out = "skipped", f"daily cap of {self.max_runs_per_day} runs reached"
@@ -1472,6 +1539,8 @@ class Scheduler:
                 status, out = await self.run_job(job)
             finished = self.now()
             nxt = sched.next_after(finished)
+            if sched.kind == "change":  # what the run itself wrote must not trigger it again
+                self.k.store.set_watch_state(job["name"], {"seen": watch_fingerprint(WORKSPACE, sched.pattern)})
             self.k.store.add_run(job["name"], iso(finished), status, out[:JOB_OUTPUT_MAX])
             self.k.store.finish_job(job["name"], iso(finished), iso(nxt) if nxt else job["next_run"],
                                     status, enabled=nxt is not None)
@@ -1518,7 +1587,8 @@ def jobs_cmd(action: str, args: list[str], schedule: str | None, agent: str, hom
         iso = lambda d: d.isoformat(timespec="seconds")
         if action == "list":
             for j in store.list_jobs():
-                print(f"{j['name']:<20} {j['schedule']:<22} next {j['next_run']}  agent={j['agent']}"
+                when = "on change" if j["schedule"].startswith("on change ") else j["next_run"]
+                print(f"{j['name']:<20} {j['schedule']:<22} next {when}  agent={j['agent']}"
                       f"  last={j['last_status'] or '-'}{'' if j['enabled'] else '  (disabled)'}")
             if not store.list_jobs():
                 print("(no jobs)")
@@ -1550,6 +1620,12 @@ def jobs_cmd(action: str, args: list[str], schedule: str | None, agent: str, hom
             except (sch.ScheduleError, ValueError) as e:
                 print(f"error: {e}")
                 return 2
+            if sc.kind == "change":  # files that already exist are the baseline, not a change
+                store.set_watch_state(name, {"seen": watch_fingerprint(base / "workspace", sc.pattern)})
+                print(f"job '{name}' (agent '{agent}') will run when files matching '{sc.pattern}' in "
+                      f"{base / 'workspace'} change. It needs `aios daemon` running (or `aios daemon --once` "
+                      "from cron / Task Scheduler; a change is acted on once it has held still for one check).")
+                return 0
             print(f"job '{name}' ({sc.describe()}, agent '{agent}') will first run at {first:%Y-%m-%d %H:%M}. "
                   "It needs `aios daemon` running (or `aios daemon --once` from cron / Task Scheduler).")
             return 0
