@@ -31,6 +31,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
 - **Skills with digest pinning and a scanner**: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
+- **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. Approving calls from the browser is not there yet.
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
 - **Prompt-injection test suite**: `python tests/test_injection.py --report` prints which attacks get through under each defense (below).
 - **Audit log** (SQLite, append-only API): every tool call is recorded with agent, tool, arguments, result and status (`ok` / `error` / `denied`). View it with `/audit`.
@@ -113,6 +114,7 @@ Other tools (Claude Desktop and any MCP client) can use aios's governed tools in
 pip install mcp
 python aios.py serve --home ~/aios-data --agent gateway --policy policy.example.toml
 python aios.py audit --home ~/aios-data      # see what the client did
+python aios.py console --home ~/aios-data    # or browse it: prints a local link with an access token
 ```
 
 MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; use absolute paths):
@@ -163,6 +165,7 @@ Honest list of what this does **not** do yet:
 - Skills are trusted by **content you reviewed**, not by author. The scanner catches obvious tricks and nothing subtle, and a skill you trust can still steer the model. Treat `--force` as "I read every line".
 - `serve` has no interactive approval (stdio is the protocol channel). Pre-allow paths with `auto_paths` (or argument values with `auto_args`) or leave risky tools off. The session taint lasts until the server restarts.
 - The audit log records actions but is not tamper-proof: anyone with write access to `aios.db` can edit it.
+- The console link is a password while the console runs: anyone who has it (or the browser cookie it sets) can read your log and notes. A new one is made each start. It does not protect against other software running as your own user, which can read `aios.db` directly anyway.
 - **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
 - Docker output is drained in bounded chunks; at most 10,000 UTF-8 bytes are retained by default. Timeout/cancellation triggers bounded container kill, force removal and an absence check. Cleanup failure is reported, not treated as a confirmed kill. A create timeout has an unknown outcome: a delayed daemon operation may still create a container; check the named container on that daemon. See [validation scope](docs/docker-sandbox-validation.md).
 - **Windows**: without Docker, `run_python` is disabled (timeout-only isolation is not safe). Use `--sandbox docker`, or set `AIOS_ALLOW_WEAK_SANDBOX=1` to enable the weak one at your own risk.
@@ -195,7 +198,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · local web console · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (read-only; approvals in the browser not yet) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
