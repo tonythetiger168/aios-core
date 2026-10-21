@@ -4,17 +4,21 @@
     daily 09:00                         every day at 09:00
     weekly mon 09:00                    every Monday at 09:00 (mon..sun or full names)
     once 2026-12-24 18:30               one time, then the job disables itself
+    on change inbox/*                   when files matching the pattern (in the workspace) change
 
 Times are local wall-clock time. Around daylight-saving changes a daily/weekly job may run an hour
 early or late once; `every` jobs are unaffected.
 """
+import posixpath
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 MIN_INTERVAL_S = 60
 MAX_INTERVAL_S = 366 * 86400
-GRAMMAR = "every 30m | every 2h | every 1d | daily 09:00 | weekly mon 09:00 | once 2026-12-24 18:30"
+GRAMMAR = ("every 30m | every 2h | every 1d | daily 09:00 | weekly mon 09:00 | once 2026-12-24 18:30 | "
+           "on change inbox/*")
+NEVER = datetime(9999, 12, 31)  # next_run of change-triggered jobs: the clock never makes them due
 DAYS = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1, "wed": 2, "wednesday": 2,
         "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "fri": 4, "friday": 4,
         "sat": 5, "saturday": 5, "sun": 6, "sunday": 6}
@@ -28,12 +32,13 @@ class ScheduleError(ValueError):
 
 @dataclass(frozen=True)
 class Schedule:
-    kind: str  # "every" | "daily" | "weekly" | "once"
+    kind: str  # "every" | "daily" | "weekly" | "once" | "change"
     seconds: int = 0
     hour: int = 0
     minute: int = 0
     weekday: int = 0
     at: datetime | None = None
+    pattern: str = ""  # "change": workspace-relative glob, e.g. inbox/*
 
     def next_after(self, after: datetime) -> datetime | None:
         """The first run strictly after `after`, or None if there will be no more runs."""
@@ -41,6 +46,8 @@ class Schedule:
             return after + timedelta(seconds=self.seconds)
         if self.kind == "once":
             return self.at if self.at and self.at > after else None
+        if self.kind == "change":
+            return NEVER  # the daemon runs it when files change, not by the clock
         cand = after.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
         if self.kind == "weekly":
             cand += timedelta(days=(self.weekday - after.weekday()) % 7)
@@ -56,6 +63,8 @@ class Schedule:
             return f"daily {self.hour:02d}:{self.minute:02d}"
         if self.kind == "weekly":
             return f"weekly {_DAY_NAMES[self.weekday].lower()} {self.hour:02d}:{self.minute:02d}"
+        if self.kind == "change":
+            return f"on change {self.pattern}"
         return f"once {self.at:%Y-%m-%d %H:%M}"
 
 
@@ -66,7 +75,19 @@ def _hm(h: str, m: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _watch_pattern(raw: str) -> str:
+    p = raw.replace("\\", "/")
+    if p.startswith("/") or re.match(r"^[A-Za-z]:", p):
+        raise ScheduleError("the watch pattern must be relative to the workspace, e.g. inbox/*")
+    p = posixpath.normpath(p)
+    if p == ".." or p.startswith("../") or p == ".":
+        raise ScheduleError("the watch pattern must stay inside the workspace, e.g. inbox/*")
+    return p
+
+
 def parse(spec: str) -> Schedule:
+    if m := re.fullmatch(r"\s*on\s+change\s+(\S+)\s*", str(spec), re.IGNORECASE):  # keeps the path's case
+        return Schedule("change", pattern=_watch_pattern(m[1]))
     s = " ".join(str(spec).lower().split())
     if m := re.fullmatch(r"every (\d+)\s*(m|min|mins|minutes?|h|hrs?|hours?|d|days?)", s):
         n, unit = int(m[1]), m[2][0]

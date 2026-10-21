@@ -68,12 +68,22 @@ python aios.py daemon --policy policy.example.toml --provider openai --model lla
 python aios.py daemon --once ...          # run what is due, then exit: for cron or Windows Task Scheduler
 ```
 
-Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30` (local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
+Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*` (see below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
 
 - **Nobody can approve anything.** Same policy pipeline as `chat`, but risky tools are refused unless the policy pre-allows the path with `auto_paths`. A job with no policy section is read-only (`now`, `read_file`, `list_files`, `recall`, `list_facts`, `search_memory`).
 - A job that reads a file is *tainted*, so even `auto_paths` stop applying, unless the scope says `auto_when_tainted = true`: your explicit statement that injected text in what the job read may write into that one folder, and nothing else.
 - Each job is its own agent (`job-<name>`: own history and memory) and starts every run with a clean history. Runs always have a cap (default 50,000 tokens, 8 steps, 300 s), and a job runs at most 200 times a day (`--max-runs-per-day`), so a typo like `every 1m` cannot burn your budget unnoticed.
 - A job missed while the daemon was off runs **once** when it comes back, not once per missed slot. Jobs run one at a time. Results: `aios jobs history`; every tool call is in `aios audit`.
+
+**File-change triggers.** `--schedule "on change inbox/*"` runs the job when files matching the pattern (relative to the workspace, subfolders included) are added, edited or removed:
+
+```bash
+python aios.py jobs add mail "Summarise the new files in inbox/ into reports/mail.txt" --schedule "on change inbox/*" --agent reporter
+```
+
+- Files already there when you add the job are the baseline. The daemon checks every `--tick` (or every `--once` run) and acts on a change only once it has held still for one check, so a file still being copied is not read half-way.
+- File names are never put into the task (anyone who can drop a file could choose one); the task only says that the pattern matched. The job reads the files itself, which makes the run *tainted* like any other.
+- What the run writes into the watched folder does not trigger it again; changes made by others *during* a run are folded into that run. At most 5,000 matching files are fingerprinted, and the daily run cap applies.
 
 ## Skills
 
@@ -181,7 +191,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`; event triggers not yet) · local web console · pluggable sandbox backends (WSL2 / Docker / microVM) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | Multi-agent with A2A · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · local web console · pluggable sandbox backends (WSL2 / Docker / microVM) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
