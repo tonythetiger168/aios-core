@@ -3,14 +3,19 @@
 The model is replaced by a scripted fake provider, so no API key or internet is needed.
 """
 import asyncio
+import contextlib
 import copy
+import io
 import json
+import os
+import subprocess
 import sys
 import http.server
 import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1224,6 +1229,310 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
             del os.environ["AIOS_SECRET_TEST"]
         self.assertIn("None", out)
         self.assertNotIn("leak", out)
+
+
+FAKE_DOCKER = r"""#!/usr/bin/env python3
+# Lifecycle stand-in only: it does not implement Docker security isolation.
+import os, signal, sys
+from pathlib import Path
+state = Path(os.environ["FAKE_DOCKER_DIR"])
+argv = sys.argv[1:]
+if argv[0] == "create":
+    name = argv[argv.index("--name") + 1]
+    (state / "argv").write_text("\n".join(argv))
+    (state / name).write_text("")
+    print(name)
+elif argv[0] == "start":
+    (state / argv[-1]).write_text(str(os.getpid()))
+    code = sys.stdin.read()
+    os.execv(sys.executable, [sys.executable, "-I", "-c", code])
+elif argv[0] == "kill":
+    path = state / argv[-1]
+    (state / "killed").write_text(argv[-1])  # records the container kill request
+    try:
+        os.kill(int(path.read_text()), signal.SIGKILL)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+elif argv[0] == "rm":
+    (state / argv[-1]).unlink(missing_ok=True)
+elif argv[:2] == ["container", "inspect"]:
+    if not (state / argv[-1]).exists():
+        print("Error: No such container: " + argv[-1], file=sys.stderr)
+        sys.exit(1)
+    print("[{}]")
+else:
+    sys.exit(2)
+"""
+
+
+class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        aios.DockerSandbox.unavailable.cache_clear()
+        self.addCleanup(aios.DockerSandbox.unavailable.cache_clear)
+
+    def test_command_isolates_the_container(self):
+        cmd = aios.DockerSandbox(mem_mb=128, pids=32).command("aios-sbx-x")
+        joined = " ".join(cmd)
+        for flag in ("create", "--rm", "--cpus 1.0", "--tmpfs /tmp:rw,nosuid,nodev,size=16m", "--network none", "--read-only", "--cap-drop ALL", "--pull never",
+                     "--security-opt no-new-privileges", "--user 65534:65534", "--memory 128m",
+                     "--memory-swap 128m", "--pids-limit 32", "--name aios-sbx-x"):
+            self.assertIn(flag, joined)
+        for mount in ("-v", "--volume", "--mount", "--privileged"):
+            self.assertNotIn(mount, cmd)  # nothing from the host is shared
+        self.assertEqual(cmd[-4:], [aios.DOCKER_IMAGE, "python", "-I", "-"])
+
+    def test_unavailable_explains_what_is_missing(self):
+        u = aios.DockerSandbox.unavailable
+        with mock.patch.object(aios.shutil, "which", return_value=None):
+            self.assertIn("not installed", u())
+        u.cache_clear()
+
+        def fake_run(out="", err="", rc=0):
+            return mock.patch.object(aios.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], rc, stdout=out, stderr=err))
+
+        with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"):
+            for (out, err, rc), want in ((("", "Error: No such image: python:3.12-slim", 1), "docker pull"),
+                                         (("", "Cannot connect to the Docker daemon", 1), "not usable"),
+                                         (("windows\n", "", 0), "Linux containers"),
+                                         (("linux\n", "", 0), None)):
+                u.cache_clear()
+                with self.subTest(err=err or out), fake_run(out, err, rc):
+                    got = u()
+                    self.assertIsNone(got) if want is None else self.assertIn(want, got)
+
+    def test_backend_selection(self):
+        ok = mock.patch.object(aios.DockerSandbox, "unavailable", return_value=None)
+        missing = mock.patch.object(aios.DockerSandbox, "unavailable", return_value="no docker")
+        self.assertIsNone(aios.make_sandbox("off"))
+        with self.assertRaises(ValueError):
+            aios.make_sandbox("vm")
+        with missing, self.assertRaises(RuntimeError):  # asked-for isolation never degrades silently
+            aios.make_sandbox("docker")
+        with ok:
+            self.assertIsInstance(aios.make_sandbox("docker"), aios.DockerSandbox)
+        with mock.patch.dict(os.environ, {"AIOS_SANDBOX": "off"}):
+            self.assertIsNone(aios.make_sandbox())
+        with mock.patch.object(aios, "IS_WINDOWS", True), mock.patch.object(aios, "Sandbox") as weak, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with ok:
+                self.assertIsInstance(aios.make_sandbox("auto"), aios.DockerSandbox)
+            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):
+                self.assertIsNone(aios.make_sandbox("auto"))
+                self.assertIsNone(aios.make_sandbox("process"))
+            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": "1"}):
+                self.assertIs(aios.make_sandbox("auto"), weak.return_value)
+        if not aios.IS_WINDOWS:
+            self.assertIsInstance(aios.make_sandbox("auto"), aios.Sandbox)
+
+    def test_install_registers_run_python_only_with_a_backend(self):
+        k = make_kernel()
+        aios.install_builtin_tools(k, sandbox="off")
+        self.assertNotIn("run_python", {t["name"] for t in k.tools.schemas_for({"*"})})
+
+    def test_tool_description_matches_backend(self):
+        for box, want in (
+                (aios.DockerSandbox(), "not a microVM"),
+                (types.SimpleNamespace(name="process", net_isolated=False, timeout=10),
+                 "network NOT isolated"),
+                (types.SimpleNamespace(name="process", net_isolated=True, timeout=10),
+                 "network namespace enabled")):
+            with self.subTest(backend=box.name, want=want), \
+                    mock.patch.object(aios, "make_sandbox", return_value=box):
+                k = make_kernel()
+                try:
+                    aios.install_builtin_tools(k)
+                    desc = next(t['description'] for t in k.tools.schemas_for({'*'})
+                                if t['name'] == 'run_python')
+                    self.assertIn(want, desc)
+                    if box.name == 'process':
+                        self.assertIn('can read files', desc)
+                finally:
+                    k.store.db.close()
+
+    async def test_output_reader_has_bounded_retained_memory(self):
+        import tracemalloc
+
+        class Flood:
+            remaining = 4096  # 32 MiB, delivered in bounded chunks
+
+            async def read(self, size):
+                self.remaining -= 1
+                return b'x' * min(size, 8192) if self.remaining >= 0 else b''
+
+        tracemalloc.start()
+        try:
+            out = await aios.DockerSandbox._read_limited(Flood(), 50)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(out, 'x' * 50 + '\n...(truncated)')
+        self.assertLess(peak, 1024 * 1024)
+
+    async def test_control_command_timeout_is_bounded(self):
+        box = aios.DockerSandbox(cleanup_timeout=0.5)
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(box._invoke(
+                [sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.1), 3)
+
+    async def test_cleanup_failure_is_not_reported_as_killed(self):
+        box = aios.DockerSandbox(timeout=0.1)
+
+        async def invoke(args, *a, **kw):
+            if args[1] == 'create':
+                return 0, 'id'
+            if args[1] == 'start':
+                raise asyncio.TimeoutError
+            return 1, 'Cannot connect to the Docker daemon'
+
+        with mock.patch.object(box, '_invoke', side_effect=invoke):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed'):
+                await box.run_python('while True: pass')
+
+    async def test_force_remove_can_recover_from_failed_or_hung_kill(self):
+        for fail in ('nonzero', 'timeout'):
+            box = aios.DockerSandbox()
+
+            async def invoke(args, **kw):
+                if args[1] == 'kill':
+                    if fail == 'timeout':
+                        raise asyncio.TimeoutError
+                    return 1, 'kill failed'
+                if args[1] == 'rm':
+                    return 0, 'removed'
+                return 1, 'Error: No such container: this-call'
+
+            with self.subTest(failure=fail), mock.patch.object(box, '_invoke', side_effect=invoke):
+                await box._cleanup('this-call')
+
+    async def test_existing_container_is_a_cleanup_failure(self):
+        box = aios.DockerSandbox()
+        with mock.patch.object(box, '_invoke', return_value=(0, '[{}]')):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed'):
+                await box._cleanup('still-present')
+
+    async def test_create_timeout_is_reported_as_unknown_even_when_absent_now(self):
+        box = aios.DockerSandbox()
+        with mock.patch.object(box, '_invoke', side_effect=asyncio.TimeoutError), \
+                mock.patch.object(box, '_cleanup') as cleanup:
+            with self.assertRaisesRegex(RuntimeError, 'create timed out; outcome unknown'):
+                await box.run_python('print(42)')
+            cleanup.assert_awaited_once()
+
+    async def test_create_failure_never_starts_code(self):
+        box = aios.DockerSandbox()
+        with mock.patch.object(box, '_invoke', return_value=(125, 'image missing')) as invoke, \
+                mock.patch.object(box, '_cleanup') as cleanup:
+            out = await box.run_python('print(42)')
+            self.assertIn('exit=125', out)
+            self.assertEqual(invoke.await_count, 1)
+            cleanup.assert_awaited_once()
+
+    async def test_cancellation_waits_for_cleanup_even_when_cancelled_again(self):
+        box = aios.DockerSandbox()
+        started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def invoke(args, *a, **kw):
+            if args[1] == 'create':
+                return 0, 'id'
+            started.set()
+            await asyncio.Event().wait()
+
+        async def cleanup(name):
+            cleaning.set()
+            await release.wait()
+
+        with mock.patch.object(box, '_invoke', side_effect=invoke), \
+                mock.patch.object(box, '_cleanup', side_effect=cleanup) as cleaner:
+            task = asyncio.create_task(box.run_python('while True: pass'))
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            await asyncio.wait_for(cleaning.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            cleaner.assert_awaited_once()
+
+    @unittest.skipIf(aios.IS_WINDOWS, "the fake docker CLI is a POSIX script")
+    async def test_run_and_timeout_with_a_fake_docker(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d, "docker")
+            exe.write_text(FAKE_DOCKER.replace("/usr/bin/env python3", sys.executable), encoding="utf-8")
+            exe.chmod(0o755)
+            with mock.patch.dict(os.environ, {"FAKE_DOCKER_DIR": d}):
+                box = aios.DockerSandbox(docker=str(exe), timeout=2, max_out=50)
+                out = await box.run_python("print(6*7)")
+                self.assertTrue(out.startswith("exit=0"), out)
+                self.assertIn("42", out)
+                self.assertIn("--network", Path(d, "argv").read_text())
+                self.assertIn("(truncated)", await box.run_python("print('x'*500)"))
+                out = await box.run_python("while True: pass")
+                self.assertEqual(out, "killed: timeout after 2s")
+                self.assertTrue(Path(d, "killed").read_text().startswith("aios-sbx-"))  # the container is killed
+
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER") == "1",
+                     "set AIOS_TEST_DOCKER=1 (and `docker pull python:3.12-slim`) to run against real Docker")
+class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        aios.DockerSandbox.unavailable.cache_clear()
+        why = aios.DockerSandbox.unavailable()
+        if why:
+            self.fail(why)
+        self.box = aios.DockerSandbox(timeout=20)
+
+    async def test_runs_code_as_an_unprivileged_user(self):
+        out = await self.box.run_python("import os; print(6*7, os.getuid(), os.getgid())")
+        self.assertEqual(out.strip(), "exit=0\n42 65534 65534")
+
+    async def test_no_network_and_no_host_files(self):
+        out = await self.box.run_python(
+            "import socket, os\n"
+            "try:\n socket.create_connection(('1.1.1.1', 53), timeout=3); print('NET')\n"
+            "except OSError: print('nonet')\n"
+            "print(sorted(os.listdir('/tmp')))\n"
+            "try:\n open('/pwned', 'w'); print('RW')\n"
+            "except OSError: print('readonly')\n")
+        self.assertIn("nonet", out)
+        self.assertIn("readonly", out)
+        self.assertIn("[]", out)  # an empty scratch dir: the workspace is not mounted
+
+    async def test_memory_cap(self):
+        out = await aios.DockerSandbox(timeout=20, mem_mb=64).run_python("x = bytearray(512 * 1024 * 1024)")
+        self.assertFalse(out.startswith("exit=0"), out)
+
+    async def test_runtime_security_settings(self):
+        out = await self.box.run_python(
+            "import os, json\n"
+            "status = dict(line.split(':', 1) for line in open('/proc/self/status') if ':' in line)\n"
+            "mounts = {p[1]: p[3].split(',') for p in map(str.split, open('/proc/mounts'))}\n"
+            "print(json.dumps({'uid': os.getuid(), 'gid': os.getgid(),\n"
+            " 'caps': [int(status[k], 16) for k in ('CapEff', 'CapPrm', 'CapBnd')],\n"
+            " 'nnp': int(status['NoNewPrivs']), 'root_ro': 'ro' in mounts['/'],\n"
+            " 'tmp_flags': mounts['/tmp'],\n"
+            " 'tmp_bytes': os.statvfs('/tmp').f_blocks * os.statvfs('/tmp').f_frsize}))\n")
+        self.assertTrue(out.startswith('exit=0\n'), out)
+        settings = json.loads(out.split('\n', 1)[1])
+        self.assertEqual((settings['uid'], settings['gid']), (65534, 65534))
+        self.assertEqual(settings['caps'], [0, 0, 0])
+        self.assertEqual(settings['nnp'], 1)
+        self.assertTrue(settings['root_ro'])
+        self.assertTrue({'rw', 'nosuid', 'nodev'} <= set(settings['tmp_flags']))
+        self.assertEqual(settings['tmp_bytes'], 16 * 1024 * 1024)
+
+    async def test_timeout_kills_the_container(self):
+        # Check this invocation, not every sandbox another test/user may be running.
+        with mock.patch.object(aios.uuid, 'uuid4', return_value=types.SimpleNamespace(
+                hex=os.urandom(16).hex())) as token:
+            name = 'aios-sbx-' + token.return_value.hex
+            out = await aios.DockerSandbox(timeout=3).run_python("while True: pass")
+        self.assertEqual(out, "killed: timeout after 3s")
+        rc, out = await self.box._invoke(['docker', 'container', 'inspect', name], timeout=3)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('no such', out.lower())
 
 
 if __name__ == "__main__":
