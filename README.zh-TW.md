@@ -27,6 +27,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策（見下）。
+- **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
 - **技能：摘要固定與掃描**：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
@@ -49,6 +50,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # 接上 MCP 伺服
 python aios.py chat --provider openai --model llama3.1   # 用 Ollama 的本機模型
 python aios.py chat --max-tokens 20000 --max-steps 6     # 每次執行的硬性上限
 python aios.py chat --policy policy.example.toml --agent notes   # 每個代理的權限與路徑範圍
+python aios.py chat --policy policy.example.toml --agent lead    # 把寫作交給 'notes' 的代理
 python aios.py chat --skill examples/skills/meeting-notes        # 載入你已固定的技能（見「技能」）
 python aios.py chat --embed-model nomic-embed-text               # 同時依語意搜尋記憶（需先 `ollama pull nomic-embed-text`）
 python aios.py chat --auto-approve          # 乾淨的執行略過 [y/N] 詢問（不安全）
@@ -181,7 +183,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍 · ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | 多 agent 與 A2A · ✅ 排程（`aios jobs`／`daemon`；事件觸發器尚未）· 本機 Web 控制台 · 可插拔沙箱後端（WSL2／Docker／microVM） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`；A2A 網路協定尚未）· ✅ 排程（`aios jobs`／`daemon`；事件觸發器尚未）· 本機 Web 控制台 · 可插拔沙箱後端（WSL2／Docker／microVM） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

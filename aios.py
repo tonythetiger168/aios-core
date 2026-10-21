@@ -58,6 +58,7 @@ FACT_SOURCES = ("user", "model", "tainted", "unknown")  # who wrote a memory
 FACT_PROMPT_MAX = 500  # chars of one fact shown in the system prompt
 FACT_PROMPT_LIMIT = 30  # more notes than this: show only the ones relevant to the task
 AUDIT_MAX = 2000  # max chars of arguments/result kept per audit entry
+MAX_DELEGATION_DEPTH = 2  # main -> helper -> helper's helper, no deeper
 DEFAULT_APPROVAL = ("write_file", "run_python")  # need human approval; MCP tools are added on connect
 
 
@@ -492,6 +493,9 @@ class Agent:
     # auto_when_tainted = true: you accept that injected text could write there); max_calls: per run.
     scopes: dict = field(default_factory=dict)
     session_tainted: bool = False  # set by the MCP gateway once the client has read untrusted data
+    ephemeral: bool = False  # history kept in memory only (delegated sub-tasks)
+    chain: tuple = ()  # delegating agents above this one, outermost first
+    run_budget: object = None  # the Budget of the run in progress (delegated sub-tasks reuse it)
 
     def __post_init__(self):
         for key, sc in self.scopes.items():
@@ -570,7 +574,25 @@ class Kernel:
 
     def _push(self, agent: Agent, msg: dict):
         agent.history.append(msg)
-        self.store.add_message(agent.name, msg)
+        if not agent.ephemeral:
+            self.store.add_message(agent.name, msg)
+
+    async def delegate(self, parent: Agent, name: str, task: str, policy: dict) -> str:
+        """Run `task` as agent `name` with that agent's own permissions, scopes and memory.
+        A delegated run starts with a fresh, unsaved history and inherits the caller's taint: text an
+        attacker planted upstream can reach the task, so the helper gets no auto-approval either."""
+        chain = (*parent.chain, parent.name)
+        if name in chain:
+            raise PermissionError(f"delegation loop: {' -> '.join((*chain, name))}")
+        if len(chain) > MAX_DELEGATION_DEPTH:
+            raise PermissionError(f"delegation deeper than {MAX_DELEGATION_DEPTH} levels")
+        pol = policy[name]
+        perms = set(pol["permissions"]) if pol["permissions"] is not None else set(DEFAULT_TOOLS)
+        child = Agent(name, perms, scopes=pol["scopes"], loaded=True, ephemeral=True, chain=chain)
+        child.system += (f" You are doing a sub-task for the agent '{parent.name}'. Its request is in the "
+                         "user turn. Reply with the result; nobody else reads your answer.")
+        child.session_tainted = self.harden and (parent.session_tainted or self._tainted(parent.history))
+        return await self._run(child, task, parent.run_budget)
 
     def _system(self, agent: Agent, task: str | None = None) -> str:
         parts = [agent.system]
@@ -681,7 +703,7 @@ class Kernel:
             return f"{type(e).__name__}: {e}", True, "error"
 
     async def _run(self, agent: Agent, task: str, budget: Budget | None = None) -> str:
-        budget = budget or self.budget
+        budget = agent.run_budget = budget or self.budget
         if not agent.loaded:  # restore history after restart
             agent.history = self.store.load_messages(agent.name)
             agent.loaded = True
@@ -711,7 +733,7 @@ class Kernel:
                     stop, answer = "budget", f"(stopped: {over})"
                     break
 
-                tainted = self.harden and self._tainted(agent.history)
+                tainted = self.harden and (agent.session_tainted or self._tainted(agent.history))
                 results = []
                 for b in comp.content:
                     if b.get("type") != "tool_use":
@@ -919,6 +941,22 @@ DEFAULT_TOOLS = ("now", "read_file", "write_file", "list_files", "remember", "re
                  "search_memory", "run_python")
 
 
+def install_agent_tools(k: Kernel, policy: dict | None):
+    """One tool per agent in the policy, `agent__<name>`: hand that agent a sub-task. Granting it is
+    done like any tool (permissions = ["agent__writer"] or "agent__*"). The helper runs with its own
+    permissions; its answer is tagged untrusted (it may carry text the helper read)."""
+    for name in sorted(policy or {}):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", name):
+            continue  # not usable as part of a tool name
+
+        @k.tools.register(f"agent__{name}", f"Hand a sub-task to the '{name}' agent, which works with its "
+                          "own tools, permissions and memory, and get its answer back.",
+                          {"task": {"type": "string", "description": "what the agent should do, in full"}},
+                          required=["task"], ctx=True, untrusted=True)
+        async def ask(task: str, agent: Agent, _name=name):
+            return await k.delegate(agent, _name, task, policy)
+
+
 # ---- Demo ----
 async def demo():
     WORKSPACE.mkdir(exist_ok=True)
@@ -994,6 +1032,7 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
         approver = ask_human
     k = Kernel(approver=approver, provider=provider, budget=budget, embedder=embedder)
     install_builtin_tools(k)
+    install_agent_tools(k, policy)
     skill_blocks = []
     if skills:
         import aios_skills as sk
@@ -1230,6 +1269,7 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     k = Kernel(store=Store(str(base / "aios.db")), provider=provider, approver=None)  # nobody to ask
     install_builtin_tools(k)
+    install_agent_tools(k, policy)
     sched = Scheduler(k, policy, budget, max_runs_per_day, timeout)
     print(f"[aios] job daemon on {base} ({len(k.store.list_jobs())} jobs"
           f"{', one pass' if once else ', Ctrl+C to stop'})", file=sys.stderr)

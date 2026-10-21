@@ -44,3 +44,11 @@ paths = ["reports/*"]
 auto_paths = ["reports/*"]
 auto_when_tainted = true
 max_calls = 5           # per run
+
+# ---------------------------------------------------------------------------------
+# Several agents working together:  python aios.py chat --agent lead --policy policy.example.toml
+# Every agent in this file can be handed a sub-task through a tool named agent__<name>. Grant it like
+# any tool. The helper works with ITS OWN permissions, scopes and memory, starts each sub-task fresh,
+# and inherits the caller's taint: if `lead` has read an untrusted file, `notes` gets no auto_paths.
+[agents.lead]
+permissions = ["now", "read_file", "list_files", "agent__notes"]
