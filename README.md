@@ -30,6 +30,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
+- **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. Approving calls from the browser is not there yet.
@@ -138,6 +139,22 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
 - **Status**: written against the MCP SDK's low-level server API and tested only against a stand-in, not a real client. If your client does not connect or lists no tools, please open an issue with the stderr output.
 
+## Talk to other agents (A2A)
+
+[A2A](https://a2a-protocol.org) lets agents from different vendors call each other. aios speaks both versions in use, 1.0 and 0.3 (JSON-RPC), and was checked against the official `a2a-sdk` in both directions.
+
+```bash
+# offer one of your agents to others (prints a token; or set AIOS_A2A_TOKEN)
+python aios.py a2a-serve --agent researcher --policy policy.example.toml --port 8770 --description "Finds facts in my notes"
+
+# call a remote agent as the tool a2a__research (its token, if it needs one, from $AIOS_A2A_TOKEN_RESEARCH)
+AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.0.1:8770
+```
+
+- **Serving**: listens on 127.0.0.1; every call needs the token (the agent card at `/.well-known/agent-card.json` is public and only names the agent). The caller is **not trusted**: each request is a fresh run of that policy agent with its own permissions and a capped budget (50,000 tokens by default), starts *tainted* so `auto_paths`/`auto_args` never apply, keeps no history between requests, and is audited. Nobody can approve risky calls, so a served agent should be read-only or tightly scoped.
+- **Calling**: `--a2a NAME=URL` (in `chat` and `daemon`) makes the tool `a2a__NAME`. Grant it per agent like any tool. It sends your text to another machine, so every call needs approval (in `daemon`: refused unless a scope pre-allows it with `auto_args`), and the answer comes back tagged untrusted. A token is never sent over plain `http` to anything but this machine, and calls always go to the URL you gave, not to a URL the remote card names.
+- Not supported yet: streaming, push notifications, files, and multi-turn conversations (each request stands alone).
+
 ## Architecture
 
 ```
@@ -200,7 +217,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (read-only; approvals in the browser not yet) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (read-only; approvals in the browser not yet) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 

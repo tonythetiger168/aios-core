@@ -1,0 +1,266 @@
+"""A2A: serving an agent over the Agent2Agent protocol and calling remote agents as tools."""
+import asyncio
+import http.client
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import aios  # noqa: E402
+import aios_a2a  # noqa: E402
+
+TOKEN = "s3cret-token"
+
+
+def text(t):
+    return aios.Completion([{"type": "text", "text": t}], "end_turn")
+
+
+def call(name, args):
+    return aios.Completion([{"type": "tool_use", "id": "c1", "name": name, "input": args}], "tool_use")
+
+
+class Scripted:
+    def __init__(self, *script):
+        self.script, self.calls = list(script), []
+
+    async def complete(self, system, messages, tools, max_tokens=1024):
+        self.calls.append({"system": system, "messages": [dict(m) for m in messages], "tools": [t["name"] for t in tools]})
+        return self.script.pop(0) if self.script else text("done")
+
+
+def user_msg(t="hello"):
+    return {"kind": "message", "role": "user", "messageId": "m1", "parts": [{"kind": "text", "text": t}]}
+
+
+class ServerCase(unittest.IsolatedAsyncioTestCase):
+    """A Server whose 'agent' echoes; requests go through a real socket from a worker thread."""
+
+    async def asyncSetUp(self):
+        self.seen = []
+
+        async def run(agent, t):
+            self.seen.append((agent, t))
+            if t == "boom":
+                raise RuntimeError("model down")
+            if t == "slow":
+                await asyncio.sleep(5)
+            return f"answer to {t}"
+
+        self.srv = aios_a2a.Server("helper", "Helps.", TOKEN, run, lambda: "agent-object",
+                                   asyncio.get_running_loop(), port=0, timeout=0.5).start()
+        self.addAsyncCleanup(asyncio.to_thread, self.srv.close)
+
+    def _http(self, method, path, body=None, token=TOKEN, raw=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        c.request(method, path, body=data, headers=headers)
+        r = c.getresponse()
+        out = r.read()
+        c.close()
+        return r.status, (json.loads(out) if out else None)
+
+    async def http(self, *a, **kw):
+        return await asyncio.to_thread(self._http, *a, **kw)
+
+    async def rpc(self, method, params=None, **kw):
+        status, body = await self.http("POST", "/", {"jsonrpc": "2.0", "id": 7, "method": method,
+                                                     "params": params or {}}, **kw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], 7)
+        return body
+
+
+class ServerTests(ServerCase):
+    async def test_card_is_public_at_both_well_known_paths(self):
+        for path in aios_a2a.CARD_PATHS:
+            status, card = await self.http("GET", path, token=None)
+            self.assertEqual(status, 200)
+            self.assertEqual((card["name"], card["protocolVersion"]), ("helper", aios_a2a.PROTOCOL))
+            self.assertEqual(card["url"], f"http://127.0.0.1:{self.srv.port}/")
+            self.assertFalse(card["capabilities"]["streaming"])
+            self.assertEqual(card["security"], [{"bearer": []}])
+        self.assertEqual(self.srv.httpd.server_address[0], "127.0.0.1")
+
+    async def test_calls_need_the_token(self):
+        for token in (None, "wrong"):
+            status, _ = await self.http("POST", "/", {"jsonrpc": "2.0", "id": 1, "method": "message/send",
+                                                      "params": {"message": user_msg()}}, token=token)
+            self.assertEqual(status, 401)
+        self.assertEqual(self.seen, [])
+
+    async def test_send_returns_a_completed_task_that_tasks_get_finds(self):
+        body = await self.rpc("message/send", {"message": user_msg("summarise")})
+        task = body["result"]
+        self.assertEqual((task["kind"], task["status"]["state"]), ("task", "completed"))
+        self.assertEqual(aios_a2a.text_of(task["artifacts"][0]["parts"]), "answer to summarise")
+        self.assertEqual(self.seen, [("agent-object", "summarise")])  # a fresh agent per request
+        got = await self.rpc("tasks/get", {"id": task["id"]})
+        self.assertEqual(got["result"], task)
+        missing = await self.rpc("tasks/get", {"id": "nope"})
+        self.assertEqual(missing["error"]["code"], aios_a2a.TASK_NOT_FOUND)
+
+    async def test_failures_become_failed_tasks(self):
+        for t, why in (("boom", "model down"), ("slow", "timed out")):
+            task = (await self.rpc("message/send", {"message": user_msg(t)}))["result"]
+            self.assertEqual(task["status"]["state"], "failed")
+            self.assertIn(why, aios_a2a.text_of(task["status"]["message"]["parts"]))
+
+    async def test_protocol_errors(self):
+        cases = [
+            ("message/stream", {"message": user_msg()}, aios_a2a.UNSUPPORTED),
+            ("tasks/cancel", {"id": "x"}, aios_a2a.UNSUPPORTED),
+            ("nope/nope", {}, aios_a2a.NO_METHOD),
+            ("message/send", {}, aios_a2a.INVALID_PARAMS),
+            ("message/send", {"message": dict(user_msg(), role="agent")}, aios_a2a.INVALID_PARAMS),
+            ("message/send", {"message": dict(user_msg(), parts=[{"kind": "file", "file": {}}])}, aios_a2a.INVALID_PARAMS),
+        ]
+        for method, params, code in cases:
+            with self.subTest(method=method, params=params):
+                self.assertEqual((await self.rpc(method, params))["error"]["code"], code)
+        status, body = await self.http("POST", "/", raw=b"{not json")
+        self.assertEqual(body["error"]["code"], aios_a2a.PARSE)
+        status, body = await self.http("POST", "/", {"jsonrpc": "1.0", "id": 1, "method": "message/send"})
+        self.assertEqual(body["error"]["code"], aios_a2a.INVALID_REQUEST)
+        status, _ = await self.http("POST", "/", raw=b"x" * (aios_a2a.BODY_MAX + 1))
+        self.assertEqual(status, 413)
+        self.assertEqual((await self.http("PUT", "/", {}))[0], 405)
+        self.assertEqual((await self.http("POST", "/other", {}))[0], 404)
+        self.assertEqual(self.seen, [])
+
+    async def test_version_1_0_shapes(self):
+        msg = {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "plan"}]}
+        res = (await self.rpc("SendMessage", {"message": msg}))["result"]
+        task = res["task"]  # 1.0 wraps the task; enum names, no "kind"
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(task["artifacts"][0]["parts"], [{"text": "answer to plan"}])
+        self.assertNotIn("kind", task)
+        self.assertEqual((await self.rpc("GetTask", {"id": task["id"]}))["result"], task)
+        old = (await self.rpc("tasks/get", {"id": task["id"]}))["result"]  # same task, 0.3 shape
+        self.assertEqual((old["kind"], old["status"]["state"]), ("task", "completed"))
+        failed = (await self.rpc("SendMessage", {"message": dict(msg, parts=[{"text": "boom"}])}))["result"]["task"]
+        self.assertEqual(failed["status"]["state"], "TASK_STATE_FAILED")
+        self.assertEqual(failed["status"]["message"]["role"], "ROLE_AGENT")
+        for method in ("SendStreamingMessage", "CancelTask", "CreateTaskPushNotificationConfig"):
+            self.assertEqual((await self.rpc(method, {}))["error"]["code"], aios_a2a.UNSUPPORTED)
+        _, card = await self.http("GET", aios_a2a.CARD_PATHS[0], token=None)
+        self.assertEqual({i["protocolVersion"] for i in card["supportedInterfaces"]}, {"1.0", "0.3"})
+
+    async def test_the_client_speaks_both_versions(self):
+        for v1 in (True, False):
+            c = aios_a2a.Client(f"http://127.0.0.1:{self.srv.port}/", TOKEN, timeout=10)
+            await asyncio.to_thread(c.card)
+            self.assertTrue(c.v1)  # the card offers 1.0
+            c.v1 = v1
+            with self.subTest(v1=v1):
+                self.assertEqual(await asyncio.to_thread(c.send, "hi"), "answer to hi")
+
+    async def test_the_client_round_trip(self):
+        c = aios_a2a.Client(f"http://127.0.0.1:{self.srv.port}/", TOKEN, timeout=10)
+        self.assertEqual((await asyncio.to_thread(c.card))["name"], "helper")
+        self.assertEqual(await asyncio.to_thread(c.send, "hi"), "answer to hi")
+        with self.assertRaisesRegex(RuntimeError, "task failed: RuntimeError: model down"):
+            await asyncio.to_thread(c.send, "boom")
+        bad = aios_a2a.Client(f"http://127.0.0.1:{self.srv.port}/", "wrong", timeout=10)
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+            await asyncio.to_thread(bad.send, "hi")
+
+
+class ClientRuleTests(unittest.TestCase):
+    def test_tokens_never_travel_over_plain_http_to_other_hosts(self):
+        with self.assertRaisesRegex(ValueError, "use https"):
+            aios_a2a.Client("http://agents.example.com/a2a", "t")
+        aios_a2a.Client("https://agents.example.com/a2a", "t")
+        aios_a2a.Client("http://agents.example.com/a2a")  # no token: allowed
+        for local in ("http://127.0.0.1:8770/", "http://localhost:8770/", "http://[::1]:8770/"):
+            aios_a2a.Client(local, "t")
+        for bad in ("ftp://x/", "file:///etc/passwd", "http:///nohost"):
+            with self.assertRaises(ValueError):
+                aios_a2a.Client(bad)
+
+    def test_state_names(self):
+        for raw, want in (("TASK_STATE_INPUT_REQUIRED", "input-required"), ("completed", "completed"),
+                          ("TASK_STATE_COMPLETED", "completed"), (None, "")):
+            self.assertEqual(aios_a2a.state_name(raw), want)
+
+    def test_text_of_ignores_other_parts(self):
+        parts = [{"kind": "text", "text": "a"}, {"kind": "file", "file": {}}, {"kind": "text", "text": 5}, "x",
+                 {"kind": "text", "text": "b"}]
+        self.assertEqual(aios_a2a.text_of(parts), "a\nb")
+        self.assertEqual(aios_a2a.text_of(None), "")
+
+
+class KernelTests(unittest.IsolatedAsyncioTestCase):
+    """A served aios agent, called by another aios kernel through the a2a__ tool."""
+    POLICY = {"helper": {"permissions": {"write_file", "now"},
+                         "scopes": {"write_file": {"paths": ["out/*"], "auto_paths": ["out/*"]}}}}
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = aios.WORKSPACE
+        aios.WORKSPACE = Path(self._tmp.name).resolve()
+        self.addCleanup(setattr, aios, "WORKSPACE", self._old)
+        self.addCleanup(self._tmp.cleanup)
+        self.remote_prov = Scripted()
+        self.remote = aios.Kernel(store=aios.Store(":memory:"), provider=self.remote_prov, approver=None)
+        self.addCleanup(self.remote.store.db.close)
+        aios.install_builtin_tools(self.remote)
+        self.srv = aios.make_a2a_server(self.remote, "helper", self.POLICY, None, TOKEN, port=0,
+                                        description="Writes reports.")
+        self.addAsyncCleanup(asyncio.to_thread, self.srv.close)
+        self.url = f"http://127.0.0.1:{self.srv.port}/"
+
+    async def test_served_runs_are_tainted_and_keep_no_history(self):
+        self.remote_prov.script = [call("write_file", {"path": "out/a.txt", "content": "x"}), text("could not write"),
+                                   text("second")]
+        c = aios_a2a.Client(self.url, TOKEN, timeout=10)
+        self.assertEqual(await asyncio.to_thread(c.send, "write out/a.txt"), "could not write")
+        self.assertFalse((aios.WORKSPACE / "out/a.txt").exists())  # auto_paths do not apply to strangers
+        (st,), = self.remote.store.db.execute("SELECT status FROM audit WHERE tool='write_file'").fetchall()
+        self.assertEqual(st, "denied")
+        self.assertEqual(await asyncio.to_thread(c.send, "again"), "second")
+        self.assertEqual(len(self.remote_prov.calls[-1]["messages"]), 1)  # no memory of the first request
+        self.assertEqual(self.remote.store.load_messages("helper"), [])  # nothing saved
+        self.assertIn("not your user", self.remote_prov.calls[0]["system"])
+        self.assertEqual(set(self.remote_prov.calls[0]["tools"]), {"write_file", "now"})
+
+    async def test_the_a2a_tool_needs_approval_and_is_untrusted(self):
+        self.remote_prov.script = [text("remote says hi")]
+        k = aios.Kernel(store=aios.Store(":memory:"), provider=Scripted(), approver=None)
+        self.addCleanup(k.store.db.close)
+        with mock.patch.dict(os.environ, {"AIOS_A2A_TOKEN_HELPER": TOKEN}):
+            self.assertEqual(await aios.install_a2a_tools(k, [f"helper={self.url}"]), ["a2a__helper"])
+        self.assertIn("Writes reports.", k.tools._schemas["a2a__helper"]["description"])
+        self.assertTrue(k.tools.is_untrusted("a2a__helper"))
+        agent = aios.Agent("main", {"a2a__helper"})
+        out, err, st = await k._execute(agent, "a2a__helper", {"task": "hi"}, False, {})
+        self.assertEqual(st, "denied")  # nobody to ask: it sends data off the machine
+        self.assertEqual(self.remote_prov.calls, [])
+
+        async def yes(*a, **kw):
+            return True
+
+        k.approver = yes
+        out, err, st = await k._execute(agent, "a2a__helper", {"task": "hi"}, False, {})
+        self.assertEqual((out, st), ("remote says hi", "ok"))
+
+    async def test_bad_specs_and_unreachable_agents_fail_at_start(self):
+        k = aios.Kernel(store=aios.Store(":memory:"), provider=Scripted(), approver=None)
+        self.addCleanup(k.store.db.close)
+        for spec in ("noequals", "bad name=http://x/", "x=ftp://x/"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                await aios.install_a2a_tools(k, [spec])
+        with self.assertRaisesRegex(RuntimeError, "no A2A agent card"):
+            await aios.install_a2a_tools(k, ["gone=http://127.0.0.1:9/"])
+
+
+if __name__ == "__main__":
+    unittest.main()
