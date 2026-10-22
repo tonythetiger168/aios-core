@@ -74,7 +74,7 @@ python aios.py daemon --policy policy.example.toml --provider openai --model lla
 python aios.py daemon --once ...          # run what is due, then exit: for cron or Windows Task Scheduler
 ```
 
-Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*` (see below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
+Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*`, `on webhook` (both below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
 
 - **Nobody can approve anything.** Same policy pipeline as `chat`, but risky tools are refused unless the policy pre-allows the path with `auto_paths`. A job with no policy section is read-only (`now`, `read_file`, `list_files`, `recall`, `list_facts`, `search_memory`).
 - A job that reads a file is *tainted*, so even `auto_paths` stop applying, unless the scope says `auto_when_tainted = true`: your explicit statement that injected text in what the job read may write into that one folder, and nothing else.
@@ -90,6 +90,18 @@ python aios.py jobs add mail "Summarise the new files in inbox/ into reports/mai
 - Files already there when you add the job are the baseline. The daemon checks every `--tick` (or every `--once` run) and acts on a change only once it has held still for one check, so a file still being copied is not read half-way.
 - File names are never put into the task (anyone who can drop a file could choose one); the task only says that the pattern matched. The job reads the files itself, which makes the run *tainted* like any other.
 - What the run writes into the watched folder does not trigger it again; changes made by others *during* a run are folded into that run. At most 5,000 matching files are fingerprinted, and the daily run cap applies.
+
+**Webhook triggers.** `--schedule "on webhook"` runs the job when another program on this machine (a git hook, a script, a home-automation bridge) sends it a request:
+
+```bash
+python aios.py jobs add triage "File the reported bug into notes/bugs.md" --schedule "on webhook" --agent reporter   # prints the job's secret once
+python aios.py daemon --webhook-port 8766 ...
+curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <secret>" --data-binary @event.json
+```
+
+- The listener binds 127.0.0.1 only and accepts `POST /hook/<job>` with the job's own secret (only its hash is stored; `aios jobs secret <job>` makes a new one). A wrong secret and an unknown job get the same 401, so names cannot be probed. Bodies are capped at 64 KB, and at most 20 requests wait per job (then 429).
+- The listener runs nothing itself: each request becomes one run on the next tick, under the job's policy, caps and daily limit. The body reaches the model **tagged as untrusted data** and the run is *tainted* from the start, so `auto_paths` stop applying (unless `auto_when_tainted`). An empty body is just a ping and does not taint. The body is deleted after the run.
+- To receive webhooks from the internet, put your own HTTPS reverse proxy or tunnel in front and keep the secret private; aios does not do TLS.
 
 ## Skills
 
@@ -200,7 +212,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (read-only; approvals in the browser not yet) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (read-only; approvals in the browser not yet) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
