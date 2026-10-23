@@ -33,7 +33,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
-- **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。目前還不能在瀏覽器裡審批。
+- **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。
@@ -75,12 +75,23 @@ python aios.py daemon --policy policy.example.toml --provider openai --model lla
 python aios.py daemon --once ...          # 執行到期的任務就結束：給 cron 或 Windows 工作排程器用
 ```
 
-排程格式：`every 30m`、`every 2h`、`every 1d`、`daily 09:00`、`weekly mon 09:00`、`once 2026-12-24 18:30`、`on change inbox/*`（見下；本地時間，最短每分鐘一次）。用 cron 的話：`* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`。
+排程格式：`every 30m`、`every 2h`、`every 1d`、`daily 09:00`、`weekly mon 09:00`、`once 2026-12-24 18:30`、`on change inbox/*`、`on webhook`（兩者見下；本地時間，最短每分鐘一次）。用 cron 的話：`* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`。
 
-- **沒有人能批准任何事。** 政策流程和 `chat` 相同，但高風險工具一律拒絕，除非政策用 `auto_paths` 預先允許該路徑。沒有政策區段的任務只能唯讀（`now`、`read_file`、`list_files`、`recall`、`list_facts`、`search_memory`）。
+- **沒有人能批准任何事**（除非你開啟下面的瀏覽器審批）。政策流程和 `chat` 相同，但高風險工具一律拒絕，除非政策用 `auto_paths` 預先允許該路徑。沒有政策區段的任務只能唯讀（`now`、`read_file`、`list_files`、`recall`、`list_facts`、`search_memory`）。
 - 讀過檔案的任務會被視為「被污染」，連 `auto_paths` 也不再生效，除非範圍設定了 `auto_when_tainted = true`：這代表你明確接受「任務讀到的文字若含注入指令，可以寫入那一個資料夾，且僅限該資料夾」。
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。
 - 守護程式停止期間錯過的任務，恢復後只會執行**一次**，不會每個錯過的時段各補一次。任務一次執行一個。結果用 `aios jobs history` 查看，每次工具呼叫都在 `aios audit` 裡。
+
+**在瀏覽器審批。** 守護程式（或 `serve`）可以改為詢問你，而不是直接拒絕：
+
+```bash
+python aios.py daemon --approvals console --approve-timeout 240 ...   # 高風險呼叫會等人回答
+python aios.py console --approve                                       # 在「Approvals」頁面回答
+```
+
+- 每個沒有被範圍預先允許的高風險呼叫，都會變成一筆請求，列出代理、工具與完整參數；若該次執行讀過不可信內容，會加上警告。你按 Approve 或 Deny。逾時（預設 240 秒，須短於任務的 `--timeout`）沒回答就視為拒絕；執行結束時請求也會關閉，事後無法再批准。
+- 只有用 `--approve` 啟動的控制台能回答；沒加時頁面是唯讀的。它唯一能寫入的就是這個回答。送出需要控制台的 cookie、每次啟動產生的表單 token，以及同源的 `Origin` 標頭，所以其他網頁無法替你按下按鈕。
+- 一次只處理一筆請求：請求未回答時，任務會等待。
 
 **檔案變動觸發。** `--schedule "on change inbox/*"` 會在符合樣式的檔案（相對於工作區，包含子資料夾）被新增、修改或刪除時執行任務：
 
@@ -91,6 +102,18 @@ python aios.py jobs add mail "把 inbox/ 裡的新檔案摘要寫到 reports/mai
 - 新增任務時已存在的檔案是基準，不算變動。守護程式每次 `--tick`（或每次 `--once`）檢查一次，變動要在下一次檢查時仍保持不變才會執行，避免讀到還在複製中的檔案。
 - 檔名**絕不會**放進任務文字（任何能放檔案的人都能挑檔名）；任務只會說明樣式有變動。任務會自己去讀檔案，所以這次執行和其他執行一樣會被視為「被污染」。
 - 任務自己寫進監看資料夾的檔案不會再次觸發它；執行**期間**別人做的變動會併入這次執行。最多只計算 5,000 個符合的檔案，每日執行上限照樣適用。
+
+**Webhook 觸發。** `--schedule "on webhook"` 會在本機其他程式（git hook、腳本、智慧家庭橋接器等）送出請求時執行任務：
+
+```bash
+python aios.py jobs add triage "把回報的 bug 記到 notes/bugs.md" --schedule "on webhook" --agent reporter   # 只會印出一次任務的密鑰
+python aios.py daemon --webhook-port 8766 ...
+curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <密鑰>" --data-binary @event.json
+```
+
+- 接收端只聽 127.0.0.1，接受帶有該任務專屬密鑰的 `POST /hook/<任務>`（只儲存雜湊；`aios jobs secret <任務>` 可產生新的密鑰）。密鑰錯誤和任務不存在都回同樣的 401，無法藉此探測任務名稱。內容上限 64 KB，每個任務最多 20 個請求排隊（超過回 429）。
+- 接收端本身不執行任何東西：每個請求會在下一次 tick 變成一次執行，套用該任務的政策、上限與每日次數限制。請求內容會**標記為不可信資料**交給模型，這次執行從一開始就是「被污染」的，所以 `auto_paths` 不再生效（除非設定 `auto_when_tainted`）。空白內容只算是通知，不會污染。執行後內容即刪除。
+- 若要接收來自網際網路的 webhook，請在前面自行架設 HTTPS 反向代理或通道，並保管好密鑰；aios 本身不處理 TLS。
 
 ## 技能（Skills）
 
@@ -152,7 +175,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 ```
 
 - **提供服務**：只聽 127.0.0.1；每次呼叫都需要 token（`/.well-known/agent-card.json` 的代理名片是公開的，只寫了代理名稱與說明）。呼叫者**不被信任**：每個請求都是該政策代理的一次全新執行，用它自己的權限與有上限的預算（預設 5 萬 token），一開始就被視為「被污染」，所以 `auto_paths`／`auto_args` 永遠不生效，請求之間不保留歷史，並寫入審計日誌。沒有人能審批高風險呼叫，所以對外提供的代理應該唯讀或嚴格限制範圍。
-- **呼叫遠端**：`--a2a 名稱=URL`（`chat` 與 `daemon` 都可用）會產生工具 `a2a__名稱`，授權方式和其他工具一樣。它會把你的文字送到另一台機器，所以每次呼叫都需要審批（在 `daemon` 中一律拒絕，除非範圍用 `auto_args` 預先允許），回覆也會被標記為不可信。token 絕不會以明文 `http` 送到本機以外的地方，而且呼叫一律送到你給的 URL，不會改送到遠端名片上寫的 URL。
+- **呼叫遠端**：`--a2a 名稱=URL`（`chat` 與 `daemon` 都可用）會產生工具 `a2a__名稱`，授權方式和其他工具一樣。它會把你的文字送到另一台機器，所以每次呼叫都需要審批（在 `daemon` 中一律拒絕，除非範圍用 `auto_args` 預先允許，或用 `--approvals console` 由你回答），回覆也會被標記為不可信。token 絕不會以明文 `http` 送到本機以外的地方，而且呼叫一律送到你給的 URL，不會改送到遠端名片上寫的 URL。
 - 尚未支援：串流、推播通知、檔案，以及多輪對話（每個請求各自獨立）。
 
 ## 架構
@@ -182,9 +205,9 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 - 定時任務是最危險的執行方式：無人值守，異常行為不會有人當場發現。請盡量讓任務唯讀，把寫入限制在單一輸出資料夾，並偶爾看看 `aios audit`。`auto_when_tainted` 是刻意拿安全換實用。時間為本地時間（遇到夏令時間切換時，每日任務可能偏移一小時一次）。守護程式只是一個行程：它掛掉，任務就會停擺，直到你重新啟動。
 - 記憶檢索只涵蓋已儲存的記憶（不含對話歷史）。向量檢索會把每條記憶的文字送到你設定的嵌入伺服器：私人記憶請用本機的。它只用替身伺服器測過，還沒有用真實的 Ollama 或 OpenAI 端點試過；關鍵字檢索不需要任何設定。
 - 技能信任的是**你審查過的內容**，不是作者。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
-- `serve` 沒有互動式審批（stdio 是協議通道）。請用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
+- `serve` 無法透過 stdio 詢問（它是協議通道）。請用 `--approvals console`、用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
-- 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
+- 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶，在 `--approve` 模式下也能回答審批請求。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
 - **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
@@ -217,7 +240,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動觸發（webhook 尚未）· ✅ 本機 Web 控制台（唯讀；瀏覽器審批尚未）· 可插拔沙箱後端（✅ Docker；microVM 尚未） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker；microVM 尚未） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
