@@ -115,6 +115,21 @@ curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <secret
 - The listener runs nothing itself: each request becomes one run on the next tick, under the job's policy, caps and daily limit. The body reaches the model **tagged as untrusted data** and the run is *tainted* from the start, so `auto_paths` stop applying (unless `auto_when_tainted`). An empty body is just a ping and does not taint. The body is deleted after the run.
 - To receive webhooks from the internet, put your own HTTPS reverse proxy or tunnel in front and keep the secret private; aios does not do TLS.
 
+## Looking after memory
+
+Notes saved while a run had read untrusted content are marked *unverified*. Check them now and then:
+
+```bash
+python aios.py memory review                # unverified notes, oldest first
+python aios.py memory confirm main owner    # you checked it: it becomes your note
+python aios.py memory tidy --dry-run        # what tidy would do
+python aios.py memory tidy                  # archive unverified notes older than 30 days (--days)
+python aios.py memory archived              # nothing is lost: memory restore <agent> <key>
+```
+
+- Tidy moves old unverified notes to an archive instead of deleting them, and never touches your notes or the model's. It also drops cached vectors whose note changed or is gone (they are rebuilt on demand), and lists notes with the same text under several keys without changing them.
+- Restore puts the note back as unverified, and refuses if a newer note with that key exists. No model is involved: deciding what an agent keeps believing is what an injected note would like to influence.
+
 ## Skills
 
 A skill is a folder in the open [Agent Skills](https://agentskills.io) format: `SKILL.md` with `name` and `description` front matter, followed by the instructions for the agent, so skills written for Claude, Codex, Gemini CLI or Copilot (for example [anthropics/skills](https://github.com/anthropics/skills)) load as they are. `skill.toml` (name, version, description) is optional; when present it wins, and a different `name` in the front matter is refused. Only the text after the front matter goes into the prompt. aios **never runs code inside a skill**; it only reads `SKILL.md`. Because those instructions go into the system prompt, a skill is a prompt-injection channel, so you review it and **pin its digest** first:

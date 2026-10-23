@@ -115,6 +115,21 @@ curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <密鑰
 - 接收端本身不執行任何東西：每個請求會在下一次 tick 變成一次執行，套用該任務的政策、上限與每日次數限制。請求內容會**標記為不可信資料**交給模型，這次執行從一開始就是「被污染」的，所以 `auto_paths` 不再生效（除非設定 `auto_when_tainted`）。空白內容只算是通知，不會污染。執行後內容即刪除。
 - 若要接收來自網際網路的 webhook，請在前面自行架設 HTTPS 反向代理或通道，並保管好密鑰；aios 本身不處理 TLS。
 
+## 照顧記憶
+
+在讀過不可信內容的執行中保存的記憶會標記為「未驗證」。偶爾檢查一下：
+
+```bash
+python aios.py memory review                # 未驗證的記憶，舊的在前
+python aios.py memory confirm main owner    # 你確認過了：它變成你的記憶
+python aios.py memory tidy --dry-run        # 預覽 tidy 會做什麼
+python aios.py memory tidy                  # 把超過 30 天的未驗證記憶移到封存（可用 --days 調整）
+python aios.py memory archived              # 不會遺失：memory restore <代理> <鍵>
+```
+
+- tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
+- restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
+
 ## 技能（Skills）
 
 技能是一個資料夾，採用開放的 [Agent Skills](https://agentskills.io) 格式：`SKILL.md` 開頭的前置欄位寫 `name` 與 `description`，後面是給代理的指令。因此為 Claude、Codex、Gemini CLI、Copilot 寫的技能（例如 [anthropics/skills](https://github.com/anthropics/skills)）可以直接使用。`skill.toml`（名稱、版本、說明）改為選用；有的話以它為準，前置欄位的 `name` 與它不同會被拒絕。只有前置欄位之後的內容會進入提示詞。aios **絕不執行技能裡的程式碼**，只會讀取 `SKILL.md`。因為這些指令會進入系統提示詞，技能本身就是提示注入的管道，所以要先審查並**固定它的摘要（digest）**：

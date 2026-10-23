@@ -2065,6 +2065,57 @@ def audit_cmd(agent: str | None, n: int, home: str):
     store.db.close()
 
 
+def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None, days: int = 30,
+               dry_run: bool = False, now=None) -> int:
+    import aios_keeper as mk
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print("(no memory)")
+        return 0
+    store = Store(str(db))
+    one = lambda t: " ".join(str(t).split())[:120]
+    try:
+        if action == "review":
+            rows = mk.review(store.db, agent)
+            for r in rows:
+                print(f"{r['agent']:<14} {r['key']:<24} {r['ts'] or '':<19}  {one(r['value'])}")
+            print(f"{len(rows)} unverified note(s). Confirm one you have checked: aios memory confirm <agent> <key>"
+                  if rows else "(no unverified notes)")
+            return 0
+        if action in ("confirm", "restore"):
+            if len(args) != 2:
+                print(f"usage: aios memory {action} <agent> <key>")
+                return 2
+            if action == "confirm":
+                ok = mk.confirm(store.db, *args)
+                print(f"confirmed {args[0]}/{args[1]}: it is now your note" if ok
+                      else f"{args[0]}/{args[1]} is not an unverified note")
+                return 0 if ok else 1
+            res = mk.restore(store.db, *args)
+            print({"restored": f"restored {args[0]}/{args[1]}",
+                   "exists": f"{args[0]}/{args[1]} exists again; remove it first (/forget) to restore the old one",
+                   "missing": f"{args[0]}/{args[1]} is not in the archive"}[res])
+            return 0 if res == "restored" else 1
+        if action == "archived":
+            rows = mk.archived(store.db, agent)
+            for r in rows:
+                print(f"{r['archived_ts']}  {r['agent']:<14} {r['key']:<24} {r['reason']}  {one(r['value'])}")
+            if not rows:
+                print("(archive is empty)")
+            return 0
+        rep = mk.tidy(store.db, days, dry_run, now)  # tidy
+        verb = "would archive" if dry_run else "archived"
+        for a, k in rep["archived"]:
+            print(f"{verb} {a}/{k} (unverified for over {days} days)")
+        print(f"{verb} {len(rep['archived'])} note(s); "
+              f"{'would drop' if dry_run else 'dropped'} {rep['stale_vectors']} stale cached vector(s)")
+        for a, v, keys in rep["duplicates"]:
+            print(f"same text under several keys for {a}: {', '.join(keys)}  ({one(v)})")
+        return 0
+    finally:
+        store.db.close()
+
+
 def add_model_flags(p):
     """Model + budget flags shared by `chat` and `daemon`."""
     p.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
@@ -2165,6 +2216,13 @@ def cli():
     jb.add_argument("--agent", default="main", help="add: policy section whose permissions the job gets")
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
+    me = sub.add_parser("memory", help="review, confirm and tidy agents' notes (nothing tidy does is lost)")
+    me.add_argument("action", choices=["review", "confirm", "tidy", "archived", "restore"])
+    me.add_argument("args", nargs="*", help="confirm/restore: <agent> <key>")
+    me.add_argument("--agent", help="review/archived: only this agent")
+    me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
+    me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
+    me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
     for p in (sv, dm):
         p.add_argument("--approvals", choices=["none", "console"], default="none",
@@ -2195,6 +2253,10 @@ def cli():
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
+    if a.cmd == "memory":
+        if a.days < 1:
+            ap.error("--days must be at least 1")
+        raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":
