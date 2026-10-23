@@ -1333,6 +1333,7 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
     def test_tool_description_matches_backend(self):
         for box, want in (
                 (aios.DockerSandbox(), "not a microVM"),
+                (aios.MicroVMSandbox(), "Firecracker microVM"),
                 (types.SimpleNamespace(name="process", net_isolated=False, timeout=10),
                  "network NOT isolated"),
                 (types.SimpleNamespace(name="process", net_isolated=True, timeout=10),
