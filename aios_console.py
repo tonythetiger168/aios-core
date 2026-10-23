@@ -132,7 +132,11 @@ def options(values, selected, blank="all") -> str:
 
 def page_overview(r: Reader, q: dict) -> str:
     n = lambda sql: (r.query(sql) or [(0,)])[0][0]
-    cards = [("Tool calls", n("SELECT COUNT(*) FROM audit WHERE tool!='(run)'")),
+    beat = r.query("SELECT ts FROM heartbeat WHERE name='daemon'")
+    seen = f"seen {beat[0][0][11:16]}" if beat else "never ran"
+    cards = [("Open alerts", n("SELECT COUNT(*) FROM alerts WHERE acked_ts IS NULL")),
+             ("Daemon", seen),
+             ("Tool calls", n("SELECT COUNT(*) FROM audit WHERE tool!='(run)'")),
              ("Refused", n("SELECT COUNT(*) FROM audit WHERE status='denied'")),
              ("Errors", n("SELECT COUNT(*) FROM audit WHERE status='error'")),
              ("Waiting for approval", (r.query("SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires>?",
@@ -146,7 +150,15 @@ def page_overview(r: Reader, q: dict) -> str:
     denied = table(["Time", "Agent", "Tool", "Arguments", "Reason"],
                    [[esc(ts), esc(a), esc(t), pre(ar), pre(res)] for ts, a, t, ar, res in rows],
                    "Nothing has been refused.")
-    return f'<div class="cards">{html_cards}</div><h2>Latest refusals</h2>{denied}'
+    rows = r.query("SELECT ts, severity, rule, subject, detail FROM alerts WHERE acked_ts IS NULL "
+                   "ORDER BY id DESC LIMIT 20")
+    sev = {"critical": "denied", "warning": "skipped", "info": "muted"}
+    alerts = table(["Time", "Severity", "Rule", "Subject", "Detail"],
+                   [[esc(ts), f'<span class="{sev.get(sv, "")}">{esc(sv)}</span>', esc(ru), esc(su), esc(de)]
+                    for ts, sv, ru, su, de in rows],
+                   "No open alerts. The daemon checks the audit log every tick; acknowledge with `aios alerts --ack`.")
+    return (f'<div class="cards">{html_cards}</div><h2>Open alerts</h2>{alerts}'
+            f"<h2>Latest refusals</h2>{denied}")
 
 
 def page_approvals(r: Reader, q: dict, csrf: str | None) -> str:
