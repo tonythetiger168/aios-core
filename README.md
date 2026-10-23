@@ -18,6 +18,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
+- **Images and PDFs (multimodal input)**: attach a picture or PDF to your next chat message with `/attach <file>` (`/attach` lists, `/detach` drops), or let the agent look at one in the workspace with `view_file`. Images that MCP tools return (screenshots from a browser server, for example) reach the model as images instead of being dropped. PNG, JPEG, GIF and WebP up to 5 MB, PDFs up to 20 MB; the type is read from the file's bytes, not its name. Only the newest 4 images/PDFs stay in an agent's history (older ones become a short note), so a long chat does not resend every picture on every step. With `--provider openai`, images are sent as `image_url` parts (needs a vision model) and PDFs are replaced by a note. An attached file counts as untrusted content like a file the agent read: a picture or a PDF can carry written instructions.
 - **Sandboxed code execution** (`run_python`), two backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (default on Linux/macOS): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces).
   - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
@@ -25,7 +26,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
 - **Budgets**: per-run limits on model calls (`--max-steps`), tokens (`--max-tokens`) and cost (`--max-cost` with `--price-in/--price-out`). A run that hits a limit stops *before* running more tools and says why. Each run's usage is written to the audit log.
 - **Human approval**: `write_file`, `run_python` and every MCP tool ask you `[y/N]` before running. With no approver configured (e.g. `demo`, library use) they are refused. `--auto-approve` turns the prompt off; unsafe.
-- **Untrusted-content tagging + taint policy**: output of `read_file`, `list_files`, `run_python` and every MCP tool is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
+- **Untrusted-content tagging + taint policy**: output of `read_file`, `view_file`, `list_files`, `run_python` and every MCP tool, and every file you `/attach`, is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
 - **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Argument rules (`args`) allow or deny values of any argument with glob patterns and a length cap, so MCP tools are no longer all-or-nothing (for example a fetch tool limited to `https://docs.python.org/*`), and `auto_args` skips the prompt for pre-approved values the same way `auto_paths` does for paths. Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
@@ -37,7 +38,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Prompt-injection test suite**: `python tests/test_injection.py --report` prints which attacks get through under each defense (below).
 - **Audit log** (SQLite, append-only API): every tool call is recorded with agent, tool, arguments, result and status (`ok` / `error` / `denied`). View it with `/audit`.
 - **Tests**: `python -m unittest discover -s tests -v` (standard library only, no API key needed); CI runs on Linux and Windows.
-- **CLI**: interactive chat with `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/reset`, `/quit`.
+- **CLI**: interactive chat with `/attach <file>`, `/detach`, `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/reset`, `/quit`.
 
 ## Quick start
 
@@ -58,6 +59,7 @@ python aios.py chat --sandbox docker          # run_python in a throwaway contai
 python aios.py chat --skill examples/skills/meeting-notes        # load a skill you pinned (see Skills)
 python aios.py chat --embed-model nomic-embed-text               # also search notes by meaning (needs `ollama pull nomic-embed-text`)
 python aios.py chat --auto-approve          # skip the [y/N] prompts for clean runs (unsafe)
+#   in chat:  /attach screenshot.png   then ask about it (images and PDFs; see What works today)
 python aios.py demo                         # scripted demo (risky tools are refused)
 ```
 
@@ -144,7 +146,7 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 ```
 
 - The client is treated like the model: **not trusted**. Same permissions, scopes, audit log and `<untrusted>` tagging as `chat`.
-- Without a policy only read-only tools are offered (`now`, `read_file`, `list_files`, `recall`, `list_facts`).
+- Without a policy only read-only tools are offered (`now`, `read_file`, `view_file`, `list_files`, `recall`, `list_facts`). `view_file` answers with MCP image content (PDFs as an embedded resource).
 - Nobody can answer a `[y/N]` prompt over stdio, so risky tools (`write_file`, `run_python`, `remember` after tainting) are **refused** unless the policy pre-allows a path with `auto_paths`. Once the session has read a file, even those are refused until the server restarts.
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
 - **Status**: written against the MCP SDK's low-level server API and tested only against a stand-in, not a real client. If your client does not connect or lists no tools, please open an issue with the stderr output.
@@ -164,6 +166,7 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 |---|---|
 | `now` | Current local date and time |
 | `read_file` / `write_file` / `list_files` | Workspace-only file access |
+| `view_file` | Look at an image (PNG, JPEG, GIF, WebP) or PDF in the workspace |
 | `remember` / `recall` / `list_facts` | Per-agent long-term memory |
 | `run_python` | Sandboxed Python (`--sandbox process` or `docker`) |
 
@@ -211,7 +214,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change triggers (webhooks not yet) · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker; microVM not yet) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
