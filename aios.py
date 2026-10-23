@@ -1998,7 +1998,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
             pins = st.list_skill_pins()
             st.db.close()
         for p in pins:
-            print(f"{p['name']:<24} v{p['version']:<10} {p['sha256'][:12]}  pinned {p['ts'][:10]}"
+            print(f"{p['name']:<24} {('v' + p['version']) if p['version'] else '-':<11} {p['sha256'][:12]}  pinned {p['ts'][:10]}"
                   + ("  (pinned despite high-severity findings)" if p["forced"] else ""))
         if not pins:
             print("(no trusted skills)")
@@ -2021,7 +2021,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     except sk.SkillError as e:
         print(f"invalid skill: {e}")
         return 1
-    print(f"{skill.name} v{skill.version}  sha256 {skill.sha256}")
+    print(f"{sk.label(skill.name, skill.version)}  sha256 {skill.sha256}")
     for f in findings:
         where = f"{f.file}:{f.line}" if f.line else f.file
         print(f"  [{f.severity:<6}] {f.rule:<17} {where}  {f.text}")
@@ -2047,7 +2047,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     store = Store(str(base / "aios.db"))
     store.pin_skill(skill.name, skill.sha256, skill.version, forced=high)
     store.db.close()
-    print(f"trusted {skill.name} v{skill.version} ({skill.sha256[:12]}). Use it with: chat --skill {target}")
+    print(f"trusted {sk.label(skill.name, skill.version)} ({skill.sha256[:12]}). Use it with: chat --skill {target}")
     return 0
 
 
