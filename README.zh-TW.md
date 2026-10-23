@@ -31,7 +31,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策（見下）。
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
-- **技能：摘要固定與掃描**：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
+- **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust`、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
@@ -117,7 +117,7 @@ curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <密鑰
 
 ## 技能（Skills）
 
-技能是一個資料夾，內含 `skill.toml`（名稱、版本）與 `SKILL.md`（給代理的指令）。aios **絕不執行技能裡的程式碼**，只會讀取 `SKILL.md`。因為這些指令會進入系統提示詞，技能本身就是提示注入的管道，所以要先審查並**固定它的摘要（digest）**：
+技能是一個資料夾，採用開放的 [Agent Skills](https://agentskills.io) 格式：`SKILL.md` 開頭的前置欄位寫 `name` 與 `description`，後面是給代理的指令。因此為 Claude、Codex、Gemini CLI、Copilot 寫的技能（例如 [anthropics/skills](https://github.com/anthropics/skills)）可以直接使用。`skill.toml`（名稱、版本、說明）改為選用；有的話以它為準，前置欄位的 `name` 與它不同會被拒絕。只有前置欄位之後的內容會進入提示詞。aios **絕不執行技能裡的程式碼**，只會讀取 `SKILL.md`。因為這些指令會進入系統提示詞，技能本身就是提示注入的管道，所以要先審查並**固定它的摘要（digest）**：
 
 ```bash
 python aios.py skills scan examples/skills/meeting-notes     # 風險掃描＋摘要
