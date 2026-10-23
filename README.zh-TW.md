@@ -18,9 +18,10 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
-- **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇兩種後端：
+- **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台。目前只有 Ubuntu 有 real-Docker CI 證據。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
+  - `microvm`（實驗性，需 Linux 與 KVM）：每次呼叫啟動一台全新的 [Firecracker](https://firecracker-microvm.github.io/) microVM，有自己的核心、沒有網路裝置、除了程式碼之外不帶入你電腦上的任何東西、根目錄唯讀、非特權使用者。只在明確指定時使用，`auto` 永遠不會選它；KVM、Firecracker 或映像檔缺少時 AIOS 會拒絕啟動。設定方式與威脅模型見 [docs/microvm-sandbox.md](docs/microvm-sandbox.md)。
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
@@ -194,7 +195,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 | `now` | 目前本地日期與時間 |
 | `read_file`／`write_file`／`list_files` | 僅限工作區的檔案存取 |
 | `remember`／`recall`／`list_facts` | 每個 agent 各自的長期記憶 |
-| `run_python` | 沙箱化 Python（`--sandbox process` 或 `docker`） |
+| `run_python` | 沙箱化 Python（`--sandbox process`、`docker` 或 `microvm`） |
 
 ## 安全現況
 
@@ -208,7 +209,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 - `serve` 無法透過 stdio 詢問（它是協議通道）。請用 `--approvals console`、用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
 - 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶，在 `--approve` 模式下也能回答審批請求。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
-- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
+- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權。
@@ -240,7 +241,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker；microVM 尚未） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

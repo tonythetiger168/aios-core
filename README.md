@@ -18,9 +18,10 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
-- **Sandboxed code execution** (`run_python`), two backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
+- **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (default on Linux/macOS): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces).
   - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
+  - `microvm` (experimental, Linux with KVM): a fresh [Firecracker](https://firecracker-microvm.github.io/) microVM per call with its own kernel, no network device, nothing from your machine except the code, a read-only root and an unprivileged user. Only chosen explicitly, never by `auto`, and AIOS refuses to start if KVM, Firecracker or the images are missing. Setup and threat model: [docs/microvm-sandbox.md](docs/microvm-sandbox.md).
 - **MCP client**: attach stdio MCP servers; their tools are registered as `<server>__<tool>` and are *not* granted to agents unless you allow them.
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
 - **Budgets**: per-run limits on model calls (`--max-steps`), tokens (`--max-tokens`) and cost (`--max-cost` with `--price-in/--price-out`). A run that hits a limit stops *before* running more tools and says why. Each run's usage is written to the audit log.
@@ -194,7 +195,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 | `now` | Current local date and time |
 | `read_file` / `write_file` / `list_files` | Workspace-only file access |
 | `remember` / `recall` / `list_facts` | Per-agent long-term memory |
-| `run_python` | Sandboxed Python (`--sandbox process` or `docker`) |
+| `run_python` | Sandboxed Python (`--sandbox process`, `docker` or `microvm`) |
 
 ## Security status
 
@@ -208,7 +209,7 @@ Honest list of what this does **not** do yet:
 - `serve` cannot ask over stdio (it is the protocol channel). Use `--approvals console`, pre-allow paths with `auto_paths` (or argument values with `auto_args`) or leave risky tools off. The session taint lasts until the server restarts.
 - The audit log records actions but is not tamper-proof: anyone with write access to `aios.db` can edit it.
 - The console link is a password while the console runs: anyone who has it (or the browser cookie it sets) can read your log and notes, and with `--approve` answer approval requests. A new one is made each start. It does not protect against other software running as your own user, which can read `aios.db` directly anyway.
-- **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
+- **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation; for that use `--sandbox microvm` on Linux with KVM. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
 - Docker output is drained in bounded chunks; at most 10,000 UTF-8 bytes are retained by default. Timeout/cancellation triggers bounded container kill, force removal and an absence check. Cleanup failure is reported, not treated as a confirmed kill. A create timeout has an unknown outcome: a delayed daemon operation may still create a container; check the named container on that daemon. See [validation scope](docs/docker-sandbox-validation.md).
 - **Windows**: without Docker, `run_python` is disabled (timeout-only isolation is not safe). Use `--sandbox docker`, or set `AIOS_ALLOW_WEAK_SANDBOX=1` to enable the weak one at your own risk.
 - Treat MCP servers as untrusted code and untrusted data sources; grant them per agent explicitly.
@@ -240,7 +241,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker; microVM not yet) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
