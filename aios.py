@@ -227,6 +227,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT, tool TEXT,
                 args TEXT, result TEXT, status TEXT);
+            CREATE TABLE IF NOT EXISTS approvals(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT, tool TEXT, args TEXT,
+                tainted INTEGER, status TEXT DEFAULT 'pending', expires TEXT, decided_ts TEXT);
         """)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(facts)")}  # upgrade older databases
         if "source" not in cols:
@@ -235,6 +238,26 @@ class Store:
             self.db.execute("ALTER TABLE facts ADD COLUMN ts TEXT")
         if "watch" not in {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}:
             self.db.execute("ALTER TABLE jobs ADD COLUMN watch TEXT")  # change-triggered jobs' state
+        self.db.commit()
+
+    # Approval requests answered in the web console (`aios console --approve`).
+    def request_approval(self, agent: str, tool: str, args: dict, tainted: bool, seconds: float) -> int:
+        now = datetime.now()
+        cur = self.db.execute(
+            "INSERT INTO approvals(ts, agent, tool, args, tainted, expires) VALUES(?,?,?,?,?,?)",
+            (now.isoformat(timespec="seconds"), agent, tool, json.dumps(args, ensure_ascii=False, indent=2),
+             int(tainted), (now + timedelta(seconds=seconds)).isoformat(timespec="seconds")))
+        self.db.commit()
+        return cur.lastrowid
+
+    def approval_status(self, aid: int) -> str | None:
+        row = self.db.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()
+        return row[0] if row else None
+
+    def expire_approval(self, aid: int):
+        """Close a request nobody answered (pending -> expired). A decision already made stays."""
+        self.db.execute("UPDATE approvals SET status='expired', decided_ts=? WHERE id=? AND status='pending'",
+                        (datetime.now().isoformat(timespec="seconds"), aid))
         self.db.commit()
 
     def add_message(self, agent: str, msg: dict):
@@ -1266,6 +1289,34 @@ async def ask_human(agent: str, tool: str, args: dict, tainted: bool = False) ->
 ask_human.wants_taint = True  # the kernel passes tainted=... to this approver
 
 
+class ConsoleApprover:
+    """Approver for unattended runs (daemon, serve): each risky call becomes a request in aios.db
+    that a person answers in `aios console --approve`. Nobody answering in time means no.
+    A person decides each call with the arguments in front of them, so it counts as interactive
+    (also after the run has read untrusted content; the console shows that warning)."""
+    interactive = True
+    wants_taint = True
+
+    def __init__(self, store: "Store", timeout: float = 240, poll: float = 0.5):
+        self.store, self.timeout, self.poll = store, timeout, poll
+
+    async def __call__(self, agent: str, tool: str, args: dict, tainted: bool = False) -> bool:
+        aid = self.store.request_approval(agent, tool, args, tainted, self.timeout)
+        print(f"[aios] approval #{aid}: {agent} wants to run {tool}; answer it in `aios console --approve` "
+              f"(waiting up to {self.timeout:g}s)", file=sys.stderr)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        try:
+            while loop.time() < deadline:
+                st = self.store.approval_status(aid)
+                if st != "pending":
+                    return st == "approved"
+                await asyncio.sleep(self.poll)
+        finally:  # also on cancellation (job timeout, Ctrl+C): nobody may approve it later
+            self.store.expire_approval(aid)
+        return self.store.approval_status(aid) == "approved"  # answered in the last instant
+
+
 def load_policy(path: str) -> dict:
     """TOML policy: per-agent tool permissions and capability scopes (needs Python 3.11+)."""
     try:
@@ -1419,7 +1470,7 @@ class Gateway:
         self.k.store.log_audit(self.agent.name, name, args, out, status)
         out = str(out)
         if status == "denied":
-            if "not approved by a human" in out:
+            if "not approved by a human" in out and self.k.approver is None:
                 out += self.HINT
         elif self.k.harden and self.k.tools.is_untrusted(name):
             self.agent.session_tainted = True  # from now on: no pre-allowed risky calls
@@ -1427,7 +1478,8 @@ class Gateway:
         return out, err
 
 
-async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str = "."):
+async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str = ".",
+                approve_timeout: float | None = None):
     global WORKSPACE
     from mcp.server.lowlevel import Server  # pip install mcp
     from mcp.server.stdio import stdio_server
@@ -1436,7 +1488,10 @@ async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str =
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    k = Kernel(store=Store(str(base / "aios.db")))  # no approver on purpose
+    store = Store(str(base / "aios.db"))
+    # stdio is the protocol channel, so nobody can be asked there: risky calls are refused unless a
+    # scope pre-allows them, or (--approvals console) a person answers them in the web console.
+    k = Kernel(store=store, approver=ConsoleApprover(store, approve_timeout) if approve_timeout else None)
     install_builtin_tools(k)
     pol = (policy or {}).get(agent_name)
     explicit = bool(pol and pol["permissions"] is not None)
@@ -1589,17 +1644,23 @@ class Scheduler:
 
 async def daemon(home: str = ".", policy: dict | None = None, provider=None, budget: Budget | None = None,
                  tick_seconds: float = 10, once: bool = False, max_runs_per_day: int = 200,
-                 timeout: float = 300):
+                 timeout: float = 300, approve_timeout: float | None = None):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    k = Kernel(store=Store(str(base / "aios.db")), provider=provider, approver=None)  # nobody to ask
+    store = Store(str(base / "aios.db"))
+    # Nobody is at a terminal: risky calls are refused, unless (--approvals console) a person
+    # answers them in the web console.
+    k = Kernel(store=store, provider=provider,
+               approver=ConsoleApprover(store, approve_timeout) if approve_timeout else None)
     install_builtin_tools(k)
     install_agent_tools(k, policy)
     sched = Scheduler(k, policy, budget, max_runs_per_day, timeout)
     print(f"[aios] job daemon on {base} ({len(k.store.list_jobs())} jobs"
           f"{', one pass' if once else ', Ctrl+C to stop'})", file=sys.stderr)
+    if approve_timeout:
+        print("[aios] risky calls wait for a person in `aios console --approve`", file=sys.stderr)
     try:
         while True:
             for r in await sched.tick():
@@ -1798,6 +1859,15 @@ def build_model(a, ap, default_tokens: int | None = None):
     return AnthropicProvider(a.model or MODEL), budget
 
 
+def approve_timeout(a, ap) -> float | None:
+    """--approvals console -> seconds to wait for a person; None = no approver."""
+    if a.approvals != "console":
+        return None
+    if a.approve_timeout <= 0:
+        ap.error("--approve-timeout must be positive")
+    return a.approve_timeout
+
+
 def cli():
     import aios_schedule
     ap = argparse.ArgumentParser(prog="aios", description="Minimal AIOS")
@@ -1814,10 +1884,12 @@ def cli():
     sv.add_argument("--agent", default="mcp", help="policy name to serve as (default: mcp)")
     sv.add_argument("--policy", help="TOML policy; without it only read-only tools are offered")
     sv.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
-    co = sub.add_parser("console", help="local read-only web console: audit log, jobs, memory, skills")
+    co = sub.add_parser("console", help="local web console: audit log, jobs, memory, skills; read-only unless --approve")
     co.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     co.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default 8765; 0 = any free port)")
     co.add_argument("--open", action="store_true", help="open the console in your browser")
+    co.add_argument("--approve", action="store_true",
+                    help="also let this console answer approval requests from `daemon`/`serve --approvals console`")
     au = sub.add_parser("audit", help="print the audit log")
     au.add_argument("--agent", help="only this agent (default: all)")
     au.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
@@ -1850,6 +1922,12 @@ def cli():
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
     dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
+    for p in (sv, dm):
+        p.add_argument("--approvals", choices=["none", "console"], default="none",
+                       help="risky calls: none = refused unless a scope pre-allows them (default); "
+                            "console = ask a person in `aios console --approve`")
+        p.add_argument("--approve-timeout", type=float, default=240,
+                       help="seconds to wait for an answer before refusing (default 240)")
     for p in (c, sv, dm, dmo):
         p.add_argument("--sandbox", choices=SANDBOXES,
                        help="run_python backend: process (local child process), docker (throwaway "
@@ -1869,7 +1947,7 @@ def cli():
         return audit_cmd(a.agent, a.n, a.home)
     if a.cmd == "console":
         import aios_console
-        raise SystemExit(aios_console.run(a.home, a.port, a.open))
+        raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":
@@ -1880,7 +1958,10 @@ def cli():
                 policy = load_policy(a.policy)
             except (OSError, ValueError) as e:
                 ap.error(f"--policy {a.policy}: {e}")
-        return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout))
+        if a.approvals == "console" and a.approve_timeout >= a.timeout:
+            ap.error("--approve-timeout must be shorter than --timeout (the job would be stopped first)")
+        return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
+                                  approve_timeout(a, ap)))
     if a.cmd == "skills":
         raise SystemExit(skills_cmd(a.action, a.target, a.home, a.force, a.yes))
     if a.cmd == "serve":
@@ -1891,7 +1972,7 @@ def cli():
             except (OSError, ValueError) as e:
                 ap.error(f"--policy {a.policy}: {e}")
         try:
-            return asyncio.run(serve(a.agent, policy, a.home))
+            return asyncio.run(serve(a.agent, policy, a.home, approve_timeout(a, ap)))
         except ImportError:
             ap.error("serve needs the MCP SDK: pip install mcp")
     provider, budget = build_model(a, ap)

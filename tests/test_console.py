@@ -95,7 +95,7 @@ class AccessTests(ConsoleCase):
         self.assertNotIn("script-src", r.getheader("Content-Security-Policy"))  # no scripts at all
         self.assertEqual(r.getheader("X-Frame-Options"), "DENY")
         self.assertEqual(r.getheader("Cache-Control"), "no-store")
-        self.assertEqual(r.getheader("Referrer-Policy"), "no-referrer")
+        self.assertEqual(r.getheader("Referrer-Policy"), "same-origin")
 
 
 class PageTests(ConsoleCase):
