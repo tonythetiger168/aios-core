@@ -77,6 +77,16 @@ python aios.py daemon --once ...          # run what is due, then exit: for cron
 
 Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*`, `on webhook` (both below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
 
+**Keep it running.** `aios service` prints a service definition that starts the daemon at login and restarts it when it crashes, plus the commands to install it. aios installs nothing itself, so you can read exactly what will run:
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # Task Scheduler (PowerShell)
+```
+
+Flags after `--` go to `aios daemon` unchanged (`--once` is refused: a service keeps running). API keys never go into the service file: systemd and launchd read `KEY=value` lines from `<home>/aios.env` (make it readable by you only); on Windows, set them as user environment variables.
+
 - **Nobody can approve anything** (unless you turn on browser approvals, below). Same policy pipeline as `chat`, but risky tools are refused unless the policy pre-allows the path with `auto_paths`. A job with no policy section is read-only (`now`, `read_file`, `list_files`, `recall`, `list_facts`, `search_memory`).
 - A job that reads a file is *tainted*, so even `auto_paths` stop applying, unless the scope says `auto_when_tainted = true`: your explicit statement that injected text in what the job read may write into that one folder, and nothing else.
 - Each job is its own agent (`job-<name>`: own history and memory) and starts every run with a clean history. Runs always have a cap (default 50,000 tokens, 8 steps, 300 s), and a job runs at most 200 times a day (`--max-runs-per-day`), so a typo like `every 1m` cannot burn your budget unnoticed.

@@ -77,6 +77,16 @@ python aios.py daemon --once ...          # 執行到期的任務就結束：給
 
 排程格式：`every 30m`、`every 2h`、`every 1d`、`daily 09:00`、`weekly mon 09:00`、`once 2026-12-24 18:30`、`on change inbox/*`、`on webhook`（兩者見下；本地時間，最短每分鐘一次）。用 cron 的話：`* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`。
 
+**保持執行。** `aios service` 會印出一份服務設定：登入時啟動守護程式、當掉時自動重啟，並附上安裝指令。aios 本身不安裝任何東西，所以你能看清楚到底會執行什麼：
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # 工作排程器（PowerShell）
+```
+
+`--` 之後的參數會原封不動交給 `aios daemon`（`--once` 會被拒絕：服務必須持續執行）。API key 絕不寫進服務設定檔：systemd 與 launchd 會從 `<home>/aios.env` 讀取 `KEY=value`（請設成只有你能讀）；Windows 請設成使用者環境變數。
+
 - **沒有人能批准任何事**（除非你開啟下面的瀏覽器審批）。政策流程和 `chat` 相同，但高風險工具一律拒絕，除非政策用 `auto_paths` 預先允許該路徑。沒有政策區段的任務只能唯讀（`now`、`read_file`、`list_files`、`recall`、`list_facts`、`search_memory`）。
 - 讀過檔案的任務會被視為「被污染」，連 `auto_paths` 也不再生效，除非範圍設定了 `auto_when_tainted = true`：這代表你明確接受「任務讀到的文字若含注入指令，可以寫入那一個資料夾，且僅限該資料夾」。
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。
