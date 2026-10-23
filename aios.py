@@ -1874,10 +1874,16 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
               "with 'Authorization: Bearer <secret>'", file=sys.stderr)
     if approve_timeout:
         print("[aios] risky calls wait for a person in `aios console --approve`", file=sys.stderr)
+    import aios_watchdog as wd
+    beat_info = f"pid={os.getpid()} tick={tick_seconds:g} timeout={timeout:g}"
     try:
         while True:
+            wd.beat(k.store.db, "daemon", beat_info)  # supervisor: the daemon is alive
             for r in await sched.tick():
                 print(f"[aios] job {r['job']}: {r['status']}", file=sys.stderr)
+            wd.beat(k.store.db, "daemon", beat_info)
+            for al in wd.check(k.store.db):  # watchdog: rules over the audit log, no model involved
+                print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
             if once:
                 break
             await asyncio.sleep(tick_seconds)
@@ -2065,6 +2071,61 @@ def audit_cmd(agent: str | None, n: int, home: str):
     store.db.close()
 
 
+def status_cmd(home: str, now=None) -> int:
+    """Supervisor view: is the daemon alive, what needs a person. Exit 0 = nothing needs attention."""
+    import aios_watchdog as wd
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print(f"no aios.db in {Path(home).resolve()}")
+        return 1
+    store = Store(str(db))
+    try:
+        hb = wd.liveness(store.db, now=now)
+        info = dict(re.findall(r"(tick|timeout)=([0-9.]+)", hb["info"] or ""))
+        if info and hb["state"] != "never":  # a slow --tick or a long job must not look like a dead daemon
+            grace = 3 * float(info.get("tick", 0)) + float(info.get("timeout", 0))
+            hb = wd.liveness(store.db, now=now, stale_after=max(wd.STALE_AFTER, grace))
+        when = f"last seen {hb['ts']} ({hb['age']:.0f}s ago)" if hb["ts"] else "has never run here"
+        print(f"daemon: {hb['state']}, {when}")
+        alerts = wd.list_alerts(store.db)
+        pending = store.db.execute("SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires>?",
+                                   (datetime.now().isoformat(timespec="seconds"),)).fetchone()[0]
+        print(f"open alerts: {len(alerts)}   waiting for approval: {pending}")
+        for al in alerts[:10]:
+            print(f"  #{al['id']} {al['ts']} [{al['severity']}] {al['rule']}: {al['detail']}")
+        return 0 if hb["state"] != "down" and not alerts and not pending else 1
+    finally:
+        store.db.close()
+
+
+def alerts_cmd(home: str, show_all: bool = False, ack: str | None = None, run_check: bool = False,
+               n: int = 50) -> int:
+    import aios_watchdog as wd
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print("(no alerts)")
+        return 0
+    store = Store(str(db))
+    try:
+        if run_check:
+            print(f"checked: {len(wd.check(store.db))} new alert(s)")
+        if ack:
+            if ack != "all" and not ack.isdigit():
+                print("--ack takes an alert number or 'all'")
+                return 2
+            print(f"acknowledged {wd.ack(store.db, ack)} alert(s)")
+            return 0
+        rows = wd.list_alerts(store.db, show_all, n)
+        for al in rows:
+            done = f"  (acknowledged {al['acked_ts']})" if al["acked_ts"] else ""
+            print(f"#{al['id']} {al['ts']} [{al['severity']}] {al['rule']} {al['subject']}: {al['detail']}{done}")
+        if not rows:
+            print("(no open alerts)" if not show_all else "(no alerts)")
+        return 0
+    finally:
+        store.db.close()
+
+
 def add_model_flags(p):
     """Model + budget flags shared by `chat` and `daemon`."""
     p.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
@@ -2165,6 +2226,14 @@ def cli():
     jb.add_argument("--agent", default="main", help="add: policy section whose permissions the job gets")
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
+    st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
+    st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
+    al.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    al.add_argument("--all", action="store_true", help="include acknowledged alerts")
+    al.add_argument("--ack", metavar="ID|all", help="acknowledge one alert, or all open ones")
+    al.add_argument("--check", action="store_true", help="run the watchdog rules now (the daemon does this every tick)")
+    al.add_argument("-n", type=int, default=50, help="how many alerts (default 50)")
     dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
     for p in (sv, dm):
         p.add_argument("--approvals", choices=["none", "console"], default="none",
@@ -2192,6 +2261,10 @@ def cli():
         return asyncio.run(demo())
     if a.cmd == "audit":
         return audit_cmd(a.agent, a.n, a.home)
+    if a.cmd == "status":
+        raise SystemExit(status_cmd(a.home))
+    if a.cmd == "alerts":
+        raise SystemExit(alerts_cmd(a.home, a.all, a.ack, a.check, a.n))
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
