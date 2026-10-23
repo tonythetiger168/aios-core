@@ -178,7 +178,9 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             k = make_kernel(Resp([text("a cat")], "end_turn"), db=db)
             await k._run(aios.Agent("a", set()), "what?", attachments=[("c.png", aios_media.block(PNG))])
             k.store.db.close()
-            msgs = aios.Store(db).load_messages("a")
+            store = aios.Store(db)
+            msgs = store.load_messages("a")
+            store.db.close()  # Windows cannot delete an open database
             self.assertEqual(len(msgs), 2)
             self.assertEqual(media_in(msgs[0]["content"]), [aios_media.block(PNG)])
 
