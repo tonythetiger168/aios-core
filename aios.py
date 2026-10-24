@@ -1050,7 +1050,8 @@ class DockerSandbox:
     def command(self, container: str) -> list[str]:
         # Create separately: once acknowledged, a delayed start cannot create a new container
         # after cleanup. A timed-out create has an unknown outcome and is never called 'killed'.
-        return [self.docker, "create", "--rm", "-i", "--name", container, "--pull", "never",
+        # No --rm: the stopped container is kept until cleanup so an OOM kill can be identified.
+        return [self.docker, "create", "-i", "--name", container, "--pull", "never",
                 "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
                 "--memory", f"{self.mem_mb}m", "--memory-swap", f"{self.mem_mb}m",
                 "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
@@ -1113,13 +1114,51 @@ class DockerSandbox:
             rc, out = await self._invoke(
                 [self.docker, "container", "inspect", container], timeout=self.cleanup_timeout)
             if rc and ("no such container" in out.lower() or "no such object" in out.lower()):
-                return  # absence verified; --rm may already have removed it
+                return  # absence verified
             errors.append(f"inspect: {out[:200]}")
         except (OSError, asyncio.TimeoutError) as e:
             errors.append(f"inspect: {type(e).__name__}")
         raise RuntimeError(f"Docker cleanup unconfirmed for {container}: {'; '.join(errors)}")
 
+    # Containers whose create timed out or was cancelled: the daemon may still create them later.
+    # Each later call removes any that appeared, for RECONCILE_WINDOW seconds (at most 32 names).
+    unknown: dict[str, float] = {}
+    RECONCILE_WINDOW = 600
+
+    async def _reconcile(self):
+        now = asyncio.get_running_loop().time()
+        for name, since in list(DockerSandbox.unknown.items()):
+            try:
+                rc, _ = await self._invoke([self.docker, "rm", "--force", name], timeout=self.cleanup_timeout)
+            except (OSError, asyncio.TimeoutError):
+                continue  # daemon busy: try again next call
+            if rc == 0:  # it existed: a delayed create happened after our cleanup
+                print(f"[sandbox] removed {name}, created late by the daemon after its create timed out",
+                      file=sys.stderr)
+            if rc == 0 or now - since > self.RECONCILE_WINDOW:
+                if rc != 0:
+                    print(f"[sandbox] stopped watching {name}: no delayed creation after "
+                          f"{self.RECONCILE_WINDOW}s", file=sys.stderr)
+                DockerSandbox.unknown.pop(name, None)
+
+    def _unknown_outcome(self, container):
+        DockerSandbox.unknown[container] = asyncio.get_running_loop().time()
+        while len(DockerSandbox.unknown) > 32:
+            name = next(iter(DockerSandbox.unknown))
+            print(f"[sandbox] too many unknown creates; no longer watching {name}", file=sys.stderr)
+            DockerSandbox.unknown.pop(name)
+
+    async def _oom_killed(self, container) -> bool:
+        try:
+            rc, out = await self._invoke([self.docker, "container", "inspect", "--format",
+                                          "{{.State.OOMKilled}}", container], timeout=self.cleanup_timeout)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        return rc == 0 and out.strip() == "true"
+
     async def run_python(self, code: str) -> str:
+        if DockerSandbox.unknown:
+            await self._reconcile()
         container = f"aios-sbx-{uuid.uuid4().hex}"
         created = False
         failure = None
@@ -1135,17 +1174,21 @@ class DockerSandbox:
             rc, out = await self._invoke(
                 [self.docker, "start", "--attach", "--interactive", container], code.encode(),
                 timeout=remaining, limit=self.max_out)
+            if rc and await self._oom_killed(container):
+                return f"killed: out of memory ({self.mem_mb} MiB limit)\n{out}"
             return f"exit={rc}\n{out}"
         except asyncio.TimeoutError:
             if not created:
+                self._unknown_outcome(container)
                 raise RuntimeError(f"Docker create timed out; outcome unknown for {container}. "
-                                   "Check the daemon for a delayed container creation.")
+                                   "AIOS will remove it if it appears during the next calls.")
             return f"killed: timeout after {self.timeout}s"
         except BaseException as e:
             failure = e
             if not created and isinstance(e, asyncio.CancelledError):
+                self._unknown_outcome(container)
                 print(f"[sandbox] Docker create cancelled; outcome unknown for {container}. "
-                      "Check the daemon for a delayed container creation.", file=sys.stderr)
+                      "AIOS will remove it if it appears during the next calls.", file=sys.stderr)
             raise
         finally:
             # Complete bounded cleanup even if the caller cancels again during teardown.

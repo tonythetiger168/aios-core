@@ -84,8 +84,9 @@ Follow-up acceptance criteria:
 
 1. Real-Docker validation on supported Windows/macOS Docker Desktop versions,
    including cancellation, cleanup and unsupported configuration failures.
-2. CPU, PID, swap and memory/OOM cause checks; daemon disconnect/restart and
-   delayed-create reconciliation tests. Rootless/remote contexts need explicit scope.
+2. ~~CPU, PID, swap and memory/OOM cause checks; delayed-create reconciliation~~: see
+   "Enforcement and failure outcomes" below. Still open: daemon disconnect/restart under
+   real Docker, and rootless or remote contexts.
 3. ~~Image digest pinning/update policy and daemon/context threat model.~~ See
    "Image pinning and trust" below.
 4. ~~A separate microVM backend~~: `--sandbox microvm`, see
@@ -148,3 +149,29 @@ namespaces for the network, seccomp and the default AppArmor/SELinux profile whe
 Docker and Docker Desktop change who enforces what. Rootless Docker needs cgroup v2 delegation for
 the limits to apply, and Docker Desktop runs everything in its own Linux VM. These configurations
 are not covered by CI; validate them with the opt-in real-Docker tests before relying on them.
+
+## Enforcement and failure outcomes
+
+Real-Docker tests on the Ubuntu CI runners (cgroup v2) check the limits Docker actually applied,
+not only the flags AIOS passed:
+
+| Limit | Checked inside the container | Behaviour test |
+|---|---|---|
+| Memory | `memory.max` equals `--memory` | Writing 512 MiB under a 64 MiB limit ends as `killed: out of memory (64 MiB limit)` |
+| Swap | `memory.swap.max` is `0` | (covered by the memory test: there is no swap to fall back on) |
+| PIDs | `pids.max` equals `--pids-limit` | Forking stops below the limit |
+| CPU | `cpu.max` quota/period equals `--cpus` | Two busy processes under 0.5 CPU get under 0.8 CPU-seconds per second |
+
+- **OOM cause**: containers are no longer created with `--rm`. After a non-zero exit, AIOS reads
+  `State.OOMKilled` before cleanup removes the container. Only a confirmed OOM kill is reported
+  as out of memory; any other failure stays `exit=<code>`. A hard crash of AIOS can leave a stopped
+  `aios-sbx-*` container behind (nothing runs in it), and `docker container prune` removes it.
+- **Delayed creates**: when `docker create` times out or is cancelled, the outcome stays explicitly
+  *unknown*. The name is also remembered. For the next 10 minutes, each `run_python` call first runs
+  `docker rm --force` on those exact names. If one appears it is removed and reported, and when the
+  window ends AIOS says it stopped watching. At most 32 names are tracked.
+- **Concurrent calls**: three parallel calls run in three containers, identified by their own
+  container IDs, and each exact container is confirmed gone afterwards. No name-prefix scan.
+
+Not covered by CI: daemon disconnect or restart during a call, rootless Docker, Docker Desktop and
+remote contexts. Failed or hung kill and removal are covered only with a fake Docker CLI.
