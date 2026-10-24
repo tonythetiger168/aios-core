@@ -5,11 +5,12 @@ can call theirs as tools.
     AIOS_A2A_TOKEN_HELPER=<token> python aios.py chat --a2a helper=http://127.0.0.1:8770 --policy ...
 
 Speaks the core of A2A over JSON-RPC 2.0, in both protocol versions in use: 1.0 (`SendMessage`,
-`SendStreamingMessage`, `GetTask`, `CancelTask`, `ListTasks`) and 0.3 (`message/send`, `message/stream`,
-`tasks/get`, `tasks/cancel`), plus the agent card at /.well-known/agent-card.json. The reply is a finished
+`SendStreamingMessage`, `GetTask`, `CancelTask`, `ListTasks`, `SubscribeToTask`) and 0.3 (`message/send`,
+`message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`), plus the agent card at /.well-known/agent-card.json. The reply is a finished
 Task with a text artifact, or, when the caller asks not to wait (1.0 `returnImmediately`, 0.3
 `blocking: false`), a working task to poll with GetTask and stop with CancelTask. The streaming methods
-send the task as server-sent events (submitted, working, answer, final status). Messages that carry a
+send the task as server-sent events (submitted, working, answer, final status); a caller whose stream
+broke can subscribe to the unfinished task again and gets the same answer and final status. Messages that carry a
 `contextId` continue that conversation: the served agent keeps its history for that context (in memory,
 bounded). Canceling a running task stops the agent at its next await and forgets that conversation's
 history (it may end mid tool call). Push notifications and file parts are not supported. Standard
@@ -55,8 +56,9 @@ CONTEXT_IDLE = 1800  # seconds before an unused conversation is forgotten
 TERMINAL = {"completed", "failed", "canceled", "rejected"}
 V1_METHODS = {"SendMessage": "send", "GetTask": "get", "CancelTask": "cancel", "ListTasks": "list"}
 V03_METHODS = {"message/send": "send", "tasks/get": "get", "tasks/cancel": "cancel"}
-STREAM_METHODS = {"SendStreamingMessage": True, "message/stream": False}  # -> speaks 1.0
-UNSUPPORTED_METHODS = {"tasks/resubscribe", "SubscribeToTask", "GetExtendedAgentCard"}
+STREAM_METHODS = {"SendStreamingMessage": (True, "stream"), "message/stream": (False, "stream"),  # (1.0?, op)
+                  "SubscribeToTask": (True, "subscribe"), "tasks/resubscribe": (False, "subscribe")}
+UNSUPPORTED_METHODS = {"GetExtendedAgentCard"}
 CANCELED = "canceled by the caller"
 NAME_RE = r"[A-Za-z0-9_-]{1,48}"
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,100}")  # context ids we accept from callers and report to models
@@ -220,22 +222,36 @@ class Server:
         text, cid = self._accept(params)
         tid = str(uuid.uuid4())
 
-        def status(state, task=None, final=False):
-            ev = {"taskId": tid, "contextId": cid,
-                  "status": self.render(task, v1)["status"] if task else
-                  {"state": "TASK_STATE_" + state.upper() if v1 else state, "timestamp": now()}}
-            return {"statusUpdate": ev} if v1 else {"kind": "status-update", "final": final, **ev}
-
         first = {"id": tid, "contextId": cid, "status": {"state": "TASK_STATE_SUBMITTED" if v1 else "submitted"}}
         emit({"task": first} if v1 else {"kind": "task", **first})
-        emit(status("working"))
-        task = self._finish(text, cid, tid)
-        rendered = self.render(task, v1)
+        ev = {"taskId": tid, "contextId": cid,
+              "status": {"state": "TASK_STATE_WORKING" if v1 else "working", "timestamp": now()}}
+        emit({"statusUpdate": ev} if v1 else {"kind": "status-update", "final": False, **ev})
+        self._follow(self._start(text, cid, tid), v1, emit)
+
+    def subscribe(self, params, v1: bool, emit):
+        """1.0 SubscribeToTask / 0.3 tasks/resubscribe: the task as it is now, then the rest of its
+        events. A finished task has no more events: GetTask returns it."""
+        task = self._task(params)
+        with self._tasks_lock:
+            if task["state"] in TERMINAL:
+                raise RpcError(UNSUPPORTED, f"the task is already {task['state']}: use GetTask")
+            now_ = self.render(task, v1)
+        emit({"task": now_} if v1 else now_)
+        self._follow(task, v1, emit)
+
+    def _follow(self, task: dict, v1: bool, emit):
+        """Wait for `task`, then emit its answer and final status."""
+        self._wait(task)
+        tid, cid = task["id"], task["contextId"]
+        with self._tasks_lock:
+            rendered = self.render(task, v1)
         for art in rendered.get("artifacts", []):
             ev = {"taskId": tid, "contextId": cid, "artifact": art}
             emit({"artifactUpdate": ev} if v1 else
                  {"kind": "artifact-update", "append": False, "lastChunk": True, **ev})
-        emit(status(task["state"], task, final=True))
+        ev = {"taskId": tid, "contextId": cid, "status": rendered["status"]}
+        emit({"statusUpdate": ev} if v1 else {"kind": "status-update", "final": True, **ev})
 
     def _task(self, params) -> dict:
         tid = params.get("id") if isinstance(params, dict) else None
@@ -308,7 +324,8 @@ class Server:
                     emit = emit or start_stream()
                     emit({"jsonrpc": "2.0", "id": rid, "result": result})
 
-                self.stream(req.get("params"), STREAM_METHODS[method], send_event)
+                v1, sop = STREAM_METHODS[method]
+                getattr(self, sop)(req.get("params"), v1, send_event)
                 return None
             if op:
                 result = getattr(self, op)(req.get("params"), method in V1_METHODS)

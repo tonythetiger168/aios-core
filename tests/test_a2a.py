@@ -43,6 +43,7 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.seen = []
+        self.gate = asyncio.Event()
 
         async def run(agent, t):
             self.seen.append((agent, t))
@@ -50,6 +51,8 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("model down")
             if t == "slow":
                 await asyncio.sleep(5)
+            if t == "gate":
+                await self.gate.wait()
             return f"answer to {t}"
 
         self.srv = aios_a2a.Server("helper", "Helps.", TOKEN, run, lambda: "agent-object",
@@ -132,7 +135,9 @@ class ServerTests(ServerCase):
         cases = [
             ("message/stream", {}, aios_a2a.INVALID_PARAMS),  # checked before the stream starts
             ("tasks/cancel", {"id": "x"}, aios_a2a.TASK_NOT_FOUND),
-            ("tasks/resubscribe", {"id": "x"}, aios_a2a.UNSUPPORTED),
+            ("tasks/resubscribe", {"id": "x"}, aios_a2a.TASK_NOT_FOUND),
+            ("SubscribeToTask", {}, aios_a2a.TASK_NOT_FOUND),
+            ("GetExtendedAgentCard", {}, aios_a2a.UNSUPPORTED),
             ("nope/nope", {}, aios_a2a.NO_METHOD),
             ("message/send", {}, aios_a2a.INVALID_PARAMS),
             ("message/send", {"message": dict(user_msg(), role="agent")}, aios_a2a.INVALID_PARAMS),
@@ -266,6 +271,79 @@ class ServerTests(ServerCase):
         self.assertIn("model down", aios_a2a.text_of(final["message"]["parts"]))
         kind, events = await self.sse("SendStreamingMessage", {"message": dict(msg, role="ROLE_AGENT")})
         self.assertEqual((kind, events[0]["error"]["code"]), ("application/json", aios_a2a.INVALID_PARAMS))
+
+    def waits(self, n):
+        """Patch the server so the test can tell when `n` streams are waiting for their task."""
+        waiting, wait = [], self.srv._wait
+
+        def counted(task):
+            waiting.append(task["id"])
+            return wait(task)
+
+        patcher = mock.patch.object(self.srv, "_wait", side_effect=counted)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        async def until():
+            for _ in range(500):
+                if len(waiting) >= n:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail(f"only {len(waiting)} of {n} streams are waiting")
+        return until
+
+    async def test_subscribing_to_a_running_task_streams_the_rest_of_it(self):
+        self.srv.timeout = 30
+        msg = {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "gate"}]}
+        task = (await self.rpc("SendMessage", {"message": msg, "configuration": {"returnImmediately": True}}))["result"]["task"]
+        await self.started("gate")
+        until = self.waits(2)
+        v1 = asyncio.ensure_future(self.sse("SubscribeToTask", {"id": task["id"]}))
+        v03 = asyncio.ensure_future(self.sse("tasks/resubscribe", {"id": task["id"]}))
+        await until()  # both subscribers have the task and wait for the rest
+        self.gate.set()
+        (k1, ev1), (k03, ev03) = await v1, await v03
+        self.assertEqual((k1, k03), ("text/event-stream", "text/event-stream"))
+        res = [e["result"] for e in ev1]
+        self.assertEqual([next(iter(r)) for r in res], ["task", "artifactUpdate", "statusUpdate"])
+        self.assertEqual(res[0]["task"]["status"]["state"], "TASK_STATE_WORKING")
+        self.assertEqual(res[1]["artifactUpdate"]["artifact"]["parts"], [{"text": "answer to gate"}])
+        self.assertEqual(res[2]["statusUpdate"]["status"]["state"], "TASK_STATE_COMPLETED")
+        res = [e["result"] for e in ev03]
+        self.assertEqual([r["kind"] for r in res], ["task", "artifact-update", "status-update"])
+        self.assertEqual((res[2]["status"]["state"], res[2]["final"]), ("completed", True))
+        self.assertEqual({r.get("taskId", r.get("id")) for r in res}, {task["id"]})
+        # a finished task has no more events: GetTask returns it
+        kind, events = await self.sse("SubscribeToTask", {"id": task["id"]})
+        self.assertEqual((kind, events[0]["error"]["code"]), ("application/json", aios_a2a.UNSUPPORTED))
+        self.assertIn("GetTask", events[0]["error"]["message"])
+
+    def _first_events(self, method, params, n):
+        """Read `n` events of a stream, then hang up (a caller whose connection broke)."""
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+        c.request("POST", "/", body=json.dumps({"jsonrpc": "2.0", "id": 9, "method": method, "params": params}),
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"})
+        r, got = c.getresponse(), []
+        while len(got) < n:
+            line = r.fp.readline().decode()
+            if line.startswith("data: "):
+                got.append(json.loads(line.removeprefix("data: ")))
+        c.close()
+        return got
+
+    async def test_a_caller_whose_stream_broke_gets_the_answer_by_subscribing_again(self):
+        self.srv.timeout = 30
+        first = await asyncio.to_thread(self._first_events, "message/stream", {"message": user_msg("gate")}, 2)
+        tid = first[0]["result"]["id"]
+        self.assertEqual(first[1]["result"]["status"]["state"], "working")
+        until = self.waits(1)  # the new stream (the broken one already waits)
+        again = asyncio.ensure_future(self.sse("tasks/resubscribe", {"id": tid}))
+        await until()
+        self.gate.set()
+        _, events = await again
+        res = [e["result"] for e in events]
+        self.assertEqual(aios_a2a.text_of(res[1]["artifact"]["parts"]), "answer to gate")
+        self.assertEqual((res[2]["status"]["state"], res[2]["final"]), ("completed", True))
 
     async def test_a_context_id_continues_the_conversation(self):
         made = []
