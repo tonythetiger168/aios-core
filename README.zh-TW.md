@@ -244,9 +244,9 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 
 - **提供服務**：只聽 127.0.0.1；每次呼叫都需要 token（`/.well-known/agent-card.json` 的代理名片是公開的，只寫了代理名稱與說明）。呼叫者**不被信任**：每段對話都是該政策代理的一個全新實例，用它自己的權限，每個請求有預算上限（預設 5 萬 token）。一開始就被視為「被污染」，所以 `auto_paths`／`auto_args` 永遠不生效，每個請求都寫入審計日誌。帶有 `contextId` 的訊息會接續那段對話：歷史只留在記憶體中（每段對話最多 20 則訊息、同時最多 20 段對話，閒置 30 分鐘後忘記），絕不存檔；沒帶的訊息就重新開始。沒有人能審批高風險呼叫，所以對外提供的代理應該唯讀或嚴格限制範圍。
 - **呼叫遠端**：`--a2a 名稱=URL`（`chat` 與 `daemon` 都可用）會產生工具 `a2a__名稱`，授權方式和其他工具一樣。它會把你的文字送到另一台機器，所以每次呼叫都需要審批（在 `daemon` 中一律拒絕，除非範圍用 `auto_args` 預先允許，或用 `--approvals console` 由你回答），回覆也會被標記為不可信。token 絕不會以明文 `http` 送到本機以外的地方，而且呼叫一律送到你給的 URL，不會改送到遠端名片上寫的 URL。每個回覆結尾會附上 `[conversation: <id>]`，模型把這個 id 當作 `conversation` 傳回去就能接續對話，遠端代理要求補充資訊時也一樣。
-- **串流**：`SendStreamingMessage`／`message/stream` 會以 server-sent events 回覆（已提交、處理中、答案、最終狀態），所以只支援串流的用戶端也能用。目前還不是逐字更新：答案一次送達。
+- **串流**：`SendStreamingMessage`／`message/stream` 會以 server-sent events 回覆（已提交、處理中、答案、最終狀態），所以只支援串流的用戶端也能用。目前還不是逐字更新：答案一次送達。串流斷線的呼叫端可以重新訂閱還沒完成的任務（`SubscribeToTask`／`tasks/resubscribe`，已用官方 a2a-sdk 用戶端驗證），會先拿到任務目前的狀態，接著是答案與最終狀態；已完成的任務請用 `GetTask` 讀取。
 - **背景任務**：不想等待的呼叫端可以送出 `returnImmediately`（1.0）或 `blocking: false`（0.3），會先拿到一個處理中的任務，之後用 `GetTask`／`tasks/get` 查詢、用 `ListTasks`（1.0；可依 `contextId` 或 `status` 篩選）列出，用 `CancelTask`／`tasks/cancel` 取消。請求仍是一次處理一個；同時最多 8 個未完成的任務，超過的會被拒絕。取消會讓代理在下一步停下，並清掉那段對話的歷史，因為它可能停在工具呼叫的一半。`a2a__名稱` 等遠端任務等到逾時時，會請遠端代理取消它。
-- 尚未支援：推播通知、重新訂閱串流，以及檔案。
+- 尚未支援：推播通知，以及檔案。
 
 ## 代理群（Swarm）
 
@@ -342,7 +342,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流、背景任務與取消）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`；尚未架設公開的註冊中心）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
