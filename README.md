@@ -31,6 +31,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy, with a heartbeat and a rule-based watchdog (`aios status`, `aios alerts`; see below).
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
+- **Agent swarms**: hand hundreds of sub-tasks to helper agents at once with the `swarm` tool or `aios swarm`, under a worker pool, a process-wide limit on model calls in flight, a shared token/cost budget and per-task timeouts, optionally combined by a reducer agent. Same permissions, approvals, taint and audit as one delegation (see below).
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
@@ -223,6 +224,38 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 - **Streaming**: `SendStreamingMessage` / `message/stream` answer as server-sent events (submitted, working, the answer, final status), so streaming-only clients work too. Updates are not incremental yet: the answer arrives in one piece.
 - Not supported yet: push notifications, cancelling a running task, and files.
 
+## Agent swarms
+
+A swarm hands many sub-tasks to helper agents **at the same time** and collects the answers: one lead fans work out to many workers, optionally one more agent combines what they found. It is built on delegation, so every worker is exactly the call the lead could make itself, one at a time: its permission, scope, approval, taint and audit all apply.
+
+```toml
+[agents.lead]
+permissions = ["read_file", "swarm", "agent__worker", "agent__editor"]
+[agents.worker]
+permissions = ["read_file"]
+[agents.editor]
+permissions = []
+```
+
+- **From an agent**: grant the tool `swarm`. The model passes `tasks` (a list of `{helper, task}`), or one `helper` + `task` + `items` (the task runs once per item, `{item}` replaced), and optionally `reduce = {helper, task}`. A swarm reaches only helpers the agent may already call (`agent__<name>`, `a2a__<name>`); asking for any other refuses the whole swarm before anything runs. Up to 1,000 tasks per call.
+- **From the command line** (batch, no lead model): `aios swarm` streams a task file of any length through the workers and writes one JSON line per result as each finishes.
+
+```bash
+python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.txt --out results.jsonl \
+    --parallel 64 --model-slots 32 --swarm-max-tokens 2000000 --reduce editor
+# tasks.txt: one task per line, or {"agent": "...", "task": "..."} per line; - reads stdin
+```
+
+**High concurrency, with hard limits.**
+- *Worker pool and backpressure*: a fixed pool of `--parallel` workers (default 8) pulls from the task list, so 100,000 tasks never mean 100,000 runs in memory, and a task file is read only when a worker is free.
+- *Rate limit*: every model call of every agent in the process waits for one of `--model-slots` slots (default 16). Nested swarms and parallel jobs share them, so the provider never sees more requests at once than that, whatever the fan-out.
+- *Shared budget*: all workers of one swarm spend from one ledger, `--swarm-max-tokens` (default 1,000,000) and `--swarm-max-cost` (with prices). When it runs out, no new task starts (the rest are reported `skipped`) and running workers stop before their next model call. A swarm inside a swarm also charges its parent's ledger. Each worker still has its own per-run budget.
+- *Isolation of failures*: each task has a timeout (`--timeout`, default 600 s); an error or timeout in one never stops the others, and cancelling the swarm cancels every worker.
+- *Combining large results*: `reduce` packs answers into bounded groups and has the reducer combine them in rounds until one answer is left, so a thousand answers never land in one prompt. Without `reduce`, the lead gets each answer clipped (1,500 chars, 20,000 in total).
+- *Database*: the SQLite store now uses WAL, so hundreds of workers can write audit entries without stalling, and the console reads while they do. Tested with 3,000 tasks, 400 workers and 150 model slots.
+
+**Security.** Workers inherit the lead's taint, as in delegation: if the lead has read untrusted content, no worker gets `auto_paths`/`auto_args`. The reducer always runs tainted, because the answers it reads may carry text the workers read. The swarm's answer is tagged untrusted. `max_calls` on `agent__<name>` counts every swarm task. Approvals are asked one at a time, so a swarm that needs many is slow by design; for unattended swarms pre-allow what workers may do with scopes. Every task is audited under the caller's name with a shared swarm id. `aios swarm` tasks are the operator's own, so they run untainted.
+
 ## Architecture
 
 ```
@@ -285,7 +318,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn and streaming) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn and streaming) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 

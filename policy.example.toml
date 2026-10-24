@@ -69,3 +69,21 @@ auto_args = { url = ["https://docs.python.org/*"] }
 allow = ["https://*"]                                       # case-sensitive; an allowed argument must be given
 deny = ["*localhost*", "*127.0.0.1*", "*169.254.169.254*"]  # ignores case
 max_len = 2000
+
+# ---------------------------------------------------------------------------------
+# Agent swarm: many helpers at once.  python aios.py chat --agent swarm_lead --policy policy.example.toml
+# The `swarm` tool reaches only helpers this agent may call one by one (agent__worker, agent__editor);
+# each task gets the same permission, scope, approval, taint and audit as a single delegation.
+# Batch mode, no lead model:  python aios.py swarm --policy policy.example.toml --agent worker \
+#                                 --tasks tasks.txt --out results.jsonl --parallel 64 --reduce editor
+[agents.swarm_lead]
+permissions = ["now", "list_files", "swarm", "agent__worker", "agent__editor"]
+
+[agents.swarm_lead.scopes.agent__worker]
+max_calls = 500         # per run: every swarm task counts
+
+[agents.worker]         # read-only: safe to run hundreds at once without approvals
+permissions = ["now", "read_file", "list_files"]
+
+[agents.editor]         # combines the workers' answers; it reads only what they returned
+permissions = []
