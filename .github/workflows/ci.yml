@@ -90,6 +90,45 @@ jobs:
           docker pull -q python:3.12-slim
           AIOS_TEST_DOCKER=1 python -m unittest tests.test_aios.RealDockerSandboxTests -v
 
+  embeddings:
+    # Vector memory search against a real Ollama server and embedding model (not the stand-in).
+    runs-on: ubuntu-latest
+    env:
+      AIOS_TEST_EMBED_URL: http://127.0.0.1:11434/v1
+      AIOS_TEST_EMBED_MODEL: nomic-embed-text
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Install Ollama and pull the embedding model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+          timeout 60 sh -c 'until curl -fsS http://127.0.0.1:11434/api/version; do sleep 1; done'; echo
+          ollama pull "$AIOS_TEST_EMBED_MODEL"
+          ollama list
+      - name: Record how the model scores notes against queries
+        run: |
+          python - <<'PY'
+          import asyncio, os, aios_memory as m
+          notes = {"pet": "my dog is named Max", "editor": "I use vim for programming",
+                   "drink": "I like green tea", "allergy": "I am allergic to peanuts",
+                   "sister": "my sister lives in Taipei"}
+          queries = ["puppy", "nut allergy", "beverage", "sibling", "tomorrow weather forecast"]
+          e = m.Embedder(os.environ["AIOS_TEST_EMBED_MODEL"], os.environ["AIOS_TEST_EMBED_URL"])
+          async def main():
+              for qp, dp in (("", ""), ("search_query: ", "search_document: ")):
+                  docs = await e.embed([dp + f"{k}: {v}" for k, v in notes.items()])
+                  print(f"prefixes {qp!r} {dp!r}")
+                  for q in queries:
+                      (qv,) = await e.embed([qp + q])
+                      print(f"  {q:30}", "  ".join(f"{k}={m.cosine(qv, d):.3f}" for k, d in zip(notes, docs)))
+          asyncio.run(main())
+          PY
+      - run: python -m unittest tests.test_memory -v
+
   microvm:
     # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
     runs-on: ubuntu-latest

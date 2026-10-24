@@ -365,5 +365,31 @@ class SearchCommandTests(unittest.TestCase):
         self.assertIn("(no matches)", text)
 
 
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_EMBED_URL") and os.environ.get("AIOS_TEST_EMBED_MODEL"),
+                     "set AIOS_TEST_EMBED_URL and AIOS_TEST_EMBED_MODEL (e.g. Ollama with nomic-embed-text)")
+class RealEmbeddingTests(unittest.IsolatedAsyncioTestCase):
+    """Hybrid search with a real embedding model, not the stand-in server."""
+    NOTES = {"pet": "my dog is named Max", "editor": "I use vim for programming",
+             "drink": "I like green tea", "allergy": "I am allergic to peanuts",
+             "sister": "my sister lives in Taipei"}
+
+    def setUp(self):
+        self.embedder = mem.Embedder(os.environ["AIOS_TEST_EMBED_MODEL"], os.environ["AIOS_TEST_EMBED_URL"])
+        self.st = store_with(**self.NOTES)
+
+    async def test_meaning_finds_notes_that_share_no_word_with_the_query(self):
+        for query, want in (("puppy", "pet"), ("nut allergy", "allergy"), ("beverage", "drink"),
+                            ("sibling", "sister")):
+            with self.subTest(query=query):
+                self.assertEqual(mem.keyword_rank(self.st.fact_rows("a"), query), [])  # keywords alone miss it
+                res, note = await mem.search(self.st, "a", query, 1, self.embedder)
+                self.assertEqual(note, "")
+                self.assertEqual(res[0]["key"], want)
+
+    async def test_an_unrelated_query_finds_nothing(self):
+        res, note = await mem.search(self.st, "a", "tomorrow weather forecast", 5, self.embedder)
+        self.assertEqual((res, note), ([], ""))
+
 if __name__ == "__main__":
     unittest.main()
