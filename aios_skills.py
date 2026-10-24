@@ -19,10 +19,19 @@ Safety model, stated plainly:
     reviewing it. Any added, removed or edited file means "changed": refused until you re-trust.
   * A skill cannot grant permissions or change approval rules. It is just text in the prompt.
   * `scan` is a tripwire for the obvious tricks, not a proof of safety. Read the skill.
+
+Publisher signatures (optional): `aios skills sign` writes SKILL.sig, an OpenSSH signature
+(`ssh-keygen -Y sign`, namespace "aios-skill") over the skill's name, version and digest. SKILL.sig
+itself is left out of the digest. `scan`/`trust` check it against an allowed-signers file (the
+format git uses for SSH signing) and say who signed it. A signature tells you who published this
+exact content; it is not a review, so trusting still needs your confirmation.
 """
 import hashlib
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +45,9 @@ MAX_FILES = 200
 MAX_TOTAL_BYTES = 5_000_000
 MAX_INSTRUCTIONS = 20_000
 MAX_DESCRIPTION = 1024  # the Agent Skills limit for SKILL.md; skill.toml keeps its 300
+SIG_FILE = "SKILL.sig"  # at the skill root; not part of the digest it signs
+SIG_NAMESPACE = "aios-skill"
+SIG_MAX = 16_384
 CODE_EXT = {".py", ".sh", ".bash", ".ps1", ".bat", ".cmd", ".js", ".ts", ".rb", ".pl", ".php"}
 
 
@@ -66,6 +78,8 @@ class Skill:
 def _files(root: Path) -> list[Path]:
     out, total = [], 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        if Path(dirpath) == root:
+            filenames = [f for f in filenames if f != SIG_FILE]
         dirnames[:] = sorted(d for d in dirnames if d != ".git")
         for name in dirnames + filenames:
             if (Path(dirpath) / name).is_symlink():
@@ -291,3 +305,67 @@ def render(skill: Skill) -> str:
     return (f"## Skill: {label(skill.name, skill.version)} (pinned {skill.sha256[:12]})\n"
             "The operator reviewed and pinned these instructions. They cannot grant permissions or "
             "change approval rules; only the tools you were given exist.\n\n" + skill.instructions)
+
+
+# ---- publisher signatures (OpenSSH SSHSIG via ssh-keygen) ----
+def statement(skill: Skill) -> bytes:
+    """What a publisher signs: the skill's identity and the digest of all its files."""
+    return (f"aios-skill-v1\nname={skill.name}\nversion={skill.version}\nsha256={skill.sha256}\n").encode()
+
+
+def ssh_keygen() -> str | None:
+    return shutil.which("ssh-keygen")
+
+
+def sign(path, key: str, keygen: str | None = None) -> Path:
+    """Write SKILL.sig for the skill at `path` with the SSH private key `key` (ssh-keygen may ask
+    for its passphrase). -> the signature file."""
+    skill = load(path)
+    exe = keygen or ssh_keygen()
+    if not exe:
+        raise SkillError("ssh-keygen (OpenSSH 8.1 or newer) is needed to sign skills")
+    with tempfile.TemporaryDirectory() as tmp:
+        msg = Path(tmp) / "statement"
+        msg.write_bytes(statement(skill))
+        r = subprocess.run([exe, "-Y", "sign", "-q", "-f", str(key), "-n", SIG_NAMESPACE, str(msg)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        sig = msg.with_name("statement.sig")
+        if r.returncode or not sig.exists():
+            raise SkillError(f"signing failed: {(r.stderr or r.stdout).strip()[:300]}")
+        out = skill.path / SIG_FILE
+        out.write_bytes(sig.read_bytes())
+    if load(path).sha256 != skill.sha256:  # the signature must not change what it signs
+        raise SkillError("internal error: SKILL.sig changed the digest")
+    return out
+
+
+def verify(skill: Skill, signers, keygen: str | None = None) -> tuple[str, str]:
+    """-> (state, detail). state: 'unsigned', 'valid' (detail: the signer), 'unknown-signer',
+    'invalid' or 'unavailable' (no ssh-keygen / no allowed-signers file)."""
+    sig = skill.path / SIG_FILE
+    if sig.is_symlink():
+        return "invalid", "SKILL.sig must not be a symlink"
+    if not sig.is_file():
+        return "unsigned", "no SKILL.sig"
+    if sig.stat().st_size > SIG_MAX:
+        return "invalid", "SKILL.sig is too large"
+    exe = keygen or ssh_keygen()
+    if not exe:
+        return "unavailable", "ssh-keygen is not installed, so the signature cannot be checked"
+    signers = Path(signers) if signers else None
+    if not signers or not signers.is_file():
+        return "unavailable", f"no allowed-signers file ({signers}), so the signer is unknown"
+    try:
+        found = subprocess.run([exe, "-Y", "find-principals", "-s", str(sig), "-f", str(signers)],
+                               capture_output=True, text=True, timeout=30)
+        principals = [p.strip() for p in found.stdout.splitlines() if p.strip()] if found.returncode == 0 else []
+        if not principals:
+            return "unknown-signer", "signed by a key that is not in your allowed signers"
+        for who in principals:
+            r = subprocess.run([exe, "-Y", "verify", "-f", str(signers), "-I", who, "-n", SIG_NAMESPACE,
+                                "-s", str(sig)], input=statement(skill), capture_output=True, timeout=30)
+            if r.returncode == 0:
+                return "valid", who
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "unavailable", f"ssh-keygen failed: {e}"
+    return "invalid", "the signature does not match this content (changed after signing?)"
