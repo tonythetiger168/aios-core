@@ -1016,6 +1016,26 @@ def docker_image() -> str:
     return image
 
 
+# PID 1 of every sandbox container: runs the code (stdin) as its child and, if the kernel's OOM
+# killer took it, says so by exiting OOM_EXIT. Docker's own OOMKilled flag comes from a separate
+# containerd event that some setups (rootless cgroup v2) lose or record too late to read back.
+# A child exit of OOM_EXIT itself is reported as 1 so that code cannot pass for an OOM kill.
+OOM_EXIT = 247
+DOCKER_SUPERVISOR = f"""\
+import subprocess, sys
+r = subprocess.run([sys.executable, "-I", "-"]).returncode
+if r == -9:
+    for path in ("/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory/memory.oom_control"):
+        try:
+            with open(path) as f:
+                if int(dict(line.split() for line in f).get("oom_kill", "0")) > 0:
+                    sys.exit({OOM_EXIT})
+        except (OSError, ValueError):
+            pass
+sys.exit(128 - r if r < 0 else 1 if r == {OOM_EXIT} else r)
+"""
+
+
 class DockerSandbox:
     """run_python in a throwaway container: no network, no host files (nothing is mounted), read-only
     root with a small /tmp, unprivileged user, all capabilities dropped, memory/CPU/process caps.
@@ -1130,7 +1150,7 @@ class DockerSandbox:
                 "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--user", "65534:65534", "--workdir", "/tmp", "--env", "HOME=/tmp",
-                self.image, "python", "-I", "-"]  # code arrives on stdin: nothing is mounted
+                self.image, "python", "-I", "-c", DOCKER_SUPERVISOR]  # code arrives on stdin: nothing is mounted
 
     @staticmethod
     async def _read_limited(stream, limit):
@@ -1267,7 +1287,7 @@ class DockerSandbox:
             rc, out = await self._invoke(
                 [self.docker, "start", "--attach", "--interactive", container], code.encode(),
                 timeout=remaining, limit=self.max_out)
-            if rc and await self._oom_killed(container, rc):
+            if rc == OOM_EXIT or rc and await self._oom_killed(container, rc):
                 return f"killed: out of memory ({self.mem_mb} MiB limit)\n{out}"
             if rc == 137:  # SIGKILL, and not the memory limit: from outside the code
                 return (f"exit=137 (killed from outside the code: the Docker daemon stopped or restarted, "
