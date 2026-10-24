@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
 import textwrap
@@ -30,7 +31,8 @@ FAKE_FC = textwrap.dedent("""\
     args = sys.argv[1:]
     cfg = json.load(open(args[args.index("--config-file") + 1]))
     with open(os.environ["FAKE_FC_SEEN"], "w") as f:
-        json.dump({{"args": args, "config": cfg, "cwd": os.getcwd()}}, f)
+        root = [d for d in cfg["drives"] if d["drive_id"] == "rootfs"][0]["path_on_host"]
+        json.dump({{"args": args, "config": cfg, "cwd": os.getcwd(), "rootfs_ino": os.stat(root).st_ino}}, f)
     mode = os.environ.get("FAKE_FC_MODE", "")
     print("[    0.000000] Linux version fake", flush=True)
     if mode == "hang":
@@ -48,6 +50,22 @@ FAKE_FC = textwrap.dedent("""\
     """)
 
 
+# Stands in for the jailer (which needs root): checks its arguments, then does what it does
+# minus chroot, uid switch and cgroups: run the exec file inside <base>/firecracker/<id>/root.
+FAKE_JAILER = textwrap.dedent("""\
+    #!{python}
+    import json, os, sys
+    args = sys.argv[1:]
+    mine, rest = args[:args.index("--")], args[args.index("--") + 1:]
+    opt = {{mine[i]: mine[i + 1] for i in range(0, len(mine) - 1, 2)}}
+    with open(os.environ["FAKE_FC_SEEN"] + ".jailer", "w") as f:
+        json.dump(mine, f)
+    root = os.path.join(opt["--chroot-base-dir"], "firecracker", opt["--id"], "root")
+    os.chdir(root)
+    os.execv(opt["--exec-file"], [opt["--exec-file"], "--id", opt["--id"], *rest])
+    """)
+
+
 def vmm_processes():
     """Processes whose command line names a per-call work dir (that is, a running VMM)."""
     found = []
@@ -60,7 +78,7 @@ def vmm_processes():
     return found
 
 
-def make_home(tmp: Path, fc=True, kernel=True, rootfs=True) -> Path:
+def make_home(tmp: Path, fc=True, kernel=True, rootfs=True, jailer=False) -> Path:
     if fc:
         p = tmp / "firecracker"
         p.write_text(FAKE_FC.format(python=sys.executable, repo=str(REPO)))
@@ -69,6 +87,10 @@ def make_home(tmp: Path, fc=True, kernel=True, rootfs=True) -> Path:
         (tmp / "vmlinux").write_bytes(b"kernel")
     if rootfs:
         (tmp / "rootfs.ext4").write_bytes(b"rootfs")
+    if jailer:
+        p = tmp / "jailer"
+        p.write_text(FAKE_JAILER.format(python=sys.executable))
+        p.chmod(0o755)
     return tmp
 
 
@@ -109,7 +131,7 @@ class MicroVMSelectionTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
     def test_unavailable_explains_what_is_missing(self):
-        with tempfile.TemporaryDirectory() as d, \
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"AIOS_MICROVM_JAILER": ""}), \
                 mock.patch.object(aios.os.path, "exists", return_value=True), \
                 mock.patch.object(aios.os, "access", side_effect=lambda p, m: p == "/dev/kvm" or Path(p).exists()):
             home = Path(d)
@@ -121,6 +143,24 @@ class MicroVMSelectionTests(unittest.TestCase):
             self.assertIn("rootfs image missing", aios.MicroVMSandbox.unavailable(home))
             make_home(home, fc=False, kernel=False)
             self.assertIsNone(aios.MicroVMSandbox.unavailable(home))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_the_jailer_needs_root_and_its_binary(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(aios.os.path, "exists", return_value=True), \
+                mock.patch.object(aios.os, "access", side_effect=lambda p, m: p == "/dev/kvm" or Path(p).exists()), \
+                mock.patch.object(aios.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"AIOS_MICROVM_JAILER": "1"}):
+            home = make_home(Path(d))
+            with mock.patch.object(aios.os, "geteuid", create=True, return_value=1000):
+                self.assertIn("needs AIOS to run as root", aios.MicroVMSandbox.unavailable(home))
+            with mock.patch.object(aios.os, "geteuid", create=True, return_value=0):
+                self.assertIn("jailer not found", aios.MicroVMSandbox.unavailable(home))
+                make_home(home, jailer=True)
+                self.assertIsNone(aios.MicroVMSandbox.unavailable(home))
+            self.assertTrue(aios.MicroVMSandbox(home).jailed)
+        with mock.patch.dict(os.environ, {"AIOS_MICROVM_JAILER": ""}):
+            self.assertFalse(aios.MicroVMSandbox(home).jailed)  # opt-in only
 
     def test_unavailable_without_kvm(self):
         with mock.patch.object(aios.sys, "platform", "linux"), \
@@ -143,7 +183,7 @@ class MicroVMHostTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(env.stop)
 
     def box(self, **kw):
-        return aios.MicroVMSandbox(home=self.home, **kw)
+        return aios.MicroVMSandbox(home=self.home, **{"jailed": False, **kw})
 
     def workdirs(self):
         return sorted(Path(tempfile.gettempdir()).glob("aios-mvm-*"))
@@ -153,6 +193,25 @@ class MicroVMHostTests(unittest.IsolatedAsyncioTestCase):
         out = await self.box().run_python("import sys; print(6*7); sys.exit(3)")
         self.assertEqual(out, "exit=3\n42\n")
         self.assertEqual(self.workdirs(), before)  # job image and config removed
+
+    async def test_a_jailed_vmm_runs_in_its_own_chroot_that_is_removed_after(self):
+        make_home(self.home, jailer=True)
+        box = self.box(jailed=True, mem_mb=128)
+        out = await box.run_python("print(6*7)")
+        self.assertEqual(out, "exit=0\n42\n")
+        jailer = json.loads(Path(str(self.seen) + ".jailer").read_text())
+        opt = dict(zip(jailer[::2], jailer[1::2]))
+        self.assertEqual((opt["--uid"], opt["--gid"]), ("65534", "65534"))
+        self.assertEqual(opt["--chroot-base-dir"], str(self.home / "jails"))
+        self.assertRegex(opt["--id"], r"^aios-mvm-[0-9a-f]{16}$")
+        if Path("/sys/fs/cgroup/cgroup.controllers").exists():
+            self.assertEqual(opt["--cgroup"], f"memory.max={(128 + box.JAIL_OVERHEAD_MB) << 20}")
+        seen = json.loads(self.seen.read_text())
+        self.assertEqual(Path(seen["cwd"]).name, "root")
+        self.assertEqual(seen["config"]["boot-source"]["kernel_image_path"], "vmlinux")  # inside the chroot
+        self.assertEqual([d["path_on_host"] for d in seen["config"]["drives"]], ["rootfs.ext4", "job.img"])
+        self.assertEqual(seen["rootfs_ino"], (self.home / "rootfs.ext4").stat().st_ino)  # linked, not copied
+        self.assertEqual(list((self.home / "jails" / "firecracker").iterdir()), [])  # the jail is gone
 
     async def test_config_has_no_network_and_read_only_drives(self):
         await self.box(mem_mb=128, vcpus=1).run_python("print(1)")
@@ -294,6 +353,60 @@ class RealMicroVMTests(unittest.IsolatedAsyncioTestCase):
             "    except OSError: break\n")
         self.assertTrue(out.startswith(("exit=", "killed: timeout")), out)
         self.assertIn("...(truncated)", out)
+
+
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_MICROVM") == "1" and os.environ.get("AIOS_MICROVM_JAILER") == "1",
+                     "set AIOS_TEST_MICROVM=1 and AIOS_MICROVM_JAILER=1, as root, to run jailed microVMs")
+class RealJailedMicroVMTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        why = aios.MicroVMSandbox.unavailable()
+        if why:
+            self.fail(why)
+        self.box = aios.MicroVMSandbox(timeout=20)
+        self.assertTrue(self.box.jailed)
+
+    def vmm(self):
+        for pid in vmm_processes():
+            try:
+                if os.readlink(f"/proc/{pid}/exe").endswith("firecracker"):
+                    return pid
+            except OSError:
+                pass
+        return None
+
+    async def test_the_vmm_is_chrooted_unprivileged_and_capped(self):
+        run = asyncio.ensure_future(self.box.run_python("import time; time.sleep(4); print('done')"))
+        for _ in range(200):
+            pid = self.vmm()
+            if pid:
+                break
+            await asyncio.sleep(0.05)
+        self.assertIsNotNone(pid, "no running VMM found")
+        status = dict(l.split(":", 1) for l in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in l)
+        # The jailer pivot_roots in a new mount namespace, so from here /proc/PID/root reads "/":
+        # look through it instead, and find the jail id from the VMM's cgroup.
+        own_mounts = os.stat(f"/proc/{pid}/ns/mnt").st_ino != os.stat("/proc/self/ns/mnt").st_ino
+        visible = set(os.listdir(f"/proc/{pid}/root"))
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text()
+        out = await run
+        self.assertEqual(out, "exit=0\ndone\n")
+        self.assertEqual(status["Uid"].split()[:2], ["65534", "65534"])
+        self.assertEqual(status["Gid"].split()[:2], ["65534", "65534"])
+        self.assertEqual(int(status["CapEff"], 16), 0)
+        self.assertTrue(own_mounts)
+        self.assertIn("vmlinux", visible)
+        self.assertFalse(visible & {"etc", "home", "usr", "proc"}, visible)  # none of the host's files
+        jail_id = re.search(r"firecracker/(aios-mvm-[0-9a-f]{16})", cgroup)
+        self.assertIsNotNone(jail_id, cgroup)
+        jail = aios.MicroVMSandbox.paths()["jails"] / "firecracker" / jail_id[1]
+        self.assertFalse(jail.exists())  # removed after the call
+        self.assertFalse(Path(f"/sys/fs/cgroup/firecracker/{jail_id[1]}").exists())
+        self.assertIsNone(self.vmm())
+
+    async def test_the_guest_sandbox_still_holds(self):
+        out = await self.box.run_python("import os, socket; print(os.getuid(), sorted(os.listdir('/sys/class/net')))")
+        self.assertEqual(out, "exit=0\n65534 ['lo']\n")
 
 
 if __name__ == "__main__":

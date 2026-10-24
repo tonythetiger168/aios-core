@@ -1340,17 +1340,30 @@ class MicroVMSandbox:
                  "random.trust_cpu=on init=/aios-init ro")
 
     def __init__(self, home=None, timeout=10, vcpus=1, mem_mb=256, max_out=10_000,
-                 boot_timeout=15, cleanup_timeout=3, max_code=1 << 20):
+                 boot_timeout=15, cleanup_timeout=3, max_code=1 << 20, jailed=None):
         self.home = Path(home or os.environ.get("AIOS_MICROVM_DIR") or MICROVM_HOME)
         self.timeout, self.vcpus, self.mem_mb, self.max_out = timeout, vcpus, mem_mb, max_out
         self.boot_timeout, self.cleanup_timeout, self.max_code = boot_timeout, cleanup_timeout, max_code
+        self.jailed = self.jailer_wanted() if jailed is None else jailed
+
+    # With AIOS_MICROVM_JAILER=1 (AIOS running as root, e.g. as a system service) each VMM is
+    # started by Firecracker's jailer: chroot into a per-call directory, its own unprivileged
+    # uid/gid, new mount namespace, its own cgroup with a memory cap. Without it the VMM runs as
+    # the AIOS user (see docs/microvm-sandbox.md).
+    JAIL_UID = 65534
+    JAIL_OVERHEAD_MB = 128  # VMM memory on top of the guest's, for its cgroup cap
+
+    @staticmethod
+    def jailer_wanted() -> bool:
+        return os.environ.get("AIOS_MICROVM_JAILER") == "1"
 
     @classmethod
     def paths(cls, home=None):
         home = Path(home or os.environ.get("AIOS_MICROVM_DIR") or MICROVM_HOME)
-        fc = home / "firecracker"
+        fc, jailer = home / "firecracker", home / "jailer"
         return {"firecracker": fc if fc.exists() else Path(shutil.which("firecracker") or fc),
-                "kernel": home / "vmlinux", "rootfs": home / "rootfs.ext4"}
+                "jailer": jailer if jailer.exists() else Path(shutil.which("jailer") or jailer),
+                "kernel": home / "vmlinux", "rootfs": home / "rootfs.ext4", "jails": home / "jails"}
 
     @classmethod
     def unavailable(cls, home=None) -> str | None:
@@ -1368,6 +1381,11 @@ class MicroVMSandbox:
             if not p[key].is_file():
                 return (f"{key} image missing: {p[key]} (see docs/microvm-sandbox.md; "
                         "scripts/build-microvm-rootfs.sh builds the root image)")
+        if cls.jailer_wanted():
+            if os.geteuid() != 0:
+                return "AIOS_MICROVM_JAILER=1 needs AIOS to run as root (the jailer drops to an unprivileged uid)"
+            if not os.access(p["jailer"], os.X_OK):
+                return f"jailer not found at {p['jailer']} (it ships in the Firecracker release tarball)"
         return None
 
     def job_image(self, nonce: str, code: str) -> bytes:
@@ -1379,6 +1397,8 @@ class MicroVMSandbox:
 
     def config(self, workdir: Path) -> dict:
         p = self.paths(self.home)
+        if self.jailed:  # paths inside the jail's chroot
+            p, workdir = {"kernel": "vmlinux", "rootfs": "rootfs.ext4"}, Path(".")
         return {
             "boot-source": {"kernel_image_path": str(p["kernel"]), "boot_args": self.BOOT_ARGS},
             "drives": [
@@ -1427,16 +1447,50 @@ class MicroVMSandbox:
             raise RuntimeError(f"microVM cleanup unconfirmed: firecracker pid {proc.pid} "
                                "did not exit after SIGKILL") from None
 
+    def _jail(self, jail_id: str) -> tuple[Path, list[str]]:
+        """Prepare the chroot for one jailed VMM: its directory and the jailer command line."""
+        p = self.paths(self.home)
+        root = p["jails"] / "firecracker" / jail_id / "root"
+        root.mkdir(parents=True, mode=0o700)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.chown(root, self.JAIL_UID, self.JAIL_UID)  # only the VMM's uid can enter its root
+        for key, name in (("kernel", "vmlinux"), ("rootfs", "rootfs.ext4")):
+            try:
+                os.link(p[key], root / name)  # same filesystem: no copy of the root image
+            except OSError:
+                shutil.copyfile(p[key], root / name)
+        cgroup = ["--cgroup-version", "2", "--cgroup",
+                  f"memory.max={(self.mem_mb + self.JAIL_OVERHEAD_MB) << 20}"] \
+            if Path("/sys/fs/cgroup/cgroup.controllers").exists() else []
+        return root, [str(p["jailer"]), "--id", jail_id, "--exec-file", str(p["firecracker"]),
+                      "--uid", str(self.JAIL_UID), "--gid", str(self.JAIL_UID),
+                      "--chroot-base-dir", str(p["jails"]), *cgroup, "--"]
+
+    def _unjail(self, jail_id: str):
+        shutil.rmtree(self.paths(self.home)["jails"] / "firecracker" / jail_id, ignore_errors=True)
+        try:
+            os.rmdir(f"/sys/fs/cgroup/firecracker/{jail_id}")
+        except OSError:
+            pass
+
     async def run_python(self, code: str) -> str:
         nonce = secrets.token_hex(16)
-        workdir = Path(tempfile.mkdtemp(prefix="aios-mvm-"))
+        if self.jailed:
+            jail_id = f"aios-mvm-{secrets.token_hex(8)}"
+            workdir, prefix = self._jail(jail_id)
+            config = "config.json"  # the jailer starts firecracker inside the chroot
+        else:
+            workdir, prefix = Path(tempfile.mkdtemp(prefix="aios-mvm-")), [str(self.paths(self.home)["firecracker"])]
+            config = str(workdir / "config.json")
         proc = None
         try:
             (workdir / "job.img").write_bytes(self.job_image(nonce, code))
             (workdir / "config.json").write_text(json.dumps(self.config(workdir)))
+            if self.jailed:
+                for name in ("job.img", "config.json"):
+                    os.chmod(workdir / name, 0o444)
             proc = await asyncio.create_subprocess_exec(
-                str(self.paths(self.home)["firecracker"]), "--no-api",
-                "--config-file", str(workdir / "config.json"), "--level", "Error",
+                *prefix, "--no-api", "--config-file", config, "--level", "Error",
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT, cwd=workdir, start_new_session=True)
             # The guest enforces the code's timeout; the host deadline also covers boot and
@@ -1459,7 +1513,10 @@ class MicroVMSandbox:
                 if proc is not None:
                     await asyncio.shield(self._stop(proc))
             finally:
-                shutil.rmtree(workdir, ignore_errors=True)
+                if self.jailed:
+                    self._unjail(jail_id)
+                else:
+                    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def make_sandbox(choice: str | None = None):

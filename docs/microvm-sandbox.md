@@ -84,11 +84,32 @@ python aios.py chat --sandbox microvm
 
 Your user needs read/write access to `/dev/kvm` (usually the `kvm` group).
 
+## Jailed VMMs (AIOS running as root)
+
+When AIOS runs as root, for example as a system service, set `AIOS_MICROVM_JAILER=1` and put
+the `jailer` binary from the same Firecracker release next to `firecracker`:
+
+```sh
+install -m 0755 release-v1.13.1-x86_64/jailer-v1.13.1-x86_64 $d/jailer
+AIOS_MICROVM_JAILER=1 python aios.py daemon --sandbox microvm ...
+```
+
+Each call then gets its own jail. The kernel and root image are hard-linked (copied if they live
+on another filesystem) into a fresh chroot under `$AIOS_MICROVM_DIR/jails/firecracker/<id>/root`,
+owned by uid/gid 65534 and mode 0700, next to the job drive and config. The jailer starts
+Firecracker in a new mount namespace, chrooted there, as uid/gid 65534 with no capabilities. On
+cgroup v2 it runs in its own cgroup capped at the guest memory plus 128 MiB. After the call, the
+jail directory and the cgroup are removed. The kernel and root image must be readable by uid
+65534. AIOS refuses to start in this mode when it is not root or the jailer is missing.
+The microVM CI job runs the real tests both ways. When jailed, it also checks from the host that
+the running VMM's uid, gid, capabilities, chroot and cgroup are as described, and that both the
+jail and the cgroup are gone afterwards.
+
 ## Known limits
 
-- Firecracker runs as the AIOS user without the `jailer` (no chroot, cgroups or separate
-  UID for the VMM). Firecracker's built-in seccomp filters are on. A production deployment
-  that treats the VMM as an attack surface should add the jailer.
+- By default Firecracker runs as the AIOS user without the `jailer` (no chroot, cgroups or
+  separate UID for the VMM). Firecracker's built-in seccomp filters are on. See "Jailed VMMs"
+  below for deployments that treat the VMM itself as an attack surface.
 - Boot costs roughly a second per call; there is no warm pool or snapshot restore yet.
 - The root image comes from a mutable Docker tag; record its digest (the build script
   prints it). No image signing.
