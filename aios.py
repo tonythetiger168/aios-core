@@ -1154,32 +1154,43 @@ class DockerSandbox:
         try:
             rc, out = await self._invoke(
                 [self.docker, "container", "inspect", container], timeout=self.cleanup_timeout)
-            if rc and ("no such container" in out.lower() or "no such object" in out.lower()):
+            if rc and self._absent(out):
                 return  # absence verified
             errors.append(f"inspect: {out[:200]}")
         except (OSError, asyncio.TimeoutError) as e:
             errors.append(f"inspect: {type(e).__name__}")
         raise RuntimeError(f"Docker cleanup unconfirmed for {container}: {'; '.join(errors)}")
 
-    # Containers whose create timed out or was cancelled: the daemon may still create them later.
-    # Each later call removes any that appeared, for RECONCILE_WINDOW seconds (at most 32 names).
+    @staticmethod
+    def _absent(out: str) -> bool:
+        out = out.lower()
+        return "no such container" in out or "no such object" in out
+
+    # Containers whose fate is unknown: a create that timed out or was cancelled (the daemon may
+    # still create it later), or a cleanup the daemon could not confirm (it was down). Each later call
+    # removes any that exist, watching each for RECONCILE_WINDOW seconds (at most 32 names).
     unknown: dict[str, float] = {}
     RECONCILE_WINDOW = 600
 
     async def _reconcile(self):
         now = asyncio.get_running_loop().time()
         for name, since in list(DockerSandbox.unknown.items()):
+            # `rm --force` succeeds for a missing container too, so look before removing
             try:
-                rc, _ = await self._invoke([self.docker, "rm", "--force", name], timeout=self.cleanup_timeout)
+                rc, out = await self._invoke([self.docker, "container", "inspect", "--format", "{{.Id}}", name],
+                                             timeout=self.cleanup_timeout)
+                if rc == 0:
+                    rc, _ = await self._invoke([self.docker, "rm", "--force", name], timeout=self.cleanup_timeout)
+                    if rc == 0:
+                        print(f"[sandbox] removed {name}, left behind by a call whose Docker outcome was "
+                              "unknown", file=sys.stderr)
+                        DockerSandbox.unknown.pop(name, None)
+                    continue
             except (OSError, asyncio.TimeoutError):
-                continue  # daemon busy: try again next call
-            if rc == 0:  # it existed: a delayed create happened after our cleanup
-                print(f"[sandbox] removed {name}, created late by the daemon after its create timed out",
+                continue  # daemon busy or down: try again next call
+            if self._absent(out) and now - since > self.RECONCILE_WINDOW:
+                print(f"[sandbox] stopped watching {name}: it did not appear in {self.RECONCILE_WINDOW}s",
                       file=sys.stderr)
-            if rc == 0 or now - since > self.RECONCILE_WINDOW:
-                if rc != 0:
-                    print(f"[sandbox] stopped watching {name}: no delayed creation after "
-                          f"{self.RECONCILE_WINDOW}s", file=sys.stderr)
                 DockerSandbox.unknown.pop(name, None)
 
     def _unknown_outcome(self, container):
@@ -1226,6 +1237,9 @@ class DockerSandbox:
                 timeout=remaining, limit=self.max_out)
             if rc and await self._oom_killed(container, rc):
                 return f"killed: out of memory ({self.mem_mb} MiB limit)\n{out}"
+            if rc == 137:  # SIGKILL, and not the memory limit: from outside the code
+                return (f"exit=137 (killed from outside the code: the Docker daemon stopped or restarted, "
+                        f"or someone killed the container)\n{out}")
             return f"exit={rc}\n{out}"
         except asyncio.TimeoutError:
             if not created:
@@ -1254,10 +1268,12 @@ class DockerSandbox:
             try:
                 cleanup.result()
             except Exception as e:
+                self._unknown_outcome(container)  # e.g. the daemon is down: remove it once it is back
+                err = RuntimeError(f"{e}. AIOS will remove it during the next calls if it still exists.")
                 if isinstance(failure, asyncio.CancelledError) or cancelled:
-                    print(f"[sandbox] {e}", file=sys.stderr)
+                    print(f"[sandbox] {err}", file=sys.stderr)
                 else:
-                    raise
+                    raise err from None
             if cancelled:
                 raise asyncio.CancelledError
 
