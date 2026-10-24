@@ -56,6 +56,8 @@ jobs:
           sudo apt-get install -y -q uidmap
           curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-$V.tgz" \
             | sudo tar -xz -C /usr/local/bin --strip-components=1
+          # the setup tool looks for the docker CLI next to itself
+          [ -e /usr/local/bin/docker ] || sudo ln -s "$(command -v docker)" /usr/local/bin/docker
           grep -q "^$USER:" /etc/subuid || echo "$USER:200000:65536" | sudo tee -a /etc/subuid /etc/subgid
           # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor by default
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
