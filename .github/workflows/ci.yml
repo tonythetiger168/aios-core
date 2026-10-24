@@ -28,3 +28,53 @@ jobs:
           docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
           echo "AIOS_TEST_DOCKER=1" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
+
+  microvm:
+    # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
+    runs-on: ubuntu-latest
+    env:
+      FC_VERSION: v1.13.1
+      FC_SHA256: 59450b9171ff2ebdf2f9a25be3a248a7ba79fb6371aec51a9d6d8eefca7b4faf
+      KERNEL_KEY: firecracker-ci/v1.13/x86_64/vmlinux-6.1.141
+      KERNEL_SHA256: b36a4a1b10f33b9cfdcde3d1a787d9c090556a3edb211cd06d1f3f9a6c7e8724
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Fetch Firecracker and the guest kernel (pinned by sha256), build the root image
+        shell: bash
+        run: |
+          d="$RUNNER_TEMP/microvm"; mkdir -p "$d"
+          curl -fsSL -o "$RUNNER_TEMP/fc.tgz" "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-x86_64.tgz"
+          echo "$FC_SHA256  $RUNNER_TEMP/fc.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/fc.tgz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64" "$d/firecracker"
+          curl -fsSL -o "$d/vmlinux" "https://s3.amazonaws.com/spec.ccfc.min/$KERNEL_KEY"
+          echo "$KERNEL_SHA256  $d/vmlinux" | sha256sum -c -
+          docker pull python:3.12-slim
+          sudo scripts/build-microvm-rootfs.sh "$d"
+          echo "AIOS_MICROVM_DIR=$d" >> "$GITHUB_ENV"
+          echo "AIOS_TEST_MICROVM=1" >> "$GITHUB_ENV"
+      - name: Run the microVM tests and record evidence
+        shell: bash
+        run: |
+          {
+            echo "commit: $GITHUB_SHA"; uname -a; nproc; ls -l /dev/kvm
+            "$AIOS_MICROVM_DIR/firecracker" --version
+            sha256sum "$AIOS_MICROVM_DIR"/firecracker "$AIOS_MICROVM_DIR"/vmlinux "$AIOS_MICROVM_DIR"/rootfs.ext4
+            docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
+            python -m unittest tests.test_microvm -v 2>&1
+          } 2>&1 | tee microvm-evidence.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: microvm-evidence
+          path: microvm-evidence.txt

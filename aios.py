@@ -5,6 +5,7 @@ export ANTHROPIC_API_KEY=...
 """
 import argparse
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -21,6 +22,7 @@ import functools
 import hashlib
 import posixpath
 import re
+import secrets
 import urllib.error
 import urllib.request
 from contextlib import AsyncExitStack
@@ -40,9 +42,10 @@ WORKSPACE = Path("./workspace").resolve()
 DB_PATH = "aios.db"
 HISTORY_LIMIT = 40  # messages reloaded per agent
 MCP_MAX_RESULT = 20_000  # chars kept from one MCP tool result
-SANDBOXES = ("auto", "process", "docker", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
+SANDBOXES = ("auto", "process", "docker", "microvm", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
 SANDBOX_CHOICE = None  # set by the CLI's --sandbox; else $AIOS_SANDBOX; else "auto"
 DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself
+MICROVM_HOME = Path.home() / ".aios" / "microvm"  # or $AIOS_MICROVM_DIR: firecracker, vmlinux, rootfs.ext4
 FILE_MAX_CHARS = 50_000  # max chars read/written by file tools
 LIST_MAX = 200  # max entries returned by list_files
 RUN_ENTRY = "(run)"  # audit tool name for per-run summaries
@@ -1118,9 +1121,142 @@ class DockerSandbox:
                 raise asyncio.CancelledError
 
 
+class MicroVMSandbox:
+    """run_python in a fresh Firecracker microVM per call (Linux with KVM only): its own guest
+    kernel, no network device, read-only root image, the code on a read-only job drive and
+    nothing else from the host. 1 vCPU and 256 MiB by default. Selected only explicitly;
+    see docs/microvm-sandbox.md for the threat model and what has been verified."""
+    name = "microvm"
+    BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off nomodule quiet loglevel=1 "
+                 "random.trust_cpu=on init=/aios-init ro")
+
+    def __init__(self, home=None, timeout=10, vcpus=1, mem_mb=256, max_out=10_000,
+                 boot_timeout=15, cleanup_timeout=3, max_code=1 << 20):
+        self.home = Path(home or os.environ.get("AIOS_MICROVM_DIR") or MICROVM_HOME)
+        self.timeout, self.vcpus, self.mem_mb, self.max_out = timeout, vcpus, mem_mb, max_out
+        self.boot_timeout, self.cleanup_timeout, self.max_code = boot_timeout, cleanup_timeout, max_code
+
+    @classmethod
+    def paths(cls, home=None):
+        home = Path(home or os.environ.get("AIOS_MICROVM_DIR") or MICROVM_HOME)
+        fc = home / "firecracker"
+        return {"firecracker": fc if fc.exists() else Path(shutil.which("firecracker") or fc),
+                "kernel": home / "vmlinux", "rootfs": home / "rootfs.ext4"}
+
+    @classmethod
+    def unavailable(cls, home=None) -> str | None:
+        """Why this backend cannot run here, or None. Never downloads or builds anything."""
+        if not sys.platform.startswith("linux"):
+            return "microVMs need Linux with KVM (use --sandbox docker elsewhere)"
+        if not os.path.exists("/dev/kvm"):
+            return "/dev/kvm is missing (no KVM: enable virtualization, or nested virtualization)"
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return "/dev/kvm is not readable and writable by this user (add it to the kvm group)"
+        p = cls.paths(home)
+        if not os.access(p["firecracker"], os.X_OK):
+            return (f"firecracker not found at {p['firecracker']} (put the binary there or on PATH)")
+        for key in ("kernel", "rootfs"):
+            if not p[key].is_file():
+                return (f"{key} image missing: {p[key]} (see docs/microvm-sandbox.md; "
+                        "scripts/build-microvm-rootfs.sh builds the root image)")
+        return None
+
+    def job_image(self, nonce: str, code: str) -> bytes:
+        data = code.encode()
+        if len(data) > self.max_code:
+            raise ValueError(f"code is larger than {self.max_code} bytes")
+        blob = f"AIOS1 {nonce} {self.timeout} {self.max_out} {len(data)}\n".encode() + data
+        return blob + b"\0" * (-len(blob) % 512)
+
+    def config(self, workdir: Path) -> dict:
+        p = self.paths(self.home)
+        return {
+            "boot-source": {"kernel_image_path": str(p["kernel"]), "boot_args": self.BOOT_ARGS},
+            "drives": [
+                {"drive_id": "rootfs", "path_on_host": str(p["rootfs"]),
+                 "is_root_device": True, "is_read_only": True},
+                {"drive_id": "job", "path_on_host": str(workdir / "job.img"),
+                 "is_root_device": False, "is_read_only": True},
+            ],
+            "machine-config": {"vcpu_count": self.vcpus, "mem_size_mib": self.mem_mb,
+                               "smt": False},
+            # no "network-interfaces", "vsock" or "mmds-config": the guest has no device to
+            # reach the network or the host through
+        }
+
+    def parse(self, log: str, nonce: str) -> str | None:
+        """The result block from the serial console, or None if the guest gave none."""
+        log = log.replace("\r\n", "\n")  # the serial console turns \n into \r\n
+        begin, end = f"AIOS-BEGIN-{nonce}\n", f"AIOS-END-{nonce} "
+        i = log.find(begin)
+        j = log.find(end, i + len(begin)) if i >= 0 else -1
+        if j < 0:
+            return None
+        fields = dict(f.split("=", 1) for f in log[j + len(end):].split("\n", 1)[0].split()
+                      if "=" in f)
+        try:
+            out = base64.b64decode("".join(log[i + len(begin):j].split()), validate=True)
+        except ValueError:
+            return None
+        text = out.decode(errors="replace")
+        if fields.get("truncated") == "1":
+            text += "\n...(truncated)"
+        if fields.get("status") == "timeout":
+            return f"killed: timeout after {self.timeout}s\n{text}".rstrip("\n")
+        return f"exit={fields.get('rc', '?')}\n{text}"
+
+    async def _stop(self, proc):
+        """Kill the VMM (and anything it started) and confirm it is gone."""
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), self.cleanup_timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"microVM cleanup unconfirmed: firecracker pid {proc.pid} "
+                               "did not exit after SIGKILL") from None
+
+    async def run_python(self, code: str) -> str:
+        nonce = secrets.token_hex(16)
+        workdir = Path(tempfile.mkdtemp(prefix="aios-mvm-"))
+        proc = None
+        try:
+            (workdir / "job.img").write_bytes(self.job_image(nonce, code))
+            (workdir / "config.json").write_text(json.dumps(self.config(workdir)))
+            proc = await asyncio.create_subprocess_exec(
+                str(self.paths(self.home)["firecracker"]), "--no-api",
+                "--config-file", str(workdir / "config.json"), "--level", "Error",
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, cwd=workdir, start_new_session=True)
+            # The guest enforces the code's timeout; the host deadline also covers boot and
+            # shutdown, and holds even if the guest never answers.
+            limit = 4 * self.max_out + 65536
+            try:
+                log = await asyncio.wait_for(DockerSandbox._read_limited(proc.stdout, limit),
+                                             self.timeout + self.boot_timeout)
+                await asyncio.wait_for(proc.wait(), self.cleanup_timeout)
+            except asyncio.TimeoutError:
+                return f"killed: timeout after {self.timeout}s (microVM did not finish)"
+            result = self.parse(log, nonce)
+            if result is None:
+                tail = log[-600:].strip()
+                raise RuntimeError(f"microVM gave no result (firecracker exit={proc.returncode})"
+                                   + (f": {tail}" if tail else ""))
+            return result
+        finally:
+            try:
+                if proc is not None:
+                    await asyncio.shield(self._stop(proc))
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+
 def make_sandbox(choice: str | None = None):
     """The run_python backend for `choice` (see SANDBOXES), or None when run_python stays off.
-    An explicit "docker" that cannot run raises RuntimeError (asked-for isolation must not degrade)."""
+    An explicit "docker" or "microvm" that cannot run raises RuntimeError (asked-for isolation
+    must not degrade); "auto" never picks microvm."""
     choice = choice or SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX") or "auto"
     if choice not in SANDBOXES:
         raise ValueError(f"sandbox must be one of {', '.join(SANDBOXES)}, not {choice!r}")
@@ -1132,6 +1268,11 @@ def make_sandbox(choice: str | None = None):
         if why:
             raise RuntimeError(f"--sandbox docker: {why}")
         return DockerSandbox()
+    if choice == "microvm":
+        why = MicroVMSandbox.unavailable()
+        if why:
+            raise RuntimeError(f"--sandbox microvm: {why}")
+        return MicroVMSandbox()
     if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable():
         return DockerSandbox()  # the only real isolation on Windows
     if IS_WINDOWS and not weak_ok:  # "process" on Windows is timeout-only: opt-in
@@ -1150,6 +1291,9 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
         if box.name == "docker":
             isolation = ("Docker Linux container; requests no network and no host directory mounts. "
                          "Isolation depends on the Docker daemon and platform; not a microVM. ")
+        elif box.name == "microvm":
+            isolation = ("Fresh Firecracker microVM per call (own kernel, KVM); no network device, "
+                         "no host files, read-only root, runs as nobody. ")
         else:
             network = "network namespace enabled" if box.net_isolated else "network NOT isolated"
             isolation = f"Local process; can read files accessible to this user; {network}. "
@@ -1874,10 +2018,16 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
               "with 'Authorization: Bearer <secret>'", file=sys.stderr)
     if approve_timeout:
         print("[aios] risky calls wait for a person in `aios console --approve`", file=sys.stderr)
+    import aios_watchdog as wd
+    beat_info = f"pid={os.getpid()} tick={tick_seconds:g} timeout={timeout:g}"
     try:
         while True:
+            wd.beat(k.store.db, "daemon", beat_info)  # supervisor: the daemon is alive
             for r in await sched.tick():
                 print(f"[aios] job {r['job']}: {r['status']}", file=sys.stderr)
+            wd.beat(k.store.db, "daemon", beat_info)
+            for al in wd.check(k.store.db):  # watchdog: rules over the audit log, no model involved
+                print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
             if once:
                 break
             await asyncio.sleep(tick_seconds)
@@ -2116,6 +2266,61 @@ def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None
         store.db.close()
 
 
+def status_cmd(home: str, now=None) -> int:
+    """Supervisor view: is the daemon alive, what needs a person. Exit 0 = nothing needs attention."""
+    import aios_watchdog as wd
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print(f"no aios.db in {Path(home).resolve()}")
+        return 1
+    store = Store(str(db))
+    try:
+        hb = wd.liveness(store.db, now=now)
+        info = dict(re.findall(r"(tick|timeout)=([0-9.]+)", hb["info"] or ""))
+        if info and hb["state"] != "never":  # a slow --tick or a long job must not look like a dead daemon
+            grace = 3 * float(info.get("tick", 0)) + float(info.get("timeout", 0))
+            hb = wd.liveness(store.db, now=now, stale_after=max(wd.STALE_AFTER, grace))
+        when = f"last seen {hb['ts']} ({hb['age']:.0f}s ago)" if hb["ts"] else "has never run here"
+        print(f"daemon: {hb['state']}, {when}")
+        alerts = wd.list_alerts(store.db)
+        pending = store.db.execute("SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires>?",
+                                   (datetime.now().isoformat(timespec="seconds"),)).fetchone()[0]
+        print(f"open alerts: {len(alerts)}   waiting for approval: {pending}")
+        for al in alerts[:10]:
+            print(f"  #{al['id']} {al['ts']} [{al['severity']}] {al['rule']}: {al['detail']}")
+        return 0 if hb["state"] != "down" and not alerts and not pending else 1
+    finally:
+        store.db.close()
+
+
+def alerts_cmd(home: str, show_all: bool = False, ack: str | None = None, run_check: bool = False,
+               n: int = 50) -> int:
+    import aios_watchdog as wd
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print("(no alerts)")
+        return 0
+    store = Store(str(db))
+    try:
+        if run_check:
+            print(f"checked: {len(wd.check(store.db))} new alert(s)")
+        if ack:
+            if ack != "all" and not ack.isdigit():
+                print("--ack takes an alert number or 'all'")
+                return 2
+            print(f"acknowledged {wd.ack(store.db, ack)} alert(s)")
+            return 0
+        rows = wd.list_alerts(store.db, show_all, n)
+        for al in rows:
+            done = f"  (acknowledged {al['acked_ts']})" if al["acked_ts"] else ""
+            print(f"#{al['id']} {al['ts']} [{al['severity']}] {al['rule']} {al['subject']}: {al['detail']}{done}")
+        if not rows:
+            print("(no open alerts)" if not show_all else "(no alerts)")
+        return 0
+    finally:
+        store.db.close()
+
+
 def add_model_flags(p):
     """Model + budget flags shared by `chat` and `daemon`."""
     p.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
@@ -2223,6 +2428,14 @@ def cli():
     me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
     me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
     me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
+    st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
+    al.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    al.add_argument("--all", action="store_true", help="include acknowledged alerts")
+    al.add_argument("--ack", metavar="ID|all", help="acknowledge one alert, or all open ones")
+    al.add_argument("--check", action="store_true", help="run the watchdog rules now (the daemon does this every tick)")
+    al.add_argument("-n", type=int, default=50, help="how many alerts (default 50)")
     dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
     for p in (sv, dm):
         p.add_argument("--approvals", choices=["none", "console"], default="none",
@@ -2236,7 +2449,8 @@ def cli():
     for p in (c, sv, dm, dmo, aa):
         p.add_argument("--sandbox", choices=SANDBOXES,
                        help="run_python backend: process (local child process), docker (throwaway "
-                            f"container, needs `docker pull {DOCKER_IMAGE}`), off, or auto (default: "
+                            f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
+                            "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
     a = ap.parse_args()
     global SANDBOX_CHOICE
@@ -2250,6 +2464,10 @@ def cli():
         return asyncio.run(demo())
     if a.cmd == "audit":
         return audit_cmd(a.agent, a.n, a.home)
+    if a.cmd == "status":
+        raise SystemExit(status_cmd(a.home))
+    if a.cmd == "alerts":
+        raise SystemExit(alerts_cmd(a.home, a.all, a.ack, a.check, a.n))
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
