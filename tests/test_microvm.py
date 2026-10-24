@@ -144,6 +144,7 @@ class MicroVMSelectionTests(unittest.TestCase):
             make_home(home, fc=False, kernel=False)
             self.assertIsNone(aios.MicroVMSandbox.unavailable(home))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
     def test_the_jailer_needs_root_and_its_binary(self):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(aios.os.path, "exists", return_value=True), \
