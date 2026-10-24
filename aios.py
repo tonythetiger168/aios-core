@@ -44,7 +44,8 @@ HISTORY_LIMIT = 40  # messages reloaded per agent
 MCP_MAX_RESULT = 20_000  # chars kept from one MCP tool result
 SANDBOXES = ("auto", "process", "docker", "microvm", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
 SANDBOX_CHOICE = None  # set by the CLI's --sandbox; else $AIOS_SANDBOX; else "auto"
-DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself
+DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself; pin with $AIOS_DOCKER_IMAGE
+DIGEST_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 MICROVM_HOME = Path.home() / ".aios" / "microvm"  # or $AIOS_MICROVM_DIR: firecracker, vmlinux, rootfs.ext4
 FILE_MAX_CHARS = 50_000  # max chars read/written by file tools
 LIST_MAX = 200  # max entries returned by list_files
@@ -965,6 +966,15 @@ class Sandbox:
             return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
 
 
+def docker_image() -> str:
+    """The image for the docker sandbox: $AIOS_DOCKER_IMAGE (ideally pinned, NAME@sha256:<digest>)
+    or DOCKER_IMAGE. A pinned reference makes the daemon run exactly that content."""
+    image = os.environ.get("AIOS_DOCKER_IMAGE", "").strip() or DOCKER_IMAGE
+    if "@" in image and not DIGEST_RE.fullmatch(image):
+        raise ValueError(f"AIOS_DOCKER_IMAGE must be NAME[:TAG] or NAME@sha256:<64 hex>, not {image!r}")
+    return image
+
+
 class DockerSandbox:
     """run_python in a throwaway container: no network, no host files (nothing is mounted), read-only
     root with a small /tmp, unprivileged user, all capabilities dropped, memory/CPU/process caps.
@@ -972,16 +982,21 @@ class DockerSandbox:
     this is a container boundary, not microVM isolation."""
     name = "docker"
 
-    def __init__(self, image=DOCKER_IMAGE, timeout=10, cpus=1.0, mem_mb=256, pids=64,
+    def __init__(self, image=None, timeout=10, cpus=1.0, mem_mb=256, pids=64,
                  max_out=10_000, docker="docker", cleanup_timeout=3):
-        self.image, self.timeout, self.cpus, self.mem_mb = image, timeout, cpus, mem_mb
-        self.pids, self.max_out, self.docker = pids, max_out, docker
+        self.image, self.timeout, self.cpus, self.mem_mb = image or docker_image(), timeout, cpus, mem_mb
+        self.pids, self.max_out = pids, max_out
+        self.docker = shutil.which(docker) or docker  # resolved once: later PATH changes cannot swap it
         self.cleanup_timeout = cleanup_timeout
 
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def unavailable(image=DOCKER_IMAGE, docker="docker") -> str | None:
-        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image."""
+        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image, and
+        with $AIOS_DOCKER_REQUIRE_DIGEST=1 that the image is pinned by digest."""
+        if os.environ.get("AIOS_DOCKER_REQUIRE_DIGEST") == "1" and not DIGEST_RE.fullmatch(image):
+            return (f"image {image} is not pinned and AIOS_DOCKER_REQUIRE_DIGEST=1: set "
+                    "AIOS_DOCKER_IMAGE=NAME@sha256:<digest> (see docs/docker-sandbox-validation.md)")
         exe = shutil.which(docker)
         if not exe:
             return "docker is not installed (or not on PATH)"
@@ -998,6 +1013,39 @@ class DockerSandbox:
         if r.stdout.strip() != "linux":
             return f"image {image} is not a Linux image (switch Docker Desktop to Linux containers)"
         return None
+
+    @staticmethod
+    def provenance(image: str, docker="docker") -> list[str]:
+        """Startup notes on what will run the code: executable, daemon endpoint, image pinning."""
+        exe = shutil.which(docker) or docker
+        notes = [f"docker executable: {exe}"]
+
+        def ask(*args):
+            try:
+                r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=20)
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+
+        host = os.environ.get("DOCKER_HOST") or ask("context", "inspect", "--format",
+                                                    "{{.Endpoints.docker.Host}}")
+        if host and not host.startswith(("unix://", "npipe://")):
+            notes.append(f"WARNING: the Docker daemon is remote ({host}): code and its output go there")
+        elif host:
+            notes.append(f"docker daemon: {host}")
+        if DIGEST_RE.fullmatch(image):
+            notes.append(f"image pinned: {image}")
+        else:
+            digests = ask("image", "inspect", "--format", "{{json .RepoDigests}}", image)
+            try:
+                found = [d for d in json.loads(digests or "[]") if isinstance(d, str) and DIGEST_RE.fullmatch(d)]
+            except ValueError:
+                found = []
+            repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+            mine = [d for d in found if d.split("@")[0] == repo] or found
+            notes.append(f"image {image} is NOT pinned (a tag can change)"
+                         + (f": pin it with AIOS_DOCKER_IMAGE={mine[0]}" if mine else ""))
+        return notes
 
     def command(self, container: str) -> list[str]:
         # Create separately: once acknowledged, a delayed start cannot create a new container
@@ -1264,17 +1312,22 @@ def make_sandbox(choice: str | None = None):
     if choice == "off":
         return None
     if choice == "docker":
-        why = DockerSandbox.unavailable()
+        image = docker_image()
+        why = DockerSandbox.unavailable(image)
         if why:
             raise RuntimeError(f"--sandbox docker: {why}")
-        return DockerSandbox()
+        for note in DockerSandbox.provenance(image):
+            print(f"[sandbox] {note}", file=sys.stderr)
+        return DockerSandbox(image)
     if choice == "microvm":
         why = MicroVMSandbox.unavailable()
         if why:
             raise RuntimeError(f"--sandbox microvm: {why}")
         return MicroVMSandbox()
-    if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable():
-        return DockerSandbox()  # the only real isolation on Windows
+    if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable(docker_image()):
+        for note in DockerSandbox.provenance(docker_image()):  # the only real isolation on Windows
+            print(f"[sandbox] {note}", file=sys.stderr)
+        return DockerSandbox()
     if IS_WINDOWS and not weak_ok:  # "process" on Windows is timeout-only: opt-in
         print("[aios] run_python disabled on Windows (no real sandbox). Use --sandbox docker "
               f"(after `docker pull {DOCKER_IMAGE}`), WSL2, or set AIOS_ALLOW_WEAK_SANDBOX=1 to enable "
@@ -2478,7 +2531,11 @@ def cli():
     choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX")
     if choice and choice not in SANDBOXES:
         ap.error(f"AIOS_SANDBOX must be one of {', '.join(SANDBOXES)}, not {choice!r}")
-    if choice == "docker" and (why := DockerSandbox.unavailable()):  # fail before starting anything
+    try:
+        image = docker_image()
+    except ValueError as e:
+        ap.error(str(e))
+    if choice == "docker" and (why := DockerSandbox.unavailable(image)):  # fail before starting anything
         ap.error(f"--sandbox docker: {why}")
     if a.cmd == "demo":
         return asyncio.run(demo())

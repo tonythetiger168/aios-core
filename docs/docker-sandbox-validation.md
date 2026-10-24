@@ -86,5 +86,65 @@ Follow-up acceptance criteria:
    including cancellation, cleanup and unsupported configuration failures.
 2. CPU, PID, swap and memory/OOM cause checks; daemon disconnect/restart and
    delayed-create reconciliation tests. Rootless/remote contexts need explicit scope.
-3. Image digest pinning/update policy and daemon/context threat model.
-4. A separate microVM backend, threat model and tests before any microVM claim.
+3. ~~Image digest pinning/update policy and daemon/context threat model.~~ See
+   "Image pinning and trust" below.
+4. ~~A separate microVM backend~~: `--sandbox microvm`, see
+   [microvm-sandbox.md](microvm-sandbox.md).
+
+## Image pinning and trust
+
+### Pinning
+
+`--pull never` stops AIOS from fetching anything, but a tag such as
+`python:3.12-slim` names whatever image was pulled last. To run exactly one image, pin it:
+
+```sh
+docker pull python:3.12-slim
+docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
+# ["python@sha256:<digest>"]
+export AIOS_DOCKER_IMAGE=python@sha256:<digest>
+export AIOS_DOCKER_REQUIRE_DIGEST=1   # optional: refuse to start with an unpinned tag
+```
+
+- With a pinned reference, the container is created from `NAME@sha256:<digest>`. The daemon
+  stores images by content, so it runs that content or nothing. A missing or different image
+  is reported as "not present", and nothing is pulled.
+- Each time the docker sandbox starts, it prints the Docker executable it resolved, the daemon
+  endpoint and whether the image is pinned. For an unpinned tag it also prints the exact
+  `AIOS_DOCKER_IMAGE=` line to pin what is present now.
+- A malformed `AIOS_DOCKER_IMAGE` (an `@` without `sha256:` and 64 hex digits) is a startup
+  error.
+- Multi-architecture images: `RepoDigests` records the digest of the multi-platform index you
+  pulled, so the same pin works on amd64 and arm64 hosts. Each host runs the image for its own
+  architecture from that index. If you need byte-identical images across hosts, pin the
+  per-platform manifest digest instead, from `docker buildx imagetools inspect`.
+
+### Updates and vulnerabilities
+
+- Update on purpose: pull the tag, review what changed (for example `docker scout cves` or
+  your scanner of choice), then move the pin. Record the old and new digests in your change log.
+- When a vulnerability in the base image matters for code isolation (the Python
+  interpreter, glibc, or anything reachable from `python -I` with no network and a read-only
+  root), pull and re-pin promptly. Kernel and runtime (runc/containerd) vulnerabilities are
+  fixed on the host, not in the image.
+- AIOS does not verify signatures (cosign/Notary). Use a registry or admission policy if you
+  need that.
+
+### What you trust
+
+- **The Docker executable**: resolved once from `PATH` when the sandbox starts and printed.
+  Whoever controls your `PATH` controls what runs.
+- **The daemon and its administrators**: anyone in the `docker` group, or with access to the
+  socket, is root-equivalent on the host and can read code and output.
+- **The Docker context**: `DOCKER_HOST` or the selected context decides which daemon runs the
+  code. A non-local endpoint (`tcp://`, `ssh://`) is flagged at startup as remote, because code
+  and output leave this machine.
+- **The image**: pinning fixes which content runs; it does not make that content trustworthy.
+
+### Platform dependencies
+
+Enforcement comes from the daemon's kernel: cgroups (v2 recommended) for memory, CPU and PIDs,
+namespaces for the network, seccomp and the default AppArmor/SELinux profile when enabled. Rootless
+Docker and Docker Desktop change who enforces what. Rootless Docker needs cgroup v2 delegation for
+the limits to apply, and Docker Desktop runs everything in its own Linux VM. These configurations
+are not covered by CI; validate them with the opt-in real-Docker tests before relying on them.
