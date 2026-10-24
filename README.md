@@ -78,6 +78,16 @@ python aios.py daemon --once ...          # run what is due, then exit: for cron
 
 Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*`, `on webhook` (both below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
 
+**Keep it running.** `aios service` prints a service definition that starts the daemon at login and restarts it when it crashes, plus the commands to install it. aios installs nothing itself, so you can read exactly what will run:
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # Task Scheduler (PowerShell)
+```
+
+Flags after `--` go to `aios daemon` unchanged (`--once` is refused: a service keeps running). API keys never go into the service file: systemd and launchd read `KEY=value` lines from `<home>/aios.env` (make it readable by you only); on Windows, set them as user environment variables.
+
 - **Nobody can approve anything** (unless you turn on browser approvals, below). Same policy pipeline as `chat`, but risky tools are refused unless the policy pre-allows the path with `auto_paths`. A job with no policy section is read-only (`now`, `read_file`, `list_files`, `recall`, `list_facts`, `search_memory`).
 - A job that reads a file is *tainted*, so even `auto_paths` stop applying, unless the scope says `auto_when_tainted = true`: your explicit statement that injected text in what the job read may write into that one folder, and nothing else.
 - Each job is its own agent (`job-<name>`: own history and memory) and starts every run with a clean history. Runs always have a cap (default 50,000 tokens, 8 steps, 300 s), and a job runs at most 200 times a day (`--max-runs-per-day`), so a typo like `every 1m` cannot burn your budget unnoticed.
@@ -208,9 +218,10 @@ python aios.py a2a-serve --agent researcher --policy policy.example.toml --port 
 AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.0.1:8770
 ```
 
-- **Serving**: listens on 127.0.0.1; every call needs the token (the agent card at `/.well-known/agent-card.json` is public and only names the agent). The caller is **not trusted**: each request is a fresh run of that policy agent with its own permissions and a capped budget (50,000 tokens by default), starts *tainted* so `auto_paths`/`auto_args` never apply, keeps no history between requests, and is audited. Nobody can approve risky calls, so a served agent should be read-only or tightly scoped.
-- **Calling**: `--a2a NAME=URL` (in `chat` and `daemon`) makes the tool `a2a__NAME`. Grant it per agent like any tool. It sends your text to another machine, so every call needs approval (in `daemon`: refused unless a scope pre-allows it with `auto_args`, or you answer it with `--approvals console`), and the answer comes back tagged untrusted. A token is never sent over plain `http` to anything but this machine, and calls always go to the URL you gave, not to a URL the remote card names.
-- Not supported yet: streaming, push notifications, files, and multi-turn conversations (each request stands alone).
+- **Serving**: listens on 127.0.0.1; every call needs the token (the agent card at `/.well-known/agent-card.json` is public and only names the agent). The caller is **not trusted**: each conversation is a fresh instance of that policy agent with its own permissions and a capped budget per request (50,000 tokens by default). It starts *tainted* so `auto_paths`/`auto_args` never apply, and every request is audited. A message that carries a `contextId` continues that conversation: its history stays in memory only (at most 20 messages per conversation and 20 conversations, forgotten after 30 idle minutes) and is never saved. A message without one starts over. Nobody can approve risky calls, so a served agent should be read-only or tightly scoped.
+- **Calling**: `--a2a NAME=URL` (in `chat` and `daemon`) makes the tool `a2a__NAME`. Grant it per agent like any tool. It sends your text to another machine, so every call needs approval (in `daemon`: refused unless a scope pre-allows it with `auto_args`, or you answer it with `--approvals console`), and the answer comes back tagged untrusted. A token is never sent over plain `http` to anything but this machine, and calls always go to the URL you gave, not to a URL the remote card names. Each answer ends with `[conversation: <id>]`; the model passes that id back as `conversation` to continue, including when the remote agent asks for more input.
+- **Streaming**: `SendStreamingMessage` / `message/stream` answer as server-sent events (submitted, working, the answer, final status), so streaming-only clients work too. Updates are not incremental yet: the answer arrives in one piece.
+- Not supported yet: push notifications, cancelling a running task, and files.
 
 ## Architecture
 
@@ -274,7 +285,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn and streaming) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 

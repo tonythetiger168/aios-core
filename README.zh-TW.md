@@ -78,6 +78,16 @@ python aios.py daemon --once ...          # 執行到期的任務就結束：給
 
 排程格式：`every 30m`、`every 2h`、`every 1d`、`daily 09:00`、`weekly mon 09:00`、`once 2026-12-24 18:30`、`on change inbox/*`、`on webhook`（兩者見下；本地時間，最短每分鐘一次）。用 cron 的話：`* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`。
 
+**保持執行。** `aios service` 會印出一份服務設定：登入時啟動守護程式、當掉時自動重啟，並附上安裝指令。aios 本身不安裝任何東西，所以你能看清楚到底會執行什麼：
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # 工作排程器（PowerShell）
+```
+
+`--` 之後的參數會原封不動交給 `aios daemon`（`--once` 會被拒絕：服務必須持續執行）。API key 絕不寫進服務設定檔：systemd 與 launchd 會從 `<home>/aios.env` 讀取 `KEY=value`（請設成只有你能讀）；Windows 請設成使用者環境變數。
+
 - **沒有人能批准任何事**（除非你開啟下面的瀏覽器審批）。政策流程和 `chat` 相同，但高風險工具一律拒絕，除非政策用 `auto_paths` 預先允許該路徑。沒有政策區段的任務只能唯讀（`now`、`read_file`、`list_files`、`recall`、`list_facts`、`search_memory`）。
 - 讀過檔案的任務會被視為「被污染」，連 `auto_paths` 也不再生效，除非範圍設定了 `auto_when_tainted = true`：這代表你明確接受「任務讀到的文字若含注入指令，可以寫入那一個資料夾，且僅限該資料夾」。
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。
@@ -208,9 +218,10 @@ python aios.py a2a-serve --agent researcher --policy policy.example.toml --port 
 AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.0.1:8770
 ```
 
-- **提供服務**：只聽 127.0.0.1；每次呼叫都需要 token（`/.well-known/agent-card.json` 的代理名片是公開的，只寫了代理名稱與說明）。呼叫者**不被信任**：每個請求都是該政策代理的一次全新執行，用它自己的權限與有上限的預算（預設 5 萬 token），一開始就被視為「被污染」，所以 `auto_paths`／`auto_args` 永遠不生效，請求之間不保留歷史，並寫入審計日誌。沒有人能審批高風險呼叫，所以對外提供的代理應該唯讀或嚴格限制範圍。
-- **呼叫遠端**：`--a2a 名稱=URL`（`chat` 與 `daemon` 都可用）會產生工具 `a2a__名稱`，授權方式和其他工具一樣。它會把你的文字送到另一台機器，所以每次呼叫都需要審批（在 `daemon` 中一律拒絕，除非範圍用 `auto_args` 預先允許，或用 `--approvals console` 由你回答），回覆也會被標記為不可信。token 絕不會以明文 `http` 送到本機以外的地方，而且呼叫一律送到你給的 URL，不會改送到遠端名片上寫的 URL。
-- 尚未支援：串流、推播通知、檔案，以及多輪對話（每個請求各自獨立）。
+- **提供服務**：只聽 127.0.0.1；每次呼叫都需要 token（`/.well-known/agent-card.json` 的代理名片是公開的，只寫了代理名稱與說明）。呼叫者**不被信任**：每段對話都是該政策代理的一個全新實例，用它自己的權限，每個請求有預算上限（預設 5 萬 token）。一開始就被視為「被污染」，所以 `auto_paths`／`auto_args` 永遠不生效，每個請求都寫入審計日誌。帶有 `contextId` 的訊息會接續那段對話：歷史只留在記憶體中（每段對話最多 20 則訊息、同時最多 20 段對話，閒置 30 分鐘後忘記），絕不存檔；沒帶的訊息就重新開始。沒有人能審批高風險呼叫，所以對外提供的代理應該唯讀或嚴格限制範圍。
+- **呼叫遠端**：`--a2a 名稱=URL`（`chat` 與 `daemon` 都可用）會產生工具 `a2a__名稱`，授權方式和其他工具一樣。它會把你的文字送到另一台機器，所以每次呼叫都需要審批（在 `daemon` 中一律拒絕，除非範圍用 `auto_args` 預先允許，或用 `--approvals console` 由你回答），回覆也會被標記為不可信。token 絕不會以明文 `http` 送到本機以外的地方，而且呼叫一律送到你給的 URL，不會改送到遠端名片上寫的 URL。每個回覆結尾會附上 `[conversation: <id>]`，模型把這個 id 當作 `conversation` 傳回去就能接續對話，遠端代理要求補充資訊時也一樣。
+- **串流**：`SendStreamingMessage`／`message/stream` 會以 server-sent events 回覆（已提交、處理中、答案、最終狀態），所以只支援串流的用戶端也能用。目前還不是逐字更新：答案一次送達。
+- 尚未支援：推播通知、取消執行中的任務，以及檔案。
 
 ## 架構
 
@@ -274,7 +285,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定與掃描（發布者簽章留待 P3 的註冊表）· ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話與串流）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心 · 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

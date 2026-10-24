@@ -71,6 +71,20 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
     async def http(self, *a, **kw):
         return await asyncio.to_thread(self._http, *a, **kw)
 
+    def _sse(self, method, params):
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+        c.request("POST", "/", body=json.dumps({"jsonrpc": "2.0", "id": 9, "method": method, "params": params}),
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}",
+                           "Accept": "text/event-stream"})
+        r = c.getresponse()
+        kind, raw = r.getheader("Content-Type"), r.read().decode()
+        c.close()
+        events = [json.loads(chunk.removeprefix("data: ")) for chunk in raw.split("\n\n") if chunk.strip()]
+        return kind, events
+
+    async def sse(self, method, params):
+        return await asyncio.to_thread(self._sse, method, params)
+
     async def rpc(self, method, params=None, **kw):
         status, body = await self.http("POST", "/", {"jsonrpc": "2.0", "id": 7, "method": method,
                                                      "params": params or {}}, **kw)
@@ -86,7 +100,7 @@ class ServerTests(ServerCase):
             self.assertEqual(status, 200)
             self.assertEqual((card["name"], card["protocolVersion"]), ("helper", aios_a2a.PROTOCOL))
             self.assertEqual(card["url"], f"http://127.0.0.1:{self.srv.port}/")
-            self.assertFalse(card["capabilities"]["streaming"])
+            self.assertTrue(card["capabilities"]["streaming"])
             self.assertEqual(card["security"], [{"bearer": []}])
         self.assertEqual(self.srv.httpd.server_address[0], "127.0.0.1")
 
@@ -116,7 +130,7 @@ class ServerTests(ServerCase):
 
     async def test_protocol_errors(self):
         cases = [
-            ("message/stream", {"message": user_msg()}, aios_a2a.UNSUPPORTED),
+            ("message/stream", {}, aios_a2a.INVALID_PARAMS),  # checked before the stream starts
             ("tasks/cancel", {"id": "x"}, aios_a2a.UNSUPPORTED),
             ("nope/nope", {}, aios_a2a.NO_METHOD),
             ("message/send", {}, aios_a2a.INVALID_PARAMS),
@@ -149,10 +163,85 @@ class ServerTests(ServerCase):
         failed = (await self.rpc("SendMessage", {"message": dict(msg, parts=[{"text": "boom"}])}))["result"]["task"]
         self.assertEqual(failed["status"]["state"], "TASK_STATE_FAILED")
         self.assertEqual(failed["status"]["message"]["role"], "ROLE_AGENT")
-        for method in ("SendStreamingMessage", "CancelTask", "CreateTaskPushNotificationConfig"):
+        for method in ("CancelTask", "CreateTaskPushNotificationConfig"):
             self.assertEqual((await self.rpc(method, {}))["error"]["code"], aios_a2a.UNSUPPORTED)
         _, card = await self.http("GET", aios_a2a.CARD_PATHS[0], token=None)
         self.assertEqual({i["protocolVersion"] for i in card["supportedInterfaces"]}, {"1.0", "0.3"})
+
+    async def test_streaming_sends_the_task_as_events(self):
+        kind, events = await self.sse("message/stream", {"message": user_msg("stream me")})
+        self.assertEqual(kind, "text/event-stream")
+        self.assertTrue(all(e["jsonrpc"] == "2.0" and e["id"] == 9 for e in events))
+        res = [e["result"] for e in events]
+        self.assertEqual([r["kind"] for r in res], ["task", "status-update", "artifact-update", "status-update"])
+        self.assertEqual(res[0]["status"]["state"], "submitted")
+        self.assertEqual((res[1]["status"]["state"], res[1]["final"]), ("working", False))
+        self.assertEqual(aios_a2a.text_of(res[2]["artifact"]["parts"]), "answer to stream me")
+        self.assertEqual((res[3]["status"]["state"], res[3]["final"]), ("completed", True))
+        self.assertEqual({r.get("taskId", r.get("id")) for r in res}, {res[0]["id"]})
+        got = (await self.rpc("tasks/get", {"id": res[0]["id"]}))["result"]
+        self.assertEqual(got["status"]["state"], "completed")  # the same task, findable afterwards
+
+    async def test_streaming_in_version_1_0(self):
+        msg = {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "boom"}]}
+        _, events = await self.sse("SendStreamingMessage", {"message": msg})
+        res = [e["result"] for e in events]
+        self.assertEqual([next(iter(r)) for r in res], ["task", "statusUpdate", "statusUpdate"])
+        self.assertEqual(res[0]["task"]["status"]["state"], "TASK_STATE_SUBMITTED")
+        final = res[2]["statusUpdate"]["status"]
+        self.assertEqual(final["state"], "TASK_STATE_FAILED")  # no answer artifact for a failure
+        self.assertIn("model down", aios_a2a.text_of(final["message"]["parts"]))
+        kind, events = await self.sse("SendStreamingMessage", {"message": dict(msg, role="ROLE_AGENT")})
+        self.assertEqual((kind, events[0]["error"]["code"]), ("application/json", aios_a2a.INVALID_PARAMS))
+
+    async def test_a_context_id_continues_the_conversation(self):
+        made = []
+        self.srv.make_agent = lambda: made.append(object()) or made[-1]
+        first = (await self.rpc("message/send", {"message": user_msg("one")}))["result"]
+        cid = first["contextId"]
+        second = (await self.rpc("message/send", {"message": dict(user_msg("two"), contextId=cid)}))["result"]
+        self.assertEqual(second["contextId"], cid)
+        other = (await self.rpc("message/send", {"message": user_msg("three")}))["result"]
+        self.assertNotEqual(other["contextId"], cid)
+        self.assertEqual(len(made), 2)  # one agent per conversation
+        self.assertIs(self.seen[0][0], self.seen[1][0])
+        self.assertIsNot(self.seen[0][0], self.seen[2][0])
+        mine = (await self.rpc("message/send", {"message": dict(user_msg("four"), contextId="my-ctx.1")}))["result"]
+        self.assertEqual(mine["contextId"], "my-ctx.1")  # callers may name a new conversation
+
+    async def test_context_rules(self):
+        for bad in ("has space", "x" * 101, 5, "../.."):
+            with self.subTest(bad=bad):
+                body = await self.rpc("message/send", {"message": dict(user_msg(), contextId=bad)})
+                self.assertEqual(body["error"]["code"], aios_a2a.INVALID_PARAMS)
+        task = (await self.rpc("message/send", {"message": user_msg()}))["result"]
+        body = await self.rpc("message/send", {"message": dict(user_msg(), taskId=task["id"])})
+        self.assertEqual(body["error"]["code"], aios_a2a.UNSUPPORTED)  # finished: use its context
+        body = await self.rpc("message/send", {"message": dict(user_msg(), taskId="nope")})
+        self.assertEqual(body["error"]["code"], aios_a2a.TASK_NOT_FOUND)
+        with mock.patch.object(aios_a2a, "CONTEXT_TURNS", 2):
+            msg = dict(user_msg(), contextId="c")
+            states = [(await self.rpc("message/send", {"message": msg}))["result"]["status"]["state"]
+                      for _ in range(3)]
+        self.assertEqual(states, ["completed", "completed", "rejected"])
+        with mock.patch.object(aios_a2a, "CONTEXTS_KEPT", 2):
+            for c in ("a", "b", "c2"):
+                await self.rpc("message/send", {"message": dict(user_msg(), contextId=c)})
+            self.assertEqual(list(self.srv.contexts), ["b", "c2"])  # the oldest is forgotten
+        with mock.patch.object(aios_a2a, "CONTEXT_IDLE", -1):
+            await self.rpc("message/send", {"message": dict(user_msg(), contextId="d")})
+            self.assertEqual(list(self.srv.contexts), ["d"])  # idle ones are dropped
+
+    async def test_the_client_continues_a_conversation(self):
+        c = aios_a2a.Client(f"http://127.0.0.1:{self.srv.port}/", TOKEN, timeout=10)
+        await asyncio.to_thread(c.card)
+        for v1 in (True, False):
+            c.v1 = v1
+            with self.subTest(v1=v1):
+                r = await asyncio.to_thread(c.ask, "hi")
+                self.assertEqual((r["answer"], r["state"], r["task_id"]), ("answer to hi", "completed", None))
+                r2 = await asyncio.to_thread(c.ask, "more", r["context_id"])
+                self.assertEqual(r2["context_id"], r["context_id"])
 
     async def test_the_client_speaks_both_versions(self):
         for v1 in (True, False):
@@ -250,7 +339,31 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
 
         k.approver = yes
         out, err, st = await k._execute(agent, "a2a__helper", {"task": "hi"}, False, {})
-        self.assertEqual((out, st), ("remote says hi", "ok"))
+        self.assertEqual(st, "ok")
+        self.assertRegex(out, r"^remote says hi\n\[conversation: [0-9a-f-]{36}\]$")
+
+    async def test_the_a2a_tool_holds_a_multi_turn_conversation(self):
+        self.remote_prov.script = [text("first"), text("second"), text("fresh")]
+        k = aios.Kernel(store=aios.Store(":memory:"), provider=Scripted(), approver=None)
+        self.addCleanup(k.store.db.close)
+        with mock.patch.dict(os.environ, {"AIOS_A2A_TOKEN_HELPER": TOKEN}):
+            await aios.install_a2a_tools(k, [f"helper={self.url}"])
+        agent = aios.Agent("main", {"a2a__helper"})
+
+        async def yes(*a, **kw):
+            return True
+
+        k.approver = yes
+        out, _, _ = await k._execute(agent, "a2a__helper", {"task": "start"}, False, {})
+        cid = out.rsplit("[conversation: ", 1)[1].rstrip("]")
+        out2, _, st = await k._execute(agent, "a2a__helper", {"task": "go on", "conversation": cid}, False, {})
+        self.assertEqual((out2.split("\n")[0], st), ("second", "ok"))
+        self.assertEqual(len(self.remote_prov.calls[1]["messages"]), 3)  # the remote kept the first turn
+        await k._execute(agent, "a2a__helper", {"task": "new"}, False, {})
+        self.assertEqual(len(self.remote_prov.calls[2]["messages"]), 1)  # no id: a new conversation
+        self.assertEqual(self.remote.store.load_messages("helper"), [])  # still never saved
+        out, err, st = await k._execute(agent, "a2a__helper", {"task": "x", "conversation": "bad id"}, False, {})
+        self.assertEqual(st, "error")
 
     async def test_bad_specs_and_unreachable_agents_fail_at_start(self):
         k = aios.Kernel(store=aios.Store(":memory:"), provider=Scripted(), approver=None)

@@ -1430,11 +1430,24 @@ async def install_a2a_tools(k: Kernel, specs: list[str]) -> list[str]:
         about = " ".join(str(card.get("description") or "").split())[:300]
 
         @k.tools.register(f"a2a__{name}", f"Ask the remote agent '{name}' ({card['name'][:60]}) over A2A. "
-                          f"It runs elsewhere and sees only what you send. {about}",
-                          {"task": {"type": "string", "description": "the request, in full"}},
+                          f"It runs elsewhere and sees only what you send. Each call starts a new conversation "
+                          f"unless you pass the conversation id from an earlier answer. {about}",
+                          {"task": {"type": "string", "description": "the request, in full"},
+                           "conversation": {"type": "string", "description":
+                                            "optional: continue this conversation (id from an earlier answer)"}},
                           required=["task"], untrusted=True)
-        async def ask(task: str, _client=client):
-            return await asyncio.to_thread(_client.send, task)
+        async def ask(task: str, conversation: str = "", _client=client, _waiting={}):
+            if conversation and not aios_a2a.ID_RE.fullmatch(conversation):
+                raise ValueError("conversation must be an id from an earlier answer")
+            r = await asyncio.to_thread(_client.ask, task, conversation or None, _waiting.pop(conversation, None))
+            if r["task_id"] and r["context_id"]:  # the agent asked for more: the next message answers it
+                _waiting[r["context_id"]] = r["task_id"]
+                while len(_waiting) > aios_a2a.CONTEXTS_KEPT:
+                    _waiting.pop(next(iter(_waiting)))
+            note = [f"conversation: {r['context_id']}"] if r["context_id"] else []
+            if r["state"] != "completed":
+                note.append(f"the remote agent needs more: {r['state']}")
+            return r["answer"] + (f"\n[{'; '.join(note)}]" if note else "")
 
         k.needs_approval.add(f"a2a__{name}")
         names.append(f"a2a__{name}")
@@ -2428,6 +2441,10 @@ def cli():
     me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
     me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
     me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    sx = sub.add_parser("service", help="print a systemd / launchd / Task Scheduler definition that keeps the daemon running",
+                        usage="aios service {systemd,launchd,windows} [--home HOME] [-- DAEMON FLAGS...]")
+    sx.add_argument("kind", choices=["systemd", "launchd", "windows"])
+    sx.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
     st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
@@ -2452,7 +2469,10 @@ def cli():
                             f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
                             "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
-    a = ap.parse_args()
+    argv, daemon_args = sys.argv[1:], []
+    if argv[:1] == ["service"] and "--" in argv:  # what follows -- is passed to `aios daemon` untouched
+        argv, daemon_args = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    a = ap.parse_args(argv)
     global SANDBOX_CHOICE
     SANDBOX_CHOICE = getattr(a, "sandbox", None)
     choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX")
@@ -2475,6 +2495,14 @@ def cli():
         if a.days < 1:
             ap.error("--days must be at least 1")
         raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
+    if a.cmd == "service":
+        import aios_service
+        try:
+            print(aios_service.render(a.kind, str(Path(a.home).resolve()), daemon_args, sys.executable,
+                                      str(Path(__file__).resolve())), end="")
+        except ValueError as e:
+            ap.error(f"service: {e}")
+        return 0
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":
