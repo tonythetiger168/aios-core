@@ -86,7 +86,7 @@ Follow-up acceptance criteria:
    including cancellation, cleanup and unsupported configuration failures.
 2. ~~CPU, PID, swap and memory/OOM cause checks; delayed-create reconciliation~~: see
    "Enforcement and failure outcomes" below, including the daemon stopping or restarting during a
-   call. Still open: rootless Docker and remote contexts.
+   call, plus rootless Docker and remote contexts (see "Rootless Docker" and "Remote contexts").
 3. ~~Image digest pinning/update policy and daemon/context threat model.~~ See
    "Image pinning and trust" below.
 4. ~~A separate microVM backend~~: `--sandbox microvm`, see
@@ -146,9 +146,50 @@ export AIOS_DOCKER_REQUIRE_DIGEST=1   # optional: refuse to start with an unpinn
 
 Enforcement comes from the daemon's kernel: cgroups (v2 recommended) for memory, CPU and PIDs,
 namespaces for the network, seccomp and the default AppArmor/SELinux profile when enabled. Rootless
-Docker and Docker Desktop change who enforces what. Rootless Docker needs cgroup v2 delegation for
-the limits to apply, and Docker Desktop runs everything in its own Linux VM. These configurations
-are not covered by CI; validate them with the opt-in real-Docker tests before relying on them.
+Docker and Docker Desktop change who enforces what. Docker Desktop runs everything in its own
+Linux VM and is not covered by CI; validate it with the opt-in real-Docker tests before relying on
+it. Before using any daemon, AIOS reads `docker info` and refuses one that reports it cannot enforce
+the memory, process-count or CPU limits (`MemoryLimit`, `PidsLimit`, `CpuCfsQuota`), because such a
+daemon accepts `--memory`, `--pids-limit` and `--cpus` and silently ignores them. A daemon that
+cannot limit swap (`SwapLimit`) is allowed with a startup warning.
+
+### Rootless Docker
+
+Rootless Docker only enforces limits when cgroup v2 controllers are delegated to the user's
+systemd session. On cgroup v1, or with the `cgroupfs` driver, rootless Docker runs without cgroups
+(`docker info` shows `CgroupDriver=none`), and a container created with `--memory 64m` can
+allocate 300 MiB (reproduced with Docker 29.9.1 and in CI). AIOS refuses such a daemon:
+
+```text
+--sandbox docker: the Docker daemon cannot enforce the sandbox's memory, process count, CPU limits
+(it would run the code without them): rootless Docker needs cgroup v2 with the cpu, memory and
+pids controllers delegated to your user.
+```
+
+With the `systemd` driver but no working user session, containers fail to start ("unable to
+apply cgroup configuration"), so nothing runs unlimited. To enable delegation (as root), then log
+in again or restart the user session:
+
+```sh
+mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' > /etc/systemd/system/user@.service.d/delegate.conf
+systemctl daemon-reload
+```
+
+The `docker-rootless` CI job checks both cases on Ubuntu: without delegation the gap is real
+(plain `docker run` exceeds the memory limit) and AIOS refuses the daemon; with delegation the
+full real-Docker sandbox tests pass, including the effective cgroup limits, OOM, PID and CPU
+enforcement. The startup notes say when the daemon is rootless.
+
+### Remote contexts
+
+With `DOCKER_HOST` or a context pointing at `tcp://` or `ssh://`, the code and its output go to
+that machine, and AIOS says so at startup. Everything else works the same way against the remote
+daemon: the limit check reads the remote daemon's `docker info`, limits come from the remote
+kernel, and cleanup is confirmed only when the remote daemon reports the container gone. A network
+failure during a call goes through the same code as a stopped daemon (the CLI cannot reach it), so the call never reports success, the
+cleanup is reported as unconfirmed, and the container is removed by a later call. Remote contexts
+are not covered by CI.
 
 ## Enforcement and failure outcomes
 
@@ -181,5 +222,6 @@ not only the flags AIOS passed:
 - **Concurrent calls**: three parallel calls run in three containers, identified by their own
   container IDs, and each exact container is confirmed gone afterwards. No name-prefix scan.
 
-Not covered by CI: rootless Docker, Docker Desktop and remote contexts. Failed or hung kill and
+Not covered by CI: Docker Desktop and remote contexts. Rootless Docker is covered by its own job
+(see "Rootless Docker"). Failed or hung kill and
 removal are covered only with a fake Docker CLI.

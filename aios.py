@@ -1033,8 +1033,9 @@ class DockerSandbox:
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def unavailable(image=DOCKER_IMAGE, docker="docker") -> str | None:
-        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image, and
-        with $AIOS_DOCKER_REQUIRE_DIGEST=1 that the image is pinned by digest."""
+        """Why this backend cannot run here, or None. Checks the CLI, the daemon, the image, that the
+        daemon can enforce the memory, process and CPU limits, and with $AIOS_DOCKER_REQUIRE_DIGEST=1
+        that the image is pinned by digest."""
         if os.environ.get("AIOS_DOCKER_REQUIRE_DIGEST") == "1" and not DIGEST_RE.fullmatch(image):
             return (f"image {image} is not pinned and AIOS_DOCKER_REQUIRE_DIGEST=1: set "
                     "AIOS_DOCKER_IMAGE=NAME@sha256:<digest> (see docs/docker-sandbox-validation.md)")
@@ -1053,7 +1054,33 @@ class DockerSandbox:
             return f"image {image} is not present: run `docker pull {image}` first"
         if r.stdout.strip() != "linux":
             return f"image {image} is not a Linux image (switch Docker Desktop to Linux containers)"
-        return None
+        return DockerSandbox._limits_problem(DockerSandbox._daemon_info(exe))
+
+    @staticmethod
+    def _daemon_info(exe) -> dict | None:
+        try:
+            r = subprocess.run([exe, "info", "--format", "{{json .}}"], capture_output=True, text=True, timeout=20)
+            info = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        return info if isinstance(info, dict) else None
+
+    # `docker info` field -> the limit that depends on it. A daemon without these (rootless Docker
+    # without cgroup v2 delegation, for one) accepts --memory/--pids-limit/--cpus and ignores them.
+    LIMIT_SUPPORT = {"MemoryLimit": "memory", "PidsLimit": "process count", "CpuCfsQuota": "CPU"}
+
+    @staticmethod
+    def _limits_problem(info: dict | None) -> str | None:
+        if info is None:
+            return "could not read `docker info`, so AIOS cannot confirm that the sandbox limits apply"
+        missing = [what for key, what in DockerSandbox.LIMIT_SUPPORT.items() if info.get(key) is not True]
+        if not missing:
+            return None
+        rootless = any("rootless" in str(o) for o in info.get("SecurityOptions") or [])
+        return (f"the Docker daemon cannot enforce the sandbox's {', '.join(missing)} limits (it would run "
+                "the code without them)" + (": rootless Docker needs cgroup v2 with the cpu, memory and pids "
+                "controllers delegated to your user" if rootless else "") +
+                ". See docs/docker-sandbox-validation.md#rootless-docker")
 
     @staticmethod
     def provenance(image: str, docker="docker") -> list[str]:
@@ -1074,6 +1101,11 @@ class DockerSandbox:
             notes.append(f"WARNING: the Docker daemon is remote ({host}): code and its output go there")
         elif host:
             notes.append(f"docker daemon: {host}")
+        info = DockerSandbox._daemon_info(exe) or {}
+        if any("rootless" in str(o) for o in info.get("SecurityOptions") or []):
+            notes.append("docker daemon is rootless: limits come from the cgroups delegated to its user")
+        if info.get("SwapLimit") is False:
+            notes.append("WARNING: the Docker daemon cannot limit swap: code may use swap beyond the memory limit")
         if DIGEST_RE.fullmatch(image):
             notes.append(f"image pinned: {image}")
         else:
