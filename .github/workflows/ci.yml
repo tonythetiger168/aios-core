@@ -62,8 +62,8 @@ jobs:
       - name: Without cgroup delegation the limits are ignored and AIOS refuses the daemon
         run: |
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
-          unset DBUS_SESSION_BUS_ADDRESS  # no systemd user session: no cgroup driver
-          (setsid dockerd-rootless.sh > "$RUNNER_TEMP/rootless-nocgroup.log" 2>&1 &)
+          # rootless with the cgroupfs driver gets no cgroups at all (CgroupDriver=none)
+          (setsid dockerd-rootless.sh --exec-opt native.cgroupdriver=cgroupfs > "$RUNNER_TEMP/rootless-nocgroup.log" 2>&1 &)
           export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
           timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 0.5; done' || { cat "$RUNNER_TEMP/rootless-nocgroup.log"; exit 1; }
           docker info --format 'CgroupDriver={{.CgroupDriver}} MemoryLimit={{.MemoryLimit}} PidsLimit={{.PidsLimit}} SecurityOptions={{json .SecurityOptions}}'
@@ -76,6 +76,7 @@ jobs:
           printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
           sudo systemctl daemon-reload
           sudo loginctl enable-linger "$USER"
+          sudo systemctl restart "user@$(id -u).service"  # a running user manager keeps its old delegation
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           timeout 60 sh -c 'until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 0.5; done'
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"

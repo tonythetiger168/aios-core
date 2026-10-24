@@ -156,9 +156,9 @@ cannot limit swap (`SwapLimit`) is allowed with a startup warning.
 ### Rootless Docker
 
 Rootless Docker only enforces limits when cgroup v2 controllers are delegated to the user's
-systemd session. Without delegation (cgroup v1, or no systemd user session) `docker info` shows
-`CgroupDriver=none`, and a container created with `--memory 64m` can allocate 300 MiB (reproduced
-with Docker 29.9.1). AIOS refuses such a daemon:
+systemd session. On cgroup v1, or with the `cgroupfs` driver, rootless Docker runs without cgroups
+(`docker info` shows `CgroupDriver=none`), and a container created with `--memory 64m` can
+allocate 300 MiB (reproduced with Docker 29.9.1 and in CI). AIOS refuses such a daemon:
 
 ```text
 --sandbox docker: the Docker daemon cannot enforce the sandbox's memory, process count, CPU limits
@@ -166,7 +166,9 @@ with Docker 29.9.1). AIOS refuses such a daemon:
 pids controllers delegated to your user.
 ```
 
-To enable delegation (as root), then log in again or restart the user session:
+With the `systemd` driver but no working user session, containers fail to start ("unable to
+apply cgroup configuration"), so nothing runs unlimited. To enable delegation (as root), then log
+in again or restart the user session:
 
 ```sh
 mkdir -p /etc/systemd/system/user@.service.d
