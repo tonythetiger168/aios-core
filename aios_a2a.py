@@ -5,11 +5,15 @@ can call theirs as tools.
     AIOS_A2A_TOKEN_HELPER=<token> python aios.py chat --a2a helper=http://127.0.0.1:8770 --policy ...
 
 Speaks the core of A2A over JSON-RPC 2.0, in both protocol versions in use: 1.0 (`SendMessage`,
-`SendStreamingMessage`, `GetTask`) and 0.3 (`message/send`, `message/stream`, `tasks/get`), plus the agent
-card at /.well-known/agent-card.json. The reply is a finished Task with a text artifact; the streaming
-methods send the same task as server-sent events (submitted, working, answer, final status). Messages that
-carry a `contextId` continue that conversation: the served agent keeps its history for that context
-(in memory, bounded). Push notifications and file parts are not supported. Standard library only.
+`SendStreamingMessage`, `GetTask`, `CancelTask`, `ListTasks`) and 0.3 (`message/send`, `message/stream`,
+`tasks/get`, `tasks/cancel`), plus the agent card at /.well-known/agent-card.json. The reply is a finished
+Task with a text artifact, or, when the caller asks not to wait (1.0 `returnImmediately`, 0.3
+`blocking: false`), a working task to poll with GetTask and stop with CancelTask. The streaming methods
+send the task as server-sent events (submitted, working, answer, final status). Messages that carry a
+`contextId` continue that conversation: the served agent keeps its history for that context (in memory,
+bounded). Canceling a running task stops the agent at its next await and forgets that conversation's
+history (it may end mid tool call). Push notifications and file parts are not supported. Standard
+library only.
 
 Security model
 - Serving: listens on 127.0.0.1, and every JSON-RPC call needs the bearer token (the card is public, as
@@ -17,6 +21,7 @@ Security model
   with its own policy, scopes and budget, starts tainted (no auto_paths / auto_args), and is audited like
   any run. Nobody can approve risky calls. History is kept only within one context (at most
   CONTEXT_TURNS turns, CONTEXTS_KEPT contexts, dropped after CONTEXT_IDLE seconds) and never saved.
+  At most TASKS_ACTIVE tasks are unfinished at once; more are rejected.
 - Calling: a remote agent becomes the tool `a2a__<name>`. It must be granted per agent like any tool,
   needs approval like MCP tools (it sends data off the machine), and its answer is tagged untrusted.
   The tool reports the conversation id so the model can continue a multi-turn exchange.
@@ -43,21 +48,22 @@ BODY_MAX = 64 * 1024  # bytes of one JSON-RPC request
 REPLY_MAX = 1024 * 1024  # bytes read from a remote agent
 TEXT_MAX = 20_000  # chars kept from a remote agent's answer
 TASKS_KEPT = 100  # finished tasks kept for tasks/get
+TASKS_ACTIVE = 8  # unfinished tasks at once (they run one at a time; the rest wait)
 CONTEXTS_KEPT = 20  # conversations remembered at once (oldest dropped first)
 CONTEXT_TURNS = 20  # requests per conversation
 CONTEXT_IDLE = 1800  # seconds before an unused conversation is forgotten
 TERMINAL = {"completed", "failed", "canceled", "rejected"}
-V1_METHODS = {"SendMessage": "send", "GetTask": "get"}
-V03_METHODS = {"message/send": "send", "tasks/get": "get"}
+V1_METHODS = {"SendMessage": "send", "GetTask": "get", "CancelTask": "cancel", "ListTasks": "list"}
+V03_METHODS = {"message/send": "send", "tasks/get": "get", "tasks/cancel": "cancel"}
 STREAM_METHODS = {"SendStreamingMessage": True, "message/stream": False}  # -> speaks 1.0
-UNSUPPORTED_METHODS = {"tasks/resubscribe", "tasks/cancel", "CancelTask", "SubscribeToTask", "ListTasks",
-                       "GetExtendedAgentCard"}
+UNSUPPORTED_METHODS = {"tasks/resubscribe", "SubscribeToTask", "GetExtendedAgentCard"}
+CANCELED = "canceled by the caller"
 NAME_RE = r"[A-Za-z0-9_-]{1,48}"
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,100}")  # context ids we accept from callers and report to models
 
 # JSON-RPC / A2A error codes
 PARSE, INVALID_REQUEST, NO_METHOD, INVALID_PARAMS = -32700, -32600, -32601, -32602
-TASK_NOT_FOUND, UNSUPPORTED = -32001, -32004
+TASK_NOT_FOUND, NOT_CANCELABLE, UNSUPPORTED = -32001, -32002, -32004
 
 
 def now() -> str:
@@ -89,7 +95,8 @@ class Server:
         self.run_fn, self.make_agent, self.loop, self.timeout = run, make_agent, loop, timeout
         self.tasks: collections.OrderedDict[str, dict] = collections.OrderedDict()
         self.contexts: collections.OrderedDict[str, dict] = collections.OrderedDict()
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # one run at a time
+        self._tasks_lock = threading.Lock()  # self.tasks is used from the HTTP threads and the loop
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), self._handler())
         self.port = self.httpd.server_address[1]
 
@@ -126,6 +133,9 @@ class Server:
             ctx["turns"] += 1
             try:
                 return "completed", await asyncio.wait_for(self.run_fn(ctx["agent"], text), self.timeout)
+            except asyncio.CancelledError:  # canceled mid-run: the history may end in a half-done step
+                self.contexts.pop(cid, None)
+                raise
             except asyncio.TimeoutError:
                 return "failed", f"timed out after {self.timeout:g}s"
             except Exception as e:
@@ -145,23 +155,64 @@ class Server:
         elif not (isinstance(cid, str) and ID_RE.fullmatch(cid)):
             raise RpcError(INVALID_PARAMS, "contextId must be 1-100 letters, digits or ._:-")
         tid = msg.get("taskId")
-        if tid not in (None, ""):  # every task here ends finished: continue in its context instead
-            if tid not in self.tasks:
+        if tid not in (None, ""):  # no task here waits for input: continue in its context instead
+            task = self.tasks.get(tid)
+            if not task:
                 raise RpcError(TASK_NOT_FOUND, "task not found")
+            if task["state"] not in TERMINAL:
+                raise RpcError(UNSUPPORTED, "that task is still running: wait for it or cancel it")
             raise RpcError(UNSUPPORTED, "that task is finished: send a new message with its contextId")
         return text, cid
 
-    def _finish(self, text: str, cid: str, tid: str | None = None) -> dict:
-        state, answer = asyncio.run_coroutine_threadsafe(self._execute(text, cid), self.loop).result()
-        task = {"id": tid or str(uuid.uuid4()), "contextId": cid, "state": state, "answer": answer,
+    def _settle(self, task: dict, fut) -> None:
+        """Record how the run behind `task` ended (once; a cancel already recorded wins)."""
+        if fut.cancelled():
+            state, answer = "canceled", CANCELED
+        else:
+            try:
+                state, answer = fut.result()
+            except BaseException as e:
+                state, answer = "failed", f"{type(e).__name__}: {e}"
+        with self._tasks_lock:
+            if task["state"] not in TERMINAL:
+                task.update(state=state, answer=answer, timestamp=now())
+            task.pop("future", None)
+
+    def _start(self, text: str, cid: str, tid: str | None = None) -> dict:
+        task = {"id": tid or str(uuid.uuid4()), "contextId": cid, "state": "working", "answer": "",
                 "timestamp": now()}
-        self.tasks[task["id"]] = task
-        while len(self.tasks) > TASKS_KEPT:
-            self.tasks.popitem(last=False)
+        with self._tasks_lock:
+            if sum(t["state"] not in TERMINAL for t in self.tasks.values()) >= TASKS_ACTIVE:
+                task.update(state="rejected", answer=f"{TASKS_ACTIVE} tasks are already unfinished: try again later")
+            else:
+                task["future"] = asyncio.run_coroutine_threadsafe(self._execute(text, cid), self.loop)
+            self.tasks[task["id"]] = task
+            for old in [k for k, t in self.tasks.items() if t["state"] in TERMINAL][:max(0, len(self.tasks) - TASKS_KEPT)]:
+                del self.tasks[old]  # oldest finished first; unfinished ones stay reachable
+        if "future" in task:
+            fut = task["future"]
+            fut.add_done_callback(lambda f: self._settle(task, f))
         return task
 
+    def _wait(self, task: dict) -> dict:
+        fut = task.get("future")
+        if fut is not None:
+            try:
+                fut.result()
+            except BaseException:
+                pass
+            self._settle(task, fut)  # the done callback may not have run yet
+        return task
+
+    def _finish(self, text: str, cid: str, tid: str | None = None) -> dict:
+        return self._wait(self._start(text, cid, tid))
+
     def send(self, params, v1: bool) -> dict:
-        task = self._finish(*self._accept(params))
+        text, cid = self._accept(params)
+        conf = params.get("configuration")
+        conf = conf if isinstance(conf, dict) else {}
+        later = conf.get("returnImmediately") is True if v1 else conf.get("blocking") is False
+        task = self._start(text, cid) if later else self._finish(text, cid)
         return {"task": self.render(task, True)} if v1 else self.render(task, False)
 
     def stream(self, params, v1: bool, emit):
@@ -186,11 +237,44 @@ class Server:
                  {"kind": "artifact-update", "append": False, "lastChunk": True, **ev})
         emit(status(task["state"], task, final=True))
 
-    def get(self, params, v1: bool) -> dict:
+    def _task(self, params) -> dict:
         tid = params.get("id") if isinstance(params, dict) else None
-        if not isinstance(tid, str) or tid not in self.tasks:
+        task = self.tasks.get(tid) if isinstance(tid, str) else None
+        if not task:
             raise RpcError(TASK_NOT_FOUND, "task not found")
-        return self.render(self.tasks[tid], v1)
+        return task
+
+    def get(self, params, v1: bool) -> dict:
+        task = self._task(params)
+        with self._tasks_lock:
+            return self.render(task, v1)
+
+    def cancel(self, params, v1: bool) -> dict:
+        task = self._task(params)
+        with self._tasks_lock:
+            if task["state"] in TERMINAL:
+                raise RpcError(NOT_CANCELABLE, f"the task is already {task['state']}")
+            task.update(state="canceled", answer=CANCELED, timestamp=now())
+            fut = task.get("future")
+        if fut is not None:
+            fut.cancel()  # stops the run at its next await (or before it starts)
+        with self._tasks_lock:
+            return self.render(task, v1)
+
+    def list(self, params, v1: bool) -> dict:
+        """1.0 ListTasks: newest first, one page (filters: contextId, status)."""
+        p = params if isinstance(params, dict) else {}
+        size = p.get("pageSize") or 50
+        if not isinstance(size, int) or not 1 <= size <= 100:
+            raise RpcError(INVALID_PARAMS, "pageSize must be 1..100")
+        if p.get("pageToken"):
+            raise RpcError(INVALID_PARAMS, "there is only one page")
+        cid, want = p.get("contextId"), state_name(p.get("status")) if p.get("status") else None
+        with self._tasks_lock:
+            hits = [t for t in reversed(self.tasks.values())
+                    if (not cid or t["contextId"] == cid) and (not want or t["state"] == want)]
+            page = [self.render(t, True) for t in hits[:size]]
+        return {"tasks": page, "nextPageToken": "", "pageSize": size, "totalSize": len(hits)}
 
     @staticmethod
     def render(task: dict, v1: bool) -> dict:
@@ -201,7 +285,7 @@ class Server:
                           "timestamp": task["timestamp"]}}
         if task["state"] == "completed":
             out["artifacts"] = [{"artifactId": task["id"] + "-answer", "name": "answer", "parts": [part]}]
-        else:  # the reason goes in the status message
+        elif task["answer"]:  # the reason goes in the status message
             msg = {"messageId": task["id"] + "-status", "role": "ROLE_AGENT" if v1 else "agent", "parts": [part]}
             out["status"]["message"] = msg if v1 else {"kind": "message", **msg}
         return out if v1 else {"kind": "task", **out}
@@ -261,19 +345,24 @@ class Server:
                 self.reply(404, {"error": "not found"})
 
             def do_POST(self):
+                try:
+                    n = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self.close_connection = True
+                    return self.reply(411, {"error": "Content-Length required"})
+                if not 0 < n <= BODY_MAX:
+                    self.close_connection = True
+                    return self.reply(413, {"error": f"body must be 1..{BODY_MAX} bytes"})
+                # read the body before any refusal: closing with it unread resets the connection on
+                # Windows, and the caller sees "connection aborted" instead of our answer
+                body = self.rfile.read(n)
                 if urllib.parse.urlsplit(self.path).path != "/":
                     return self.reply(404, {"error": "not found"})
                 auth = self.headers.get("Authorization", "")
                 if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), srv.token.encode())):
                     return self.reply(401, {"error": "bearer token required"}, (("WWW-Authenticate", "Bearer"),))
                 try:
-                    n = int(self.headers.get("Content-Length", ""))
-                except ValueError:
-                    return self.reply(411, {"error": "Content-Length required"})
-                if not 0 < n <= BODY_MAX:
-                    return self.reply(413, {"error": f"body must be 1..{BODY_MAX} bytes"})
-                try:
-                    req = json.loads(self.rfile.read(n))
+                    req = json.loads(body)
                 except ValueError:
                     return self.reply(200, {"jsonrpc": "2.0", "id": None,
                                             "error": {"code": PARSE, "message": "invalid JSON"}})
@@ -415,7 +504,11 @@ class Client:
         deadline = time.monotonic() + self.timeout
         while state_name((res.get("status") or {}).get("state")) not in TERMINAL | {"input-required", "auth-required"}:
             if time.monotonic() > deadline:
-                raise RuntimeError("A2A task did not finish in time")
+                try:  # don't leave it running on their side
+                    self._rpc("CancelTask" if self.v1 else "tasks/cancel", {"id": res.get("id")})
+                except RuntimeError:
+                    pass
+                raise RuntimeError("A2A task did not finish in time (asked the agent to cancel it)")
             time.sleep(poll)
             res = self._rpc("GetTask" if self.v1 else "tasks/get", {"id": res.get("id")})
         status = res.get("status") or {}
