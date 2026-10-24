@@ -301,7 +301,7 @@ class HybridSearchTests(EmbeddingServerCase):
         url, seen = self.serve()
         st, e = self.store(), mem.Embedder("m", url)
         await mem.search(st, "a", "puppy", embedder=e)
-        self.assertEqual([len(r["input"]) for r in seen["requests"]], [3, 1])  # 3 notes, then the query
+        self.assertEqual([len(r["input"]) for r in seen["requests"]], [3 + len(mem.ANCHORS), 1])  # 3 notes and the anchors, then the query
         await mem.search(st, "a", "kitten pet", embedder=e)
         self.assertEqual([len(r["input"]) for r in seen["requests"]][2:], [1])  # only the query again
         st.set_fact("a", "pet", "my cat is named Tom")  # changed text -> stale vector
@@ -313,7 +313,7 @@ class HybridSearchTests(EmbeddingServerCase):
         st = self.store()
         await mem.search(st, "a", "puppy", embedder=mem.Embedder("m1", url))
         await mem.search(st, "a", "puppy", embedder=mem.Embedder("m2", url))
-        self.assertEqual([len(r["input"]) for r in seen["requests"]], [3, 1, 3, 1])
+        self.assertEqual([len(r["input"]) for r in seen["requests"]], [3 + len(mem.ANCHORS), 1, 3 + len(mem.ANCHORS), 1])
 
     async def test_a_failing_embedding_server_falls_back_to_keywords_with_a_note(self):
         url, _ = self.serve(status=500)
@@ -371,7 +371,7 @@ class SearchCommandTests(unittest.TestCase):
 class RealEmbeddingTests(unittest.IsolatedAsyncioTestCase):
     """Hybrid search with a real embedding model, not the stand-in server."""
     NOTES = {"pet": "my dog is named Max", "editor": "I use vim for programming",
-             "drink": "I like green tea", "allergy": "I am allergic to peanuts",
+             "drink": "I like green tea", "health": "I am allergic to peanuts",
              "sister": "my sister lives in Taipei"}
 
     def setUp(self):
@@ -379,7 +379,7 @@ class RealEmbeddingTests(unittest.IsolatedAsyncioTestCase):
         self.st = store_with(**self.NOTES)
 
     async def test_meaning_finds_notes_that_share_no_word_with_the_query(self):
-        for query, want in (("puppy", "pet"), ("nut allergy", "allergy"), ("beverage", "drink"),
+        for query, want in (("puppy", "pet"), ("nut allergy", "health"), ("beverage", "drink"),
                             ("sibling", "sister")):
             with self.subTest(query=query):
                 self.assertEqual(mem.keyword_rank(self.st.fact_rows("a"), query), [])  # keywords alone miss it

@@ -112,19 +112,20 @@ jobs:
       - name: Record how the model scores notes against queries
         run: |
           python - <<'PY'
-          import asyncio, os, aios_memory as m
+          import asyncio, os, statistics, aios_memory as m
           notes = {"pet": "my dog is named Max", "editor": "I use vim for programming",
-                   "drink": "I like green tea", "allergy": "I am allergic to peanuts",
+                   "drink": "I like green tea", "health": "I am allergic to peanuts",
                    "sister": "my sister lives in Taipei"}
           queries = ["puppy", "nut allergy", "beverage", "sibling", "tomorrow weather forecast"]
           e = m.Embedder(os.environ["AIOS_TEST_EMBED_MODEL"], os.environ["AIOS_TEST_EMBED_URL"])
           async def main():
-              for qp, dp in (("", ""), ("search_query: ", "search_document: ")):
-                  docs = await e.embed([dp + f"{k}: {v}" for k, v in notes.items()])
-                  print(f"prefixes {qp!r} {dp!r}")
-                  for q in queries:
-                      (qv,) = await e.embed([qp + q])
-                      print(f"  {q:30}", "  ".join(f"{k}={m.cosine(qv, d):.3f}" for k, d in zip(notes, docs)))
+              docs = await e.embed([f"{k}: {v}" for k, v in notes.items()])
+              anchors = await e.embed(list(m.ANCHORS))
+              for q in queries:
+                  (qv,) = await e.embed([q])
+                  base = statistics.median(m.cosine(qv, a) for a in anchors)
+                  print(f"{q:28} anchors={base:.3f} floor={max(m.MIN_COSINE, base + m.VECTOR_MARGIN):.3f}",
+                        "  ".join(f"{k}={m.cosine(qv, d):.3f}" for k, d in zip(notes, docs)))
           asyncio.run(main())
           PY
       - run: python -m unittest tests.test_memory -v

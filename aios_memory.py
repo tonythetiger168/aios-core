@@ -12,13 +12,21 @@ import hashlib
 import json
 import math
 import re
+import statistics
 import urllib.error
 import urllib.request
 from collections import Counter
 
 K1, B = 1.5, 0.75
 RRF_K = 60
-MIN_COSINE = 0.25  # a heuristic: vector hits below this are treated as unrelated
+MIN_COSINE = 0.25  # vector hits below this are always unrelated
+# Real models score any two texts well above zero (nomic-embed-text: unrelated pairs 0.3-0.5, related
+# 0.66-0.78), so a fixed floor lets every note through. The query is also compared with these
+# unrelated sentences: a note must beat their median by VECTOR_MARGIN to count as a hit.
+ANCHORS = ("The meeting moved to Monday afternoon.", "Prices rose slightly last quarter.",
+           "The train leaves from platform four.", "Please restart the router.",
+           "The museum opens at nine.")
+VECTOR_MARGIN = 0.15
 EMBED_BATCH = 64
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
@@ -88,6 +96,7 @@ class Embedder:
                  api_key: str | None = None, timeout: int = 120):
         self.model, self.base_url = model, base_url.rstrip("/")
         self.api_key, self.timeout = api_key, timeout
+        self.anchors: list[list[float]] | None = None  # vectors of ANCHORS, fetched once
 
     def _post(self, payload: dict) -> dict:
         req = urllib.request.Request(
@@ -126,13 +135,18 @@ async def _vector_rank(store, agent: str, rows: list[dict], query: str, embedder
     texts = [f"{r['key']}: {r['value']}" for r in rows]
     cached = store.get_vectors(agent, embedder.model)  # key -> (sha, vector)
     missing = [i for i, r in enumerate(rows) if cached.get(r["key"], (None, None))[0] != _sha(texts[i])]
-    if missing:
-        for i, vec in zip(missing, await embedder.embed([texts[i] for i in missing])):
+    extra = [] if embedder.anchors else list(ANCHORS)
+    if missing or extra:
+        vecs = await embedder.embed([texts[i] for i in missing] + extra)
+        for i, vec in zip(missing, vecs):
             store.put_vector(agent, rows[i]["key"], embedder.model, _sha(texts[i]), vec)
             cached[rows[i]["key"]] = (_sha(texts[i]), vec)
+        if extra:
+            embedder.anchors = vecs[len(missing):]
     (qv,) = await embedder.embed([query])
+    floor = max(MIN_COSINE, statistics.median(cosine(qv, a) for a in embedder.anchors) + VECTOR_MARGIN)
     scored = [(i, cosine(qv, cached[r["key"]][1])) for i, r in enumerate(rows)]
-    return sorted([(i, s) for i, s in scored if s >= MIN_COSINE], key=lambda x: -x[1])
+    return sorted([(i, s) for i, s in scored if s >= floor], key=lambda x: -x[1])
 
 
 async def search(store, agent: str, query: str, limit: int = 5,
