@@ -1282,13 +1282,21 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(flag, joined)
         for mount in ("-v", "--volume", "--mount", "--privileged"):
             self.assertNotIn(mount, cmd)  # nothing from the host is shared
-        self.assertEqual(cmd[-4:], [aios.DOCKER_IMAGE, "python", "-I", "-"])
+        self.assertEqual(cmd[-5:], [aios.DOCKER_IMAGE, "python", "-I", "-c", aios.DOCKER_SUPERVISOR])
+
+    def test_the_supervisor_passes_the_codes_exit_status_through(self):
+        for code, want in (("print('hi')", 0), ("import sys; sys.exit(3)", 3),
+                           (f"import sys; sys.exit({aios.OOM_EXIT})", 1)):  # cannot fake an OOM kill
+            with self.subTest(code=code):
+                r = subprocess.run([sys.executable, "-I", "-c", aios.DOCKER_SUPERVISOR], input=code,
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, want, r.stderr)
 
     def test_image_can_be_pinned_by_digest(self):
         pinned = "python:3.12-slim@sha256:" + "a" * 64
         with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": pinned}):
             self.assertEqual(aios.docker_image(), pinned)
-            self.assertEqual(aios.DockerSandbox().command("c")[-4], pinned)  # the daemon runs exactly this
+            self.assertEqual(aios.DockerSandbox().command("c")[-5], pinned)  # the daemon runs exactly this
         with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": ""}):
             self.assertEqual(aios.docker_image(), aios.DOCKER_IMAGE)
         for bad in ("python@sha256:abc", "python@md5:" + "a" * 64, "py thon@sha256:" + "a" * 64):
@@ -1516,6 +1524,14 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 return 0, 'true\n' if oom and len(inspects) >= oom else 'false\n'
             return 0, ''
 
+        # the supervisor saw the OOM kill itself: no need to ask Docker
+        async def supervised(args, *a, **kw):
+            return (aios.OOM_EXIT, 'partial') if args[1] == 'start' else (0, 'id')
+
+        with mock.patch.object(box, '_invoke', side_effect=supervised), \
+                mock.patch.object(box, '_cleanup'), mock.patch.object(box, '_oom_killed') as asked:
+            self.assertEqual(await box.run_python('x'), 'killed: out of memory (64 MiB limit)\npartial')
+            asked.assert_not_called()
         # oom: on which inspect Docker reports OOMKilled (it records it asynchronously), 0 = never
         for oom, want in ((1, 'killed: out of memory (64 MiB limit)\npartial output'),
                           (3, 'killed: out of memory (64 MiB limit)\npartial output'),
