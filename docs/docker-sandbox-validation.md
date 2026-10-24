@@ -85,8 +85,8 @@ Follow-up acceptance criteria:
 1. Real-Docker validation on supported Windows/macOS Docker Desktop versions,
    including cancellation, cleanup and unsupported configuration failures.
 2. ~~CPU, PID, swap and memory/OOM cause checks; delayed-create reconciliation~~: see
-   "Enforcement and failure outcomes" below. Still open: daemon disconnect/restart under
-   real Docker, and rootless or remote contexts.
+   "Enforcement and failure outcomes" below, including the daemon stopping or restarting during a
+   call. Still open: rootless Docker and remote contexts.
 3. ~~Image digest pinning/update policy and daemon/context threat model.~~ See
    "Image pinning and trust" below.
 4. ~~A separate microVM backend~~: `--sandbox microvm`, see
@@ -164,14 +164,22 @@ not only the flags AIOS passed:
 
 - **OOM cause**: containers are no longer created with `--rm`. After a non-zero exit, AIOS reads
   `State.OOMKilled` before cleanup removes the container. Only a confirmed OOM kill is reported
-  as out of memory; any other failure stays `exit=<code>`. A hard crash of AIOS can leave a stopped
+  as out of memory. Any other SIGKILL (exit 137) is labelled as coming from outside the code (the
+  daemon stopped or restarted, or someone killed the container); other failures stay `exit=<code>`.
+  A hard crash of AIOS can leave a stopped
   `aios-sbx-*` container behind (nothing runs in it), and `docker container prune` removes it.
-- **Delayed creates**: when `docker create` times out or is cancelled, the outcome stays explicitly
-  *unknown*. The name is also remembered. For the next 10 minutes, each `run_python` call first runs
-  `docker rm --force` on those exact names. If one appears it is removed and reported, and when the
-  window ends AIOS says it stopped watching. At most 32 names are tracked.
+- **Unknown outcomes**: when `docker create` times out or is cancelled, or cleanup cannot confirm
+  the container is gone (typically because the daemon is down), the outcome stays explicitly
+  *unknown* and the call says so. The exact name is remembered. For the next 10 minutes, each
+  `run_python` call first inspects those names and removes any that exist (`docker rm --force`
+  alone cannot tell: since Docker 23 it succeeds for a missing container too). Removals are
+  reported, and when the window ends AIOS says it stopped watching. At most 32 names are tracked.
+- **Daemon stop or restart during a call** (real Docker, Ubuntu 3.12 CI job, via `systemctl`):
+  the call ends as soon as the daemon goes away, never as a success. If the daemon is still down
+  at cleanup, the call reports *cleanup unconfirmed* and the container is removed by the first
+  call after the daemon is back.
 - **Concurrent calls**: three parallel calls run in three containers, identified by their own
   container IDs, and each exact container is confirmed gone afterwards. No name-prefix scan.
 
-Not covered by CI: daemon disconnect or restart during a call, rootless Docker, Docker Desktop and
-remote contexts. Failed or hung kill and removal are covered only with a fake Docker CLI.
+Not covered by CI: rootless Docker, Docker Desktop and remote contexts. Failed or hung kill and
+removal are covered only with a fake Docker CLI.

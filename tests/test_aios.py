@@ -1434,8 +1434,9 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             return 1, 'Cannot connect to the Docker daemon'
 
         with mock.patch.object(box, '_invoke', side_effect=invoke):
-            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed'):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed.*remove it during the next calls'):
                 await box.run_python('while True: pass')
+        self.assertEqual(len(aios.DockerSandbox.unknown), 1)  # the daemon was down: removed once it is back
 
     async def test_force_remove_can_recover_from_failed_or_hung_kill(self):
         for fail in ('nonzero', 'timeout'):
@@ -1483,7 +1484,8 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         # oom: on which inspect Docker reports OOMKilled (it records it asynchronously), 0 = never
         for oom, want in ((1, 'killed: out of memory (64 MiB limit)\npartial output'),
                           (3, 'killed: out of memory (64 MiB limit)\npartial output'),
-                          (0, 'exit=137\npartial output')):
+                          (0, 'exit=137 (killed from outside the code: the Docker daemon stopped or restarted, '
+                              'or someone killed the container)\npartial output')):
             inspects = []
             with self.subTest(oom=oom), mock.patch.object(box, '_invoke', side_effect=invoke), \
                     mock.patch.object(box, '_cleanup'), mock.patch.object(aios.asyncio, 'sleep', new=mock.AsyncMock()):
@@ -1500,17 +1502,39 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
 
         async def invoke(args, *a, **kw):
             calls.append(args[1:])
-            if args[1] == 'rm':
-                return 0, late  # the daemon did create it after all
+            if args[1:3] == ['container', 'inspect']:
+                return 0, 'abc123'  # the daemon did create it after all
             return (0, 'id') if args[1] == 'create' else (0, 'ok')
 
         err = io.StringIO()
         with mock.patch.object(box, '_invoke', side_effect=invoke), mock.patch.object(box, '_cleanup'), \
                 contextlib.redirect_stderr(err):
             await box.run_python('print(1)')
-        self.assertEqual(calls[0], ['rm', '--force', late])  # exact name, before this call's create
+        self.assertEqual(calls[0], ['container', 'inspect', '--format', '{{.Id}}', late])  # exact name
+        self.assertEqual(calls[1], ['rm', '--force', late])  # before this call's create
         self.assertIn(f'removed {late}', err.getvalue())
         self.assertEqual(aios.DockerSandbox.unknown, {})
+
+    async def test_a_missing_container_stays_watched(self):
+        # `docker rm --force` exits 0 for a container that does not exist (Docker 23+), so its exit
+        # code cannot tell "removed" from "not created yet"
+        box = aios.DockerSandbox()
+        aios.DockerSandbox.unknown['aios-sbx-late'] = asyncio.get_running_loop().time()
+
+        async def invoke(args, *a, **kw):
+            if args[1:3] == ['container', 'inspect']:
+                return 1, 'Error: No such object: aios-sbx-late'
+            return 0, ''
+
+        with mock.patch.object(box, '_invoke', side_effect=invoke) as inv, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            await box._reconcile()
+        self.assertIn('aios-sbx-late', aios.DockerSandbox.unknown)
+        self.assertNotIn('removed', err.getvalue())
+        self.assertNotIn('rm', [c.args[0][1] for c in inv.call_args_list])
+        with mock.patch.object(box, '_invoke', side_effect=OSError("daemon down")):
+            await box._reconcile()
+        self.assertIn('aios-sbx-late', aios.DockerSandbox.unknown)  # unreachable: try again later
 
     async def test_reconciliation_gives_up_after_its_window(self):
         box = aios.DockerSandbox()
@@ -1716,6 +1740,80 @@ class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         rc, out = await self.box._invoke(['docker', 'container', 'inspect', name], timeout=3)
         self.assertNotEqual(rc, 0)
         self.assertIn('no such', out.lower())
+
+
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER") == "1" and os.environ.get("AIOS_TEST_DOCKER_STOP")
+                     and os.environ.get("AIOS_TEST_DOCKER_START"),
+                     "set AIOS_TEST_DOCKER_STOP/START to shell commands that stop and start the Docker daemon")
+class RealDockerDaemonTests(unittest.IsolatedAsyncioTestCase):
+    """The daemon stops or restarts while a call runs (CI: systemctl on the runner)."""
+    SLEEPER = "import time\nprint('started', flush=True)\ntime.sleep(120)\n"
+
+    async def asyncSetUp(self):
+        aios.DockerSandbox.unknown.clear()
+        self.addCleanup(aios.DockerSandbox.unknown.clear)
+        self.box = aios.DockerSandbox(timeout=90)
+
+    def sh(self, var):
+        subprocess.run(os.environ[var], shell=True, check=True, timeout=120,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def ours(self):
+        r = subprocess.run(["docker", "ps", "-a", "--filter", "name=aios-sbx-", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=30)
+        return set(r.stdout.split())
+
+    async def running(self, before):
+        for _ in range(300):
+            new = self.ours() - before
+            if new:
+                return new.pop()
+            await asyncio.sleep(0.1)
+        self.fail("the sandbox container never appeared")
+
+    async def test_a_daemon_restart_during_a_call_is_never_a_silent_success(self):
+        before = self.ours()
+        call = asyncio.create_task(self.box.run_python(self.SLEEPER))
+        name = await self.running(before)
+        await asyncio.sleep(1)
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_STOP")
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_START")
+        try:  # the call ends when the daemon goes away; whether cleanup ran before it was back is a race
+            out = await asyncio.wait_for(call, 120)
+            print(f"\n[daemon restart] {out!r}", file=sys.stderr)
+            self.assertFalse(out.startswith("exit=0"), out)
+            if out.startswith("exit=137"):
+                self.assertIn("killed from outside the code", out)
+        except RuntimeError as e:
+            print(f"\n[daemon restart] {e}", file=sys.stderr)
+            self.assertIn("remove it during the next calls", str(e))
+            self.assertIn(name, aios.DockerSandbox.unknown)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual((await self.box.run_python("print(1)")).strip(), "exit=0\n1")
+        self.assertNotIn(name, self.ours())  # removed by the call itself or by the next one
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+
+    async def test_a_daemon_that_stays_down_is_reported_and_reconciled_later(self):
+        before = self.ours()
+        call = asyncio.create_task(self.box.run_python(self.SLEEPER))
+        name = await self.running(before)
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_STOP")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "(?s)cleanup unconfirmed.*remove it during the next calls"):
+                await asyncio.wait_for(call, 120)
+            self.assertIn(name, aios.DockerSandbox.unknown)
+        finally:
+            await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_START")
+        if name not in self.ours():
+            self.skipTest("this daemon removed the stopped container itself")  # nothing left to reconcile
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = await self.box.run_python("print(6 * 7)")
+        self.assertEqual(out.strip(), "exit=0\n42")
+        self.assertIn(f"removed {name}", err.getvalue())
+        self.assertNotIn(name, self.ours())
+        self.assertEqual(aios.DockerSandbox.unknown, {})
 
 
 if __name__ == "__main__":
