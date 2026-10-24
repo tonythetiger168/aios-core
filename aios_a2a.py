@@ -345,19 +345,24 @@ class Server:
                 self.reply(404, {"error": "not found"})
 
             def do_POST(self):
+                try:
+                    n = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self.close_connection = True
+                    return self.reply(411, {"error": "Content-Length required"})
+                if not 0 < n <= BODY_MAX:
+                    self.close_connection = True
+                    return self.reply(413, {"error": f"body must be 1..{BODY_MAX} bytes"})
+                # read the body before any refusal: closing with it unread resets the connection on
+                # Windows, and the caller sees "connection aborted" instead of our answer
+                body = self.rfile.read(n)
                 if urllib.parse.urlsplit(self.path).path != "/":
                     return self.reply(404, {"error": "not found"})
                 auth = self.headers.get("Authorization", "")
                 if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), srv.token.encode())):
                     return self.reply(401, {"error": "bearer token required"}, (("WWW-Authenticate", "Bearer"),))
                 try:
-                    n = int(self.headers.get("Content-Length", ""))
-                except ValueError:
-                    return self.reply(411, {"error": "Content-Length required"})
-                if not 0 < n <= BODY_MAX:
-                    return self.reply(413, {"error": f"body must be 1..{BODY_MAX} bytes"})
-                try:
-                    req = json.loads(self.rfile.read(n))
+                    req = json.loads(body)
                 except ValueError:
                     return self.reply(200, {"jsonrpc": "2.0", "id": None,
                                             "error": {"code": PARSE, "message": "invalid JSON"}})
