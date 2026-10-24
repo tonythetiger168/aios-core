@@ -115,6 +115,23 @@ class PageTests(ConsoleCase):
         self.assertIn("write_file", body)  # the refused call is listed
         self.assertIn("permission denied: nope", body)
 
+    def test_overview_shows_open_alerts_and_the_daemon(self):
+        import aios_watchdog as wd
+        _, body = self.req("/")
+        self.assertIn("No open alerts", body)
+        self.assertIn("never ran", body)
+        st = aios.Store(str(self.home / "aios.db"))
+        wd.beat(st.db)
+        st.log_audit(f"job-{XSS}", "write_file", {}, "not approved by a human: write_file (this run has read "
+                     "untrusted content, so a person must approve each risky call interactively)", "denied")
+        wd.check(st.db)
+        st.db.close()
+        _, body = self.req("/")
+        self.assertIn("tainted-refused", body)
+        self.assertIn("critical", body)
+        self.assertNotIn("<script", body)  # alert text names attacker-chosen things: escaped
+        self.assertIn("seen ", body)
+
     def test_audit_filters(self):
         _, body = self.req("/audit?agent=other")
         self.assertIn("2026-10-21", body)
