@@ -1328,15 +1328,50 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any("remote" in n and "10.0.0.5" in n
                                     for n in aios.DockerSandbox.provenance("python:3.12-slim")))
 
+    def test_a_daemon_that_would_ignore_the_limits_is_refused(self):
+        # what rootless Docker without cgroups reports (reproduced with Docker 29.9.1): it accepts
+        # --memory 64m and lets the code allocate 300 MiB
+        rootless = {"MemoryLimit": False, "PidsLimit": False, "CpuCfsQuota": False, "SwapLimit": False,
+                    "SecurityOptions": ["name=seccomp,profile=builtin", "name=rootless"]}
+        why = aios.DockerSandbox._limits_problem(rootless)
+        self.assertIn("memory, process count, CPU limits", why)
+        self.assertIn("cgroup v2", why)
+        self.assertIn("#rootless-docker", why)
+        why = aios.DockerSandbox._limits_problem({"MemoryLimit": True, "PidsLimit": False, "CpuCfsQuota": True})
+        self.assertIn("process count limits", why)
+        self.assertNotIn("rootless", why.split(".")[0])
+        self.assertIn("cannot confirm", aios.DockerSandbox._limits_problem(None))
+        self.assertIn("memory", aios.DockerSandbox._limits_problem({}))  # unknown counts as missing
+        self.assertIsNone(aios.DockerSandbox._limits_problem(
+            {"MemoryLimit": True, "PidsLimit": True, "CpuCfsQuota": True, "SwapLimit": False}))
+
+        def fake_run(args, **kw):
+            out = json.dumps(rootless) if args[1] == "info" else "linux\n"
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        aios.DockerSandbox.unavailable.cache_clear()
+        with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(aios.subprocess, "run", side_effect=fake_run), \
+                mock.patch.dict(os.environ, {"DOCKER_HOST": ""}):
+            self.assertIn("cannot enforce", aios.DockerSandbox.unavailable())
+            notes = aios.DockerSandbox.provenance("python:3.12-slim")
+        self.assertTrue(any("rootless" in n for n in notes))
+        self.assertTrue(any("cannot limit swap" in n for n in notes))
+
     def test_unavailable_explains_what_is_missing(self):
         u = aios.DockerSandbox.unavailable
         with mock.patch.object(aios.shutil, "which", return_value=None):
             self.assertIn("not installed", u())
         u.cache_clear()
 
+        limits = json.dumps({"MemoryLimit": True, "PidsLimit": True, "CpuCfsQuota": True})
+
         def fake_run(out="", err="", rc=0):
-            return mock.patch.object(aios.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], rc, stdout=out, stderr=err))
+            def run(args, **kw):
+                if args[1] == "info":
+                    return subprocess.CompletedProcess(args, 0, stdout=limits, stderr="")
+                return subprocess.CompletedProcess(args, rc, stdout=out, stderr=err)
+            return mock.patch.object(aios.subprocess, "run", side_effect=run)
 
         with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"):
             for (out, err, rc), want in ((("", "Error: No such image: python:3.12-slim", 1), "docker pull"),
@@ -1602,6 +1637,28 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 out = await box.run_python("while True: pass")
                 self.assertEqual(out, "killed: timeout after 2s")
                 self.assertTrue(Path(d, "killed").read_text().startswith("aios-sbx-"))  # the container is killed
+
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER_NO_LIMITS") == "1",
+                     "set AIOS_TEST_DOCKER_NO_LIMITS=1 with DOCKER_HOST pointing at a daemon that cannot "
+                     "enforce limits (rootless Docker without cgroup delegation)")
+class RealDockerWithoutLimitsTests(unittest.TestCase):
+    def test_the_gap_is_real_and_aios_refuses_the_daemon(self):
+        # plain Docker accepts the flags and ignores them...
+        r = subprocess.run(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                            "--memory", "64m", "--memory-swap", "64m", aios.DOCKER_IMAGE, "python", "-c",
+                            "b = bytearray(300 * 2**20); print('allocated')"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertIn("allocated", r.stdout, r.stderr)
+        # ...so AIOS will not run code there
+        aios.DockerSandbox.unavailable.cache_clear()
+        self.addCleanup(aios.DockerSandbox.unavailable.cache_clear)
+        why = aios.DockerSandbox.unavailable()
+        self.assertIsNotNone(why)
+        self.assertIn("cannot enforce the sandbox's memory", why)
+        self.assertIn("rootless", why)
+        with self.assertRaisesRegex(RuntimeError, "--sandbox docker: the Docker daemon cannot enforce"):
+            aios.make_sandbox("docker")
 
 
 @unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER") == "1",

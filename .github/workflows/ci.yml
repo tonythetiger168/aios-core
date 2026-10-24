@@ -40,6 +40,53 @@ jobs:
           echo "AIOS_TEST_DOCKER_START=sudo systemctl start docker.socket docker.service && until docker info >/dev/null 2>&1; do sleep 0.5; done" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
 
+  docker-rootless:
+    # Rootless Docker: without cgroup delegation the daemon ignores --memory/--pids-limit/--cpus and
+    # AIOS must refuse it; with delegation (systemd user session) the real sandbox tests must pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Install rootless Docker (same version as the runner's Docker)
+        run: |
+          V=$(docker version --format '{{.Server.Version}}'); echo "docker $V"
+          sudo apt-get install -y -q uidmap
+          curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-$V.tgz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1
+          grep -q "^$USER:" /etc/subuid || echo "$USER:200000:65536" | sudo tee -a /etc/subuid /etc/subgid
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor by default
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Without cgroup delegation the limits are ignored and AIOS refuses the daemon
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          unset DBUS_SESSION_BUS_ADDRESS  # no systemd user session: no cgroup driver
+          (setsid dockerd-rootless.sh > "$RUNNER_TEMP/rootless-nocgroup.log" 2>&1 &)
+          export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+          timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 0.5; done' || { cat "$RUNNER_TEMP/rootless-nocgroup.log"; exit 1; }
+          docker info --format 'CgroupDriver={{.CgroupDriver}} MemoryLimit={{.MemoryLimit}} PidsLimit={{.PidsLimit}} SecurityOptions={{json .SecurityOptions}}'
+          docker pull -q python:3.12-slim
+          AIOS_TEST_DOCKER_NO_LIMITS=1 python -m unittest tests.test_aios.RealDockerWithoutLimitsTests -v
+          pkill -u "$USER" -x rootlesskit; timeout 30 sh -c 'while pgrep -u "$USER" -x dockerd >/dev/null; do sleep 0.5; done'
+      - name: With cgroup v2 delegation the real sandbox tests pass on rootless Docker
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          timeout 60 sh -c 'until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 0.5; done'
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+          dockerd-rootless-setuptool.sh install --force
+          export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+          timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 0.5; done'
+          docker info --format 'CgroupDriver={{.CgroupDriver}} MemoryLimit={{.MemoryLimit}} PidsLimit={{.PidsLimit}} SecurityOptions={{json .SecurityOptions}}'
+          docker pull -q python:3.12-slim
+          AIOS_TEST_DOCKER=1 python -m unittest tests.test_aios.RealDockerSandboxTests -v
+
   microvm:
     # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
     runs-on: ubuntu-latest
