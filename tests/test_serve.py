@@ -1,8 +1,8 @@
 """MCP server mode: the policy pipeline for an outside client, and the SDK glue.
 
-The real `mcp` SDK is NOT required: the glue is checked against a small stand-in that mimics the
-low-level server API (Server, stdio_server, types). It has not been run against a real MCP client
-in CI; see the README note.
+The real `mcp` SDK is NOT required here: the glue is checked against a small stand-in that mimics
+the 1.x low-level server API (Server, stdio_server, types). tests/test_mcp_interop.py drives the
+real server with the SDK's own client when the SDK is installed (CI covers 1.x and 2.x).
 """
 import asyncio
 import contextlib

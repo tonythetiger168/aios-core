@@ -1,7 +1,10 @@
 """Tiny demo MCP server. Run by aios.py over stdio. Requires: pip install mcp"""
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer  # mcp 2.x
+except ImportError:
+    from mcp.server.fastmcp import FastMCP as MCPServer  # mcp 1.x
 
-mcp = FastMCP("demo")
+mcp = MCPServer("demo")
 
 
 @mcp.tool()
