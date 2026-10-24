@@ -203,7 +203,13 @@ not only the flags AIOS passed:
 | PIDs | `pids.max` equals `--pids-limit` | Forking stops below the limit |
 | CPU | `cpu.max` quota/period equals `--cpus` | Two busy processes under 0.5 CPU get under 0.8 CPU-seconds per second |
 
-- **OOM cause**: containers are no longer created with `--rm`. After a non-zero exit, AIOS reads
+- **OOM cause**: the code runs as the child of a small Python supervisor (PID 1 in the
+  container). When the child dies by SIGKILL, the supervisor reads the container's own
+  `memory.events` (cgroup v2) or `memory.oom_control` (v1). If `oom_kill` is above zero, it exits 247,
+  which AIOS reports as out of memory. This matters because Docker's `State.OOMKilled` comes from a
+  separate containerd event that rootless cgroup v2 setups were seen to lose. A child that exits 247
+  on its own is reported as exit 1, so code cannot pass for an OOM kill. As a second check,
+  containers are no longer created with `--rm`. After a non-zero exit, AIOS reads
   `State.OOMKilled` before cleanup removes the container. Only a confirmed OOM kill is reported
   as out of memory. Any other SIGKILL (exit 137) is labelled as coming from outside the code (the
   daemon stopped or restarted, or someone killed the container); other failures stay `exit=<code>`.
