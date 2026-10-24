@@ -91,7 +91,9 @@ class ClientOfARealServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_tools_of_an_sdk_server_are_registered_and_callable(self):
         k = aios.Kernel(store=aios.Store(":memory:"))
         try:
-            names = await asyncio.wait_for(k.connect_mcp("demo", sys.executable, [str(ROOT / "demo_mcp_server.py")]), 60)
+            # not wait_for: on 3.11 it runs the call in another task, and the SDK's anyio scopes must be
+            # left in the task that entered them (k.close() below)
+            names = await k.connect_mcp("demo", sys.executable, [str(ROOT / "demo_mcp_server.py")])
             self.assertEqual(sorted(names), ["demo__add", "demo__word_count"])
             self.assertTrue(k.tools.is_untrusted("demo__add"))
             self.assertIn("demo__add", k.needs_approval)
