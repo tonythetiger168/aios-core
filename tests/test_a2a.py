@@ -131,7 +131,8 @@ class ServerTests(ServerCase):
     async def test_protocol_errors(self):
         cases = [
             ("message/stream", {}, aios_a2a.INVALID_PARAMS),  # checked before the stream starts
-            ("tasks/cancel", {"id": "x"}, aios_a2a.UNSUPPORTED),
+            ("tasks/cancel", {"id": "x"}, aios_a2a.TASK_NOT_FOUND),
+            ("tasks/resubscribe", {"id": "x"}, aios_a2a.UNSUPPORTED),
             ("nope/nope", {}, aios_a2a.NO_METHOD),
             ("message/send", {}, aios_a2a.INVALID_PARAMS),
             ("message/send", {"message": dict(user_msg(), role="agent")}, aios_a2a.INVALID_PARAMS),
@@ -163,10 +164,82 @@ class ServerTests(ServerCase):
         failed = (await self.rpc("SendMessage", {"message": dict(msg, parts=[{"text": "boom"}])}))["result"]["task"]
         self.assertEqual(failed["status"]["state"], "TASK_STATE_FAILED")
         self.assertEqual(failed["status"]["message"]["role"], "ROLE_AGENT")
-        for method in ("CancelTask", "CreateTaskPushNotificationConfig"):
-            self.assertEqual((await self.rpc(method, {}))["error"]["code"], aios_a2a.UNSUPPORTED)
+        self.assertEqual((await self.rpc("CancelTask", {"id": "nope"}))["error"]["code"], aios_a2a.TASK_NOT_FOUND)
+        self.assertEqual((await self.rpc("CreateTaskPushNotificationConfig", {}))["error"]["code"],
+                         aios_a2a.UNSUPPORTED)
         _, card = await self.http("GET", aios_a2a.CARD_PATHS[0], token=None)
         self.assertEqual({i["protocolVersion"] for i in card["supportedInterfaces"]}, {"1.0", "0.3"})
+
+    async def started(self, t):
+        for _ in range(200):
+            if any(seen == t for _, seen in self.seen):
+                return
+            await asyncio.sleep(0.01)
+        self.fail(f"{t!r} never started")
+
+    async def test_a_task_that_does_not_block_can_be_polled_and_canceled(self):
+        self.srv.timeout = 30
+        msg = dict(user_msg("slow"), contextId="c1")
+        task = (await self.rpc("message/send", {"message": msg, "configuration": {"blocking": False}}))["result"]
+        self.assertEqual(task["status"]["state"], "working")
+        self.assertNotIn("artifacts", task)
+        await self.started("slow")
+        self.assertEqual((await self.rpc("tasks/get", {"id": task["id"]}))["result"]["status"]["state"], "working")
+        body = await self.rpc("message/send", {"message": dict(user_msg(), taskId=task["id"])})
+        self.assertIn("still running", body["error"]["message"])
+        done = (await self.rpc("tasks/cancel", {"id": task["id"]}))["result"]
+        self.assertEqual(done["status"]["state"], "canceled")
+        self.assertEqual(aios_a2a.text_of(done["status"]["message"]["parts"]), aios_a2a.CANCELED)
+        await asyncio.sleep(0.05)
+        self.assertEqual((await self.rpc("tasks/get", {"id": task["id"]}))["result"]["status"]["state"], "canceled")
+        self.assertNotIn("c1", self.srv.contexts)  # its history may end mid-step: forgotten
+        self.assertEqual((await self.rpc("tasks/cancel", {"id": task["id"]}))["error"]["code"],
+                         aios_a2a.NOT_CANCELABLE)
+        quick = (await self.rpc("message/send", {"message": dict(msg, parts=[{"kind": "text", "text": "hi"}])}))["result"]
+        self.assertEqual(quick["status"]["state"], "completed")
+        self.assertEqual((await self.rpc("tasks/cancel", {"id": quick["id"]}))["error"]["code"],
+                         aios_a2a.NOT_CANCELABLE)
+
+    async def test_version_1_0_return_immediately_list_and_cancel(self):
+        self.srv.timeout = 30
+        msg = {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "slow"}], "contextId": "a"}
+        res = (await self.rpc("SendMessage", {"message": msg, "configuration": {"returnImmediately": True}}))["result"]
+        task = res["task"]
+        self.assertEqual(task["status"]["state"], "TASK_STATE_WORKING")
+        other = (await self.rpc("SendMessage", {"message": dict(msg, parts=[{"text": "hi"}], contextId="b"),
+                                                "configuration": {"returnImmediately": True}}))["result"]["task"]
+        listed = (await self.rpc("ListTasks", {}))["result"]
+        self.assertEqual([t["id"] for t in listed["tasks"]], [other["id"], task["id"]])  # newest first
+        self.assertEqual((listed["totalSize"], listed["nextPageToken"]), (2, ""))
+        only_a = (await self.rpc("ListTasks", {"contextId": "a"}))["result"]["tasks"]
+        self.assertEqual([t["id"] for t in only_a], [task["id"]])
+        await self.started("slow")
+        working = (await self.rpc("ListTasks", {"status": "TASK_STATE_WORKING"}))["result"]["tasks"]
+        self.assertIn(task["id"], [t["id"] for t in working])
+        for bad in ({"pageSize": 101}, {"pageSize": "5"}, {"pageToken": "next"}):
+            self.assertEqual((await self.rpc("ListTasks", bad))["error"]["code"], aios_a2a.INVALID_PARAMS)
+        done = (await self.rpc("CancelTask", {"id": task["id"]}))["result"]
+        self.assertEqual(done["status"]["state"], "TASK_STATE_CANCELED")
+        self.assertEqual(done["status"]["message"]["role"], "ROLE_AGENT")
+        for _ in range(200):  # the queued one runs once the canceled one lets go
+            got = (await self.rpc("GetTask", {"id": other["id"]}))["result"]
+            if got["status"]["state"] != "TASK_STATE_WORKING":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(got["artifacts"][0]["parts"], [{"text": "answer to hi"}])
+
+    async def test_unfinished_tasks_are_bounded(self):
+        self.srv.timeout = 30
+        with mock.patch.object(aios_a2a, "TASKS_ACTIVE", 1):
+            later = {"blocking": False}
+            first = (await self.rpc("message/send", {"message": user_msg("slow"), "configuration": later}))["result"]
+            second = (await self.rpc("message/send", {"message": user_msg("hi"), "configuration": later}))["result"]
+            self.assertEqual(second["status"]["state"], "rejected")
+            await self.rpc("tasks/cancel", {"id": first["id"]})
+            with mock.patch.object(aios_a2a, "TASKS_KEPT", 1):
+                for _ in range(3):
+                    await self.rpc("message/send", {"message": user_msg("hi")})
+            self.assertEqual(len(self.srv.tasks), 1)
 
     async def test_streaming_sends_the_task_as_events(self):
         kind, events = await self.sse("message/stream", {"message": user_msg("stream me")})
@@ -261,6 +334,21 @@ class ServerTests(ServerCase):
         bad = aios_a2a.Client(f"http://127.0.0.1:{self.srv.port}/", "wrong", timeout=10)
         with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
             await asyncio.to_thread(bad.send, "hi")
+
+
+class ClientCancelTests(unittest.TestCase):
+    def test_a_task_that_takes_too_long_is_canceled(self):
+        c = aios_a2a.Client("http://127.0.0.1:1/", timeout=0.05)
+        working = {"kind": "task", "id": "t1", "status": {"state": "working"}}
+        calls = []
+
+        def rpc(method, params):
+            calls.append((method, params))
+            return working
+        with mock.patch.object(c, "_rpc", side_effect=rpc):
+            with self.assertRaisesRegex(RuntimeError, "asked the agent to cancel"):
+                c.ask("hi", poll=0.01)
+        self.assertEqual(calls[-1], ("tasks/cancel", {"id": "t1"}))
 
 
 class ClientRuleTests(unittest.TestCase):
