@@ -241,7 +241,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS fact_vecs(
                 agent TEXT, key TEXT, model TEXT, sha TEXT, vec TEXT, PRIMARY KEY(agent, key, model));
             CREATE TABLE IF NOT EXISTS skills(
-                name TEXT PRIMARY KEY, sha256 TEXT, version TEXT, ts TEXT, forced INTEGER DEFAULT 0);
+                name TEXT PRIMARY KEY, sha256 TEXT, version TEXT, ts TEXT, forced INTEGER DEFAULT 0,
+                signer TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS audit(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT, tool TEXT,
                 args TEXT, result TEXT, status TEXT);
@@ -257,6 +258,8 @@ class Store:
             self.db.execute("ALTER TABLE facts ADD COLUMN source TEXT DEFAULT 'unknown'")
         if "ts" not in cols:
             self.db.execute("ALTER TABLE facts ADD COLUMN ts TEXT")
+        if "signer" not in {r[1] for r in self.db.execute("PRAGMA table_info(skills)")}:
+            self.db.execute("ALTER TABLE skills ADD COLUMN signer TEXT DEFAULT ''")  # verified publisher
         if "watch" not in {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}:
             self.db.execute("ALTER TABLE jobs ADD COLUMN watch TEXT")  # change-triggered jobs' state
         self.db.commit()
@@ -444,18 +447,19 @@ class Store:
         return [dict(zip(("job", "ts", "status", "output"), r)) for r in reversed(rows)]
 
     # Skill pins: the digest of a skill folder the person reviewed and trusted.
-    def pin_skill(self, name: str, sha256: str, version: str, forced: bool = False):
-        self.db.execute("INSERT OR REPLACE INTO skills(name, sha256, version, ts, forced) VALUES(?,?,?,?,?)",
-                        (name, sha256, version, datetime.now().isoformat(timespec="seconds"), int(forced)))
+    def pin_skill(self, name: str, sha256: str, version: str, forced: bool = False, signer: str = ""):
+        self.db.execute("INSERT OR REPLACE INTO skills(name, sha256, version, ts, forced, signer) VALUES(?,?,?,?,?,?)",
+                        (name, sha256, version, datetime.now().isoformat(timespec="seconds"), int(forced), signer))
         self.db.commit()
 
     def get_skill_pin(self, name: str) -> dict | None:
-        r = self.db.execute("SELECT sha256, version, ts, forced FROM skills WHERE name=?", (name,)).fetchone()
-        return {"sha256": r[0], "version": r[1], "ts": r[2], "forced": bool(r[3])} if r else None
+        r = self.db.execute("SELECT sha256, version, ts, forced, signer FROM skills WHERE name=?", (name,)).fetchone()
+        return {"sha256": r[0], "version": r[1], "ts": r[2], "forced": bool(r[3]), "signer": r[4] or ""} if r else None
 
     def list_skill_pins(self) -> list[dict]:
-        rows = self.db.execute("SELECT name, sha256, version, ts, forced FROM skills ORDER BY name").fetchall()
-        return [{"name": n, "sha256": h, "version": v, "ts": t, "forced": bool(f)} for n, h, v, t, f in rows]
+        rows = self.db.execute("SELECT name, sha256, version, ts, forced, signer FROM skills ORDER BY name").fetchall()
+        return [{"name": n, "sha256": h, "version": v, "ts": t, "forced": bool(f), "signer": g or ""}
+                for n, h, v, t, f, g in rows]
 
     def unpin_skill(self, name: str) -> bool:
         n = self.db.execute("DELETE FROM skills WHERE name=?", (name,)).rowcount
@@ -2501,8 +2505,11 @@ def print_hook_secret(name: str, secret: str):
           "--data-binary @event.json\n\nThe body (up to 64 KB) reaches the job as untrusted data.")
 
 
-def skills_cmd(action: str, target: str | None, home: str, force: bool = False, yes: bool = False) -> int:
+def skills_cmd(action: str, target: str | None, home: str, force: bool = False, yes: bool = False,
+               key: str | None = None, signers: str | None = None, require_signed: bool = False) -> int:
     import aios_skills as sk
+    signers = signers or os.environ.get("AIOS_SKILL_SIGNERS") or str(Path(home).resolve() / "allowed_signers")
+    require_signed = require_signed or os.environ.get("AIOS_SKILLS_REQUIRE_SIGNED") == "1"
 
     if action == "list":
         db = Path(home).resolve() / "aios.db"
@@ -2513,6 +2520,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
             st.db.close()
         for p in pins:
             print(f"{p['name']:<24} {('v' + p['version']) if p['version'] else '-':<11} {p['sha256'][:12]}  pinned {p['ts'][:10]}"
+                  + (f"  signed by {p['signer']}" if p["signer"] else "")
                   + ("  (pinned despite high-severity findings)" if p["forced"] else ""))
         if not pins:
             print("(no trusted skills)")
@@ -2528,6 +2536,19 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
         store.db.close()
         print(f"removed trust for '{target}'" if ok else f"'{target}' was not trusted")
         return 0 if ok else 1
+    if action == "sign":
+        if not key:
+            print("usage: aios skills sign <folder> --key <ssh private key>")
+            return 2
+        try:
+            out = sk.sign(target, key)
+        except sk.SkillError as e:
+            print(f"cannot sign: {e}")
+            return 1
+        skill = sk.load(target)
+        print(f"signed {sk.label(skill.name, skill.version)} ({skill.sha256[:12]}) -> {out}\n"
+              "Publish your public key so users can add it to their allowed_signers file.")
+        return 0
 
     findings = sk.scan(target)
     try:
@@ -2536,6 +2557,12 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
         print(f"invalid skill: {e}")
         return 1
     print(f"{sk.label(skill.name, skill.version)}  sha256 {skill.sha256}")
+    sig_state, sig_detail = sk.verify(skill, signers)
+    print({"valid": f"  signature: valid, signed by {sig_detail}",
+           "unsigned": "  signature: none (unsigned skill)",
+           "unknown-signer": f"  signature: {sig_detail} ({signers})",
+           "invalid": f"  signature: INVALID: {sig_detail}",
+           "unavailable": f"  signature: present but not checked: {sig_detail}"}[sig_state])
     for f in findings:
         where = f"{f.file}:{f.line}" if f.line else f.file
         print(f"  [{f.severity:<6}] {f.rule:<17} {where}  {f.text}")
@@ -2544,7 +2571,13 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
           f"{len([f for f in findings if f.severity == 'medium'])} medium. "
           "A clean scan is a tripwire, not proof of safety: read the skill before trusting it.")
     if action == "scan":
-        return 1 if high else 0
+        return 1 if high or sig_state == "invalid" else 0
+    if sig_state == "invalid":
+        print("refusing to trust: the signature does not match (remove SKILL.sig only if you know why)")
+        return 1
+    if require_signed and sig_state != "valid":
+        print(f"refusing to trust: a valid signature from an allowed signer is required ({signers})")
+        return 1
 
     if high and not force:
         print("refusing to trust: high-severity findings (use --force only if you have read them and they are fine)")
@@ -2559,9 +2592,11 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
             return 1
     base.mkdir(parents=True, exist_ok=True)
     store = Store(str(base / "aios.db"))
-    store.pin_skill(skill.name, skill.sha256, skill.version, forced=high)
+    signer = sig_detail if sig_state == "valid" else ""
+    store.pin_skill(skill.name, skill.sha256, skill.version, forced=high, signer=signer)
     store.db.close()
-    print(f"trusted {sk.label(skill.name, skill.version)} ({skill.sha256[:12]}). Use it with: chat --skill {target}")
+    print(f"trusted {sk.label(skill.name, skill.version)} ({skill.sha256[:12]})"
+          + (f", signed by {signer}" if signer else "") + f". Use it with: chat --skill {target}")
     return 0
 
 
@@ -2785,8 +2820,12 @@ def cli():
     c.add_argument("--skill", action="append", default=[], metavar="FOLDER",
                    help="load a skill folder you have pinned with `aios skills trust` (repeatable)")
     k_ = sub.add_parser("skills", help="review, pin and list skills (instruction packs)")
-    k_.add_argument("action", choices=["scan", "trust", "list", "untrust"])
-    k_.add_argument("target", nargs="?", help="skill folder (scan/trust) or skill name (untrust)")
+    k_.add_argument("action", choices=["scan", "trust", "list", "untrust", "sign"])
+    k_.add_argument("target", nargs="?", help="skill folder (scan/trust/sign) or skill name (untrust)")
+    k_.add_argument("--key", help="sign: SSH private key (ed25519 recommended) to sign with")
+    k_.add_argument("--signers", help="allowed-signers file (default: <home>/allowed_signers or $AIOS_SKILL_SIGNERS)")
+    k_.add_argument("--require-signed", action="store_true",
+                    help="trust: refuse unless signed by an allowed signer (also $AIOS_SKILLS_REQUIRE_SIGNED=1)")
     k_.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     k_.add_argument("--force", action="store_true", help="trust despite high-severity findings")
     k_.add_argument("--yes", action="store_true", help="skip the typed confirmation (for scripts)")
@@ -2939,7 +2978,8 @@ def cli():
         except OSError as e:
             ap.error(f"cannot listen on 127.0.0.1:{a.port}: {e}")
     if a.cmd == "skills":
-        raise SystemExit(skills_cmd(a.action, a.target, a.home, a.force, a.yes))
+        raise SystemExit(skills_cmd(a.action, a.target, a.home, a.force, a.yes, a.key, a.signers,
+                                    a.require_signed))
     if a.cmd == "serve":
         policy = None
         if a.policy:
