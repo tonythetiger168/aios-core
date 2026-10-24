@@ -1183,13 +1183,22 @@ class DockerSandbox:
             print(f"[sandbox] too many unknown creates; no longer watching {name}", file=sys.stderr)
             DockerSandbox.unknown.pop(name)
 
-    async def _oom_killed(self, container) -> bool:
-        try:
-            rc, out = await self._invoke([self.docker, "container", "inspect", "--format",
-                                          "{{.State.OOMKilled}}", container], timeout=self.cleanup_timeout)
-        except (OSError, asyncio.TimeoutError):
-            return False
-        return rc == 0 and out.strip() == "true"
+    async def _oom_killed(self, container, exit_code: int) -> bool:
+        # Docker records OOMKilled from a separate containerd event, so right after a SIGKILL exit
+        # (137) it can still read false for a moment: look again briefly before saying no.
+        tries = 10 if exit_code == 137 else 1
+        for i in range(tries):
+            try:
+                rc, out = await self._invoke([self.docker, "container", "inspect", "--format",
+                                              "{{.State.OOMKilled}}", container], timeout=self.cleanup_timeout)
+            except (OSError, asyncio.TimeoutError):
+                return False
+            if rc == 0 and out.strip() == "true":
+                return True
+            if rc or i == tries - 1:
+                return False
+            await asyncio.sleep(0.2)
+        return False
 
     async def run_python(self, code: str) -> str:
         if DockerSandbox.unknown:
@@ -1209,7 +1218,7 @@ class DockerSandbox:
             rc, out = await self._invoke(
                 [self.docker, "start", "--attach", "--interactive", container], code.encode(),
                 timeout=remaining, limit=self.max_out)
-            if rc and await self._oom_killed(container):
+            if rc and await self._oom_killed(container, rc):
                 return f"killed: out of memory ({self.mem_mb} MiB limit)\n{out}"
             return f"exit={rc}\n{out}"
         except asyncio.TimeoutError:
