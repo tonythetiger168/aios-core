@@ -488,6 +488,11 @@ class Store:
 
 # ---- Tool registry (like syscalls) ----
 # ---- Untrusted content + capability scopes ----
+def _sdk_field(obj, name: str, old: str):
+    """A field of an MCP SDK object: mcp 2.x names them in snake_case, 1.x in camelCase."""
+    return getattr(obj, name, None) if hasattr(obj, name) else getattr(obj, old, None)
+
+
 def tag_untrusted(source: str, text: str) -> str:
     """Wrap tool output that may carry attacker-written text. Fake tags inside are defused."""
     src = re.sub(r"[^\w.\-]", "_", source)[:64]
@@ -703,7 +708,7 @@ class Kernel:
             async def call(**kwargs):
                 res = await session.call_tool(tool_name, kwargs)
                 text = "\n".join(c.text for c in res.content if getattr(c, "type", "") == "text")
-                if res.isError:
+                if _sdk_field(res, "is_error", "isError"):
                     raise RuntimeError(text or "MCP tool error")
                 return text[:MCP_MAX_RESULT]
             return call
@@ -711,7 +716,8 @@ class Kernel:
         names = []
         for t in (await session.list_tools()).tools:
             full = f"{server}__{t.name}"
-            self.tools.register_raw(full, t.description or "", t.inputSchema, make(t.name), untrusted=True)
+            self.tools.register_raw(full, t.description or "", _sdk_field(t, "input_schema", "inputSchema"),
+                                    make(t.name), untrusted=True)
             self.needs_approval.add(full)
             names.append(full)
         return names
@@ -2047,22 +2053,37 @@ async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str =
     agent = Agent(agent_name, set(pol["permissions"]) if explicit else set(SERVE_DEFAULT_TOOLS),
                   scopes=pol["scopes"] if pol else {})
     gw = Gateway(k, agent)
-    try:
-        server = Server("aios", instructions=SERVER_INSTRUCTIONS)
-    except TypeError:  # older SDKs have no `instructions`
-        server = Server("aios")
 
-    @server.list_tools()
-    async def list_tools():
+    def tool_list():
         return [types.Tool(name=t["name"], description=t["description"], inputSchema=t["input_schema"])
                 for t in gw.tools()]
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict):
-        out, err = await gw.call(name, arguments)
-        if err:
-            raise RuntimeError(out)  # the SDK reports this to the client as a tool error
-        return [types.TextContent(type="text", text=out)]
+    if hasattr(Server, "list_tools"):  # mcp 1.x: handlers are registered with decorators
+        try:
+            server = Server("aios", instructions=SERVER_INSTRUCTIONS)
+        except TypeError:  # older SDKs have no `instructions`
+            server = Server("aios")
+
+        @server.list_tools()
+        async def list_tools():
+            return tool_list()
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict):
+            out, err = await gw.call(name, arguments)
+            if err:
+                raise RuntimeError(out)  # the SDK reports this to the client as a tool error
+            return [types.TextContent(type="text", text=out)]
+    else:  # mcp 2.x: handlers are passed to the constructor and return whole results
+        async def on_list_tools(ctx, params):
+            return types.ListToolsResult(tools=tool_list())
+
+        async def on_call_tool(ctx, params):
+            out, err = await gw.call(params.name, params.arguments or {})
+            return types.CallToolResult(content=[types.TextContent(type="text", text=out)], isError=bool(err))
+
+        server = Server("aios", instructions=SERVER_INSTRUCTIONS, on_list_tools=on_list_tools,
+                        on_call_tool=on_call_tool)
 
     # stdout belongs to the protocol: anything for humans goes to stderr
     print(f"[aios] MCP server '{agent_name}' on stdio: {len(gw.tools())} tools, "

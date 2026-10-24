@@ -19,6 +19,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt
+      - name: Install the MCP SDK (latest on 3.12, last 1.x on Windows 3.11, none on Ubuntu 3.11)
+        if: matrix.python == '3.12' || runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ matrix.python }}" = "3.12" ]; then pip install mcp; else pip install "mcp<2"; fi
+          python -c "import importlib.metadata as m; print('mcp', m.version('mcp'))"
       - name: Prepare the Docker sandbox tests (Linux runners only)
         if: runner.os == 'Linux'
         run: |

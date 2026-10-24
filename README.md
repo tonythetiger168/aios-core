@@ -228,7 +228,7 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 - Without a policy only read-only tools are offered (`now`, `read_file`, `list_files`, `recall`, `list_facts`).
 - Nobody can answer a `[y/N]` prompt over stdio, so risky tools (`write_file`, `run_python`, `remember` after tainting) are **refused** unless the policy pre-allows a path with `auto_paths`. Once the session has read a file, even those are refused until the server restarts.
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
-- **Status**: written against the MCP SDK's low-level server API and tested only against a stand-in, not a real client. If your client does not connect or lists no tools, please open an issue with the stderr output.
+- **Status**: works with the official `mcp` SDK 1.x and 2.x. CI drives `aios serve` with the SDK's own stdio client (initialize, list, call, refusals, audit) on both versions, and connects aios to a real SDK server. Not yet tried with Claude Desktop or other GUI clients: if yours does not connect or lists no tools, please open an issue with the stderr output.
 
 ## Talk to other agents (A2A)
 
@@ -341,7 +341,7 @@ Months are relative estimates (month 1 = project start) and will move.
 | Phase | When | Goal | Exit criterion |
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
-| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
+| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
 | **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming, background tasks and cancel) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`; no public registry hosted yet) · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
