@@ -2383,6 +2383,10 @@ def cli():
     jb.add_argument("--agent", default="main", help="add: policy section whose permissions the job gets")
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
+    sx = sub.add_parser("service", help="print a systemd / launchd / Task Scheduler definition that keeps the daemon running",
+                        usage="aios service {systemd,launchd,windows} [--home HOME] [-- DAEMON FLAGS...]")
+    sx.add_argument("kind", choices=["systemd", "launchd", "windows"])
+    sx.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
     st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
@@ -2407,7 +2411,10 @@ def cli():
                             f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
                             "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
-    a = ap.parse_args()
+    argv, daemon_args = sys.argv[1:], []
+    if argv[:1] == ["service"] and "--" in argv:  # what follows -- is passed to `aios daemon` untouched
+        argv, daemon_args = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    a = ap.parse_args(argv)
     global SANDBOX_CHOICE
     SANDBOX_CHOICE = getattr(a, "sandbox", None)
     choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX")
@@ -2426,6 +2433,14 @@ def cli():
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
+    if a.cmd == "service":
+        import aios_service
+        try:
+            print(aios_service.render(a.kind, str(Path(a.home).resolve()), daemon_args, sys.executable,
+                                      str(Path(__file__).resolve())), end="")
+        except ValueError as e:
+            ap.error(f"service: {e}")
+        return 0
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":
