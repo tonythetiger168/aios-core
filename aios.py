@@ -1430,11 +1430,24 @@ async def install_a2a_tools(k: Kernel, specs: list[str]) -> list[str]:
         about = " ".join(str(card.get("description") or "").split())[:300]
 
         @k.tools.register(f"a2a__{name}", f"Ask the remote agent '{name}' ({card['name'][:60]}) over A2A. "
-                          f"It runs elsewhere and sees only what you send. {about}",
-                          {"task": {"type": "string", "description": "the request, in full"}},
+                          f"It runs elsewhere and sees only what you send. Each call starts a new conversation "
+                          f"unless you pass the conversation id from an earlier answer. {about}",
+                          {"task": {"type": "string", "description": "the request, in full"},
+                           "conversation": {"type": "string", "description":
+                                            "optional: continue this conversation (id from an earlier answer)"}},
                           required=["task"], untrusted=True)
-        async def ask(task: str, _client=client):
-            return await asyncio.to_thread(_client.send, task)
+        async def ask(task: str, conversation: str = "", _client=client, _waiting={}):
+            if conversation and not aios_a2a.ID_RE.fullmatch(conversation):
+                raise ValueError("conversation must be an id from an earlier answer")
+            r = await asyncio.to_thread(_client.ask, task, conversation or None, _waiting.pop(conversation, None))
+            if r["task_id"] and r["context_id"]:  # the agent asked for more: the next message answers it
+                _waiting[r["context_id"]] = r["task_id"]
+                while len(_waiting) > aios_a2a.CONTEXTS_KEPT:
+                    _waiting.pop(next(iter(_waiting)))
+            note = [f"conversation: {r['context_id']}"] if r["context_id"] else []
+            if r["state"] != "completed":
+                note.append(f"the remote agent needs more: {r['state']}")
+            return r["answer"] + (f"\n[{'; '.join(note)}]" if note else "")
 
         k.needs_approval.add(f"a2a__{name}")
         names.append(f"a2a__{name}")
