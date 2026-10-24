@@ -144,6 +144,21 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 - 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。告警只負責回報，絕不停止、阻擋或更改任何東西。
 - 「down」代表超過 3 次 tick 加上一次任務逾時（至少 2 分鐘）沒有心跳，所以長時間的任務不會被誤判成守護程式掛掉。把 `aios status` 放進 cron 或監控檢查，守護程式掛掉時就會收到通知。
 
+## 照顧記憶
+
+在讀過不可信內容的執行中保存的記憶會標記為「未驗證」。偶爾檢查一下：
+
+```bash
+python aios.py memory review                # 未驗證的記憶，舊的在前
+python aios.py memory confirm main owner    # 你確認過了：它變成你的記憶
+python aios.py memory tidy --dry-run        # 預覽 tidy 會做什麼
+python aios.py memory tidy                  # 把超過 30 天的未驗證記憶移到封存（可用 --days 調整）
+python aios.py memory archived              # 不會遺失：memory restore <代理> <鍵>
+```
+
+- tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
+- restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
+
 ## 技能（Skills）
 
 技能是一個資料夾，採用開放的 [Agent Skills](https://agentskills.io) 格式：`SKILL.md` 開頭的前置欄位寫 `name` 與 `description`，後面是給代理的指令。因此為 Claude、Codex、Gemini CLI、Copilot 寫的技能（例如 [anthropics/skills](https://github.com/anthropics/skills)）可以直接使用。`skill.toml`（名稱、版本、說明）改為選用；有的話以它為準，前置欄位的 `name` 與它不同會被拒絕。只有前置欄位之後的內容會進入提示詞。aios **絕不執行技能裡的程式碼**，只會讀取 `SKILL.md`。因為這些指令會進入系統提示詞，技能本身就是提示注入的管道，所以要先審查並**固定它的摘要（digest）**：
