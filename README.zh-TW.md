@@ -20,7 +20,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。
-  - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台。目前只有 Ubuntu 有 real-Docker CI 證據。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
+  - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台。目前只有 Ubuntu 有 real-Docker CI 證據。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
   - `microvm`（實驗性，需 Linux 與 KVM）：每次呼叫啟動一台全新的 [Firecracker](https://firecracker-microvm.github.io/) microVM，有自己的核心、沒有網路裝置、除了程式碼之外不帶入你電腦上的任何東西、根目錄唯讀、非特權使用者。只在明確指定時使用，`auto` 永遠不會選它；KVM、Firecracker 或映像檔缺少時 AIOS 會拒絕啟動。設定方式與威脅模型見 [docs/microvm-sandbox.md](docs/microvm-sandbox.md)。
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
@@ -79,6 +79,16 @@ python aios.py daemon --once ...          # 執行到期的任務就結束：給
 
 排程格式：`every 30m`、`every 2h`、`every 1d`、`daily 09:00`、`weekly mon 09:00`、`once 2026-12-24 18:30`、`on change inbox/*`、`on webhook`（兩者見下；本地時間，最短每分鐘一次）。用 cron 的話：`* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`。
 
+**保持執行。** `aios service` 會印出一份服務設定：登入時啟動守護程式、當掉時自動重啟，並附上安裝指令。aios 本身不安裝任何東西，所以你能看清楚到底會執行什麼：
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # 工作排程器（PowerShell）
+```
+
+`--` 之後的參數會原封不動交給 `aios daemon`（`--once` 會被拒絕：服務必須持續執行）。API key 絕不寫進服務設定檔：systemd 與 launchd 會從 `<home>/aios.env` 讀取 `KEY=value`（請設成只有你能讀）；Windows 請設成使用者環境變數。
+
 - **沒有人能批准任何事**（除非你開啟下面的瀏覽器審批）。政策流程和 `chat` 相同，但高風險工具一律拒絕，除非政策用 `auto_paths` 預先允許該路徑。沒有政策區段的任務只能唯讀（`now`、`read_file`、`list_files`、`recall`、`list_facts`、`search_memory`）。
 - 讀過檔案的任務會被視為「被污染」，連 `auto_paths` 也不再生效，除非範圍設定了 `auto_when_tainted = true`：這代表你明確接受「任務讀到的文字若含注入指令，可以寫入那一個資料夾，且僅限該資料夾」。
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。
@@ -134,6 +144,21 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 
 - 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。告警只負責回報，絕不停止、阻擋或更改任何東西。
 - 「down」代表超過 3 次 tick 加上一次任務逾時（至少 2 分鐘）沒有心跳，所以長時間的任務不會被誤判成守護程式掛掉。把 `aios status` 放進 cron 或監控檢查，守護程式掛掉時就會收到通知。
+
+## 照顧記憶
+
+在讀過不可信內容的執行中保存的記憶會標記為「未驗證」。偶爾檢查一下：
+
+```bash
+python aios.py memory review                # 未驗證的記憶，舊的在前
+python aios.py memory confirm main owner    # 你確認過了：它變成你的記憶
+python aios.py memory tidy --dry-run        # 預覽 tidy 會做什麼
+python aios.py memory tidy                  # 把超過 30 天的未驗證記憶移到封存（可用 --days 調整）
+python aios.py memory archived              # 不會遺失：memory restore <代理> <鍵>
+```
+
+- tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
+- restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
 
 ## 技能（Skills）
 

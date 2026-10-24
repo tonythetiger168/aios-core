@@ -44,7 +44,8 @@ HISTORY_LIMIT = 40  # messages reloaded per agent
 MCP_MAX_RESULT = 20_000  # chars kept from one MCP tool result
 SANDBOXES = ("auto", "process", "docker", "microvm", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
 SANDBOX_CHOICE = None  # set by the CLI's --sandbox; else $AIOS_SANDBOX; else "auto"
-DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself
+DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself; pin with $AIOS_DOCKER_IMAGE
+DIGEST_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 MICROVM_HOME = Path.home() / ".aios" / "microvm"  # or $AIOS_MICROVM_DIR: firecracker, vmlinux, rootfs.ext4
 FILE_MAX_CHARS = 50_000  # max chars read/written by file tools
 LIST_MAX = 200  # max entries returned by list_files
@@ -996,6 +997,15 @@ class Sandbox:
             return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
 
 
+def docker_image() -> str:
+    """The image for the docker sandbox: $AIOS_DOCKER_IMAGE (ideally pinned, NAME@sha256:<digest>)
+    or DOCKER_IMAGE. A pinned reference makes the daemon run exactly that content."""
+    image = os.environ.get("AIOS_DOCKER_IMAGE", "").strip() or DOCKER_IMAGE
+    if "@" in image and not DIGEST_RE.fullmatch(image):
+        raise ValueError(f"AIOS_DOCKER_IMAGE must be NAME[:TAG] or NAME@sha256:<64 hex>, not {image!r}")
+    return image
+
+
 class DockerSandbox:
     """run_python in a throwaway container: no network, no host files (nothing is mounted), read-only
     root with a small /tmp, unprivileged user, all capabilities dropped, memory/CPU/process caps.
@@ -1003,16 +1013,21 @@ class DockerSandbox:
     this is a container boundary, not microVM isolation."""
     name = "docker"
 
-    def __init__(self, image=DOCKER_IMAGE, timeout=10, cpus=1.0, mem_mb=256, pids=64,
+    def __init__(self, image=None, timeout=10, cpus=1.0, mem_mb=256, pids=64,
                  max_out=10_000, docker="docker", cleanup_timeout=3):
-        self.image, self.timeout, self.cpus, self.mem_mb = image, timeout, cpus, mem_mb
-        self.pids, self.max_out, self.docker = pids, max_out, docker
+        self.image, self.timeout, self.cpus, self.mem_mb = image or docker_image(), timeout, cpus, mem_mb
+        self.pids, self.max_out = pids, max_out
+        self.docker = shutil.which(docker) or docker  # resolved once: later PATH changes cannot swap it
         self.cleanup_timeout = cleanup_timeout
 
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def unavailable(image=DOCKER_IMAGE, docker="docker") -> str | None:
-        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image."""
+        """Why this backend cannot run here, or None. Checks the CLI, the daemon and the image, and
+        with $AIOS_DOCKER_REQUIRE_DIGEST=1 that the image is pinned by digest."""
+        if os.environ.get("AIOS_DOCKER_REQUIRE_DIGEST") == "1" and not DIGEST_RE.fullmatch(image):
+            return (f"image {image} is not pinned and AIOS_DOCKER_REQUIRE_DIGEST=1: set "
+                    "AIOS_DOCKER_IMAGE=NAME@sha256:<digest> (see docs/docker-sandbox-validation.md)")
         exe = shutil.which(docker)
         if not exe:
             return "docker is not installed (or not on PATH)"
@@ -1029,6 +1044,39 @@ class DockerSandbox:
         if r.stdout.strip() != "linux":
             return f"image {image} is not a Linux image (switch Docker Desktop to Linux containers)"
         return None
+
+    @staticmethod
+    def provenance(image: str, docker="docker") -> list[str]:
+        """Startup notes on what will run the code: executable, daemon endpoint, image pinning."""
+        exe = shutil.which(docker) or docker
+        notes = [f"docker executable: {exe}"]
+
+        def ask(*args):
+            try:
+                r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=20)
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+
+        host = os.environ.get("DOCKER_HOST") or ask("context", "inspect", "--format",
+                                                    "{{.Endpoints.docker.Host}}")
+        if host and not host.startswith(("unix://", "npipe://")):
+            notes.append(f"WARNING: the Docker daemon is remote ({host}): code and its output go there")
+        elif host:
+            notes.append(f"docker daemon: {host}")
+        if DIGEST_RE.fullmatch(image):
+            notes.append(f"image pinned: {image}")
+        else:
+            digests = ask("image", "inspect", "--format", "{{json .RepoDigests}}", image)
+            try:
+                found = [d for d in json.loads(digests or "[]") if isinstance(d, str) and DIGEST_RE.fullmatch(d)]
+            except ValueError:
+                found = []
+            repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+            mine = [d for d in found if d.split("@")[0] == repo] or found
+            notes.append(f"image {image} is NOT pinned (a tag can change)"
+                         + (f": pin it with AIOS_DOCKER_IMAGE={mine[0]}" if mine else ""))
+        return notes
 
     def command(self, container: str) -> list[str]:
         # Create separately: once acknowledged, a delayed start cannot create a new container
@@ -1295,17 +1343,22 @@ def make_sandbox(choice: str | None = None):
     if choice == "off":
         return None
     if choice == "docker":
-        why = DockerSandbox.unavailable()
+        image = docker_image()
+        why = DockerSandbox.unavailable(image)
         if why:
             raise RuntimeError(f"--sandbox docker: {why}")
-        return DockerSandbox()
+        for note in DockerSandbox.provenance(image):
+            print(f"[sandbox] {note}", file=sys.stderr)
+        return DockerSandbox(image)
     if choice == "microvm":
         why = MicroVMSandbox.unavailable()
         if why:
             raise RuntimeError(f"--sandbox microvm: {why}")
         return MicroVMSandbox()
-    if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable():
-        return DockerSandbox()  # the only real isolation on Windows
+    if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable(docker_image()):
+        for note in DockerSandbox.provenance(docker_image()):  # the only real isolation on Windows
+            print(f"[sandbox] {note}", file=sys.stderr)
+        return DockerSandbox()
     if IS_WINDOWS and not weak_ok:  # "process" on Windows is timeout-only: opt-in
         print("[aios] run_python disabled on Windows (no real sandbox). Use --sandbox docker "
               f"(after `docker pull {DOCKER_IMAGE}`), WSL2, or set AIOS_ALLOW_WEAK_SANDBOX=1 to enable "
@@ -2483,6 +2536,57 @@ def audit_cmd(agent: str | None, n: int, home: str):
     store.db.close()
 
 
+def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None, days: int = 30,
+               dry_run: bool = False, now=None) -> int:
+    import aios_keeper as mk
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print("(no memory)")
+        return 0
+    store = Store(str(db))
+    one = lambda t: " ".join(str(t).split())[:120]
+    try:
+        if action == "review":
+            rows = mk.review(store.db, agent)
+            for r in rows:
+                print(f"{r['agent']:<14} {r['key']:<24} {r['ts'] or '':<19}  {one(r['value'])}")
+            print(f"{len(rows)} unverified note(s). Confirm one you have checked: aios memory confirm <agent> <key>"
+                  if rows else "(no unverified notes)")
+            return 0
+        if action in ("confirm", "restore"):
+            if len(args) != 2:
+                print(f"usage: aios memory {action} <agent> <key>")
+                return 2
+            if action == "confirm":
+                ok = mk.confirm(store.db, *args)
+                print(f"confirmed {args[0]}/{args[1]}: it is now your note" if ok
+                      else f"{args[0]}/{args[1]} is not an unverified note")
+                return 0 if ok else 1
+            res = mk.restore(store.db, *args)
+            print({"restored": f"restored {args[0]}/{args[1]}",
+                   "exists": f"{args[0]}/{args[1]} exists again; remove it first (/forget) to restore the old one",
+                   "missing": f"{args[0]}/{args[1]} is not in the archive"}[res])
+            return 0 if res == "restored" else 1
+        if action == "archived":
+            rows = mk.archived(store.db, agent)
+            for r in rows:
+                print(f"{r['archived_ts']}  {r['agent']:<14} {r['key']:<24} {r['reason']}  {one(r['value'])}")
+            if not rows:
+                print("(archive is empty)")
+            return 0
+        rep = mk.tidy(store.db, days, dry_run, now)  # tidy
+        verb = "would archive" if dry_run else "archived"
+        for a, k in rep["archived"]:
+            print(f"{verb} {a}/{k} (unverified for over {days} days)")
+        print(f"{verb} {len(rep['archived'])} note(s); "
+              f"{'would drop' if dry_run else 'dropped'} {rep['stale_vectors']} stale cached vector(s)")
+        for a, v, keys in rep["duplicates"]:
+            print(f"same text under several keys for {a}: {', '.join(keys)}  ({one(v)})")
+        return 0
+    finally:
+        store.db.close()
+
+
 def status_cmd(home: str, now=None) -> int:
     """Supervisor view: is the daemon alive, what needs a person. Exit 0 = nothing needs attention."""
     import aios_watchdog as wd
@@ -2660,6 +2764,17 @@ def cli():
     jb.add_argument("--agent", default="main", help="add: policy section whose permissions the job gets")
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
+    me = sub.add_parser("memory", help="review, confirm and tidy agents' notes (nothing tidy does is lost)")
+    me.add_argument("action", choices=["review", "confirm", "tidy", "archived", "restore"])
+    me.add_argument("args", nargs="*", help="confirm/restore: <agent> <key>")
+    me.add_argument("--agent", help="review/archived: only this agent")
+    me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
+    me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
+    me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    sx = sub.add_parser("service", help="print a systemd / launchd / Task Scheduler definition that keeps the daemon running",
+                        usage="aios service {systemd,launchd,windows} [--home HOME] [-- DAEMON FLAGS...]")
+    sx.add_argument("kind", choices=["systemd", "launchd", "windows"])
+    sx.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
     st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
@@ -2698,13 +2813,20 @@ def cli():
                             f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
                             "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
-    a = ap.parse_args()
+    argv, daemon_args = sys.argv[1:], []
+    if argv[:1] == ["service"] and "--" in argv:  # what follows -- is passed to `aios daemon` untouched
+        argv, daemon_args = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    a = ap.parse_args(argv)
     global SANDBOX_CHOICE
     SANDBOX_CHOICE = getattr(a, "sandbox", None)
     choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX")
     if choice and choice not in SANDBOXES:
         ap.error(f"AIOS_SANDBOX must be one of {', '.join(SANDBOXES)}, not {choice!r}")
-    if choice == "docker" and (why := DockerSandbox.unavailable()):  # fail before starting anything
+    try:
+        image = docker_image()
+    except ValueError as e:
+        ap.error(str(e))
+    if choice == "docker" and (why := DockerSandbox.unavailable(image)):  # fail before starting anything
         ap.error(f"--sandbox docker: {why}")
     if a.cmd in ("chat", "daemon", "a2a-serve", "swarm"):
         apply_swarm_flags(a, ap)
@@ -2732,6 +2854,18 @@ def cli():
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
+    if a.cmd == "memory":
+        if a.days < 1:
+            ap.error("--days must be at least 1")
+        raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
+    if a.cmd == "service":
+        import aios_service
+        try:
+            print(aios_service.render(a.kind, str(Path(a.home).resolve()), daemon_args, sys.executable,
+                                      str(Path(__file__).resolve())), end="")
+        except ValueError as e:
+            ap.error(f"service: {e}")
+        return 0
     if a.cmd == "jobs":
         raise SystemExit(jobs_cmd(a.action, a.args, a.schedule, a.agent, a.home, a.n))
     if a.cmd == "daemon":

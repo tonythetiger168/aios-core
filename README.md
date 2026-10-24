@@ -20,7 +20,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
 - **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (default on Linux/macOS): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces).
-  - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
+  - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. Pin it with `AIOS_DOCKER_IMAGE=python@sha256:<digest>` so a changed tag cannot swap what runs (the startup message prints the line to use; see [pinning](docs/docker-sandbox-validation.md#image-pinning-and-trust)). On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
   - `microvm` (experimental, Linux with KVM): a fresh [Firecracker](https://firecracker-microvm.github.io/) microVM per call with its own kernel, no network device, nothing from your machine except the code, a read-only root and an unprivileged user. Only chosen explicitly, never by `auto`, and AIOS refuses to start if KVM, Firecracker or the images are missing. Setup and threat model: [docs/microvm-sandbox.md](docs/microvm-sandbox.md).
 - **MCP client**: attach stdio MCP servers; their tools are registered as `<server>__<tool>` and are *not* granted to agents unless you allow them.
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
@@ -79,6 +79,16 @@ python aios.py daemon --once ...          # run what is due, then exit: for cron
 
 Schedules: `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekly mon 09:00`, `once 2026-12-24 18:30`, `on change inbox/*`, `on webhook` (both below; local time, at most once a minute). With cron: `* * * * * cd ~/aios && python aios.py daemon --once --provider openai --model llama3.1`.
 
+**Keep it running.** `aios service` prints a service definition that starts the daemon at login and restarts it when it crashes, plus the commands to install it. aios installs nothing itself, so you can read exactly what will run:
+
+```bash
+python aios.py service systemd --home ~/aios-data -- --policy policy.toml --provider openai --model llama3.1   # Linux
+python aios.py service launchd --home ~/aios-data -- ...                                                   # macOS
+python aios.py service windows --home C:\aios-data -- ...                                                  # Task Scheduler (PowerShell)
+```
+
+Flags after `--` go to `aios daemon` unchanged (`--once` is refused: a service keeps running). API keys never go into the service file: systemd and launchd read `KEY=value` lines from `<home>/aios.env` (make it readable by you only); on Windows, set them as user environment variables.
+
 - **Nobody can approve anything** (unless you turn on browser approvals, below). Same policy pipeline as `chat`, but risky tools are refused unless the policy pre-allows the path with `auto_paths`. A job with no policy section is read-only (`now`, `read_file`, `list_files`, `recall`, `list_facts`, `search_memory`).
 - A job that reads a file is *tainted*, so even `auto_paths` stop applying, unless the scope says `auto_when_tainted = true`: your explicit statement that injected text in what the job read may write into that one folder, and nothing else.
 - Each job is its own agent (`job-<name>`: own history and memory) and starts every run with a clean history. Runs always have a cap (default 50,000 tokens, 8 steps, 300 s), and a job runs at most 200 times a day (`--max-runs-per-day`), so a typo like `every 1m` cannot burn your budget unnoticed.
@@ -134,6 +144,21 @@ python aios.py alerts --home ~/aios-data     # open alerts; --ack <id>|all, --al
 
 - Alerts go to the daemon's stderr, `aios status`, `aios alerts` and the console's overview. The same rule for the same agent is not repeated within an hour. Alerts only report; they never stop, block or change anything.
 - "Down" means no heartbeat for longer than 3 ticks plus one job timeout (at least 2 minutes), so a long job does not look like a dead daemon. Put `aios status` in cron or a monitoring check to be told when the daemon dies.
+
+## Looking after memory
+
+Notes saved while a run had read untrusted content are marked *unverified*. Check them now and then:
+
+```bash
+python aios.py memory review                # unverified notes, oldest first
+python aios.py memory confirm main owner    # you checked it: it becomes your note
+python aios.py memory tidy --dry-run        # what tidy would do
+python aios.py memory tidy                  # archive unverified notes older than 30 days (--days)
+python aios.py memory archived              # nothing is lost: memory restore <agent> <key>
+```
+
+- Tidy moves old unverified notes to an archive instead of deleting them, and never touches your notes or the model's. It also drops cached vectors whose note changed or is gone (they are rebuilt on demand), and lists notes with the same text under several keys without changing them.
+- Restore puts the note back as unverified, and refuses if a newer note with that key exists. No model is involved: deciding what an agent keeps believing is what an injected note would like to influence.
 
 ## Skills
 

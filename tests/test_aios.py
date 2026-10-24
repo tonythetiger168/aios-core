@@ -1281,6 +1281,50 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(mount, cmd)  # nothing from the host is shared
         self.assertEqual(cmd[-4:], [aios.DOCKER_IMAGE, "python", "-I", "-"])
 
+    def test_image_can_be_pinned_by_digest(self):
+        pinned = "python:3.12-slim@sha256:" + "a" * 64
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": pinned}):
+            self.assertEqual(aios.docker_image(), pinned)
+            self.assertEqual(aios.DockerSandbox().command("c")[-4], pinned)  # the daemon runs exactly this
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": ""}):
+            self.assertEqual(aios.docker_image(), aios.DOCKER_IMAGE)
+        for bad in ("python@sha256:abc", "python@md5:" + "a" * 64, "py thon@sha256:" + "a" * 64):
+            with self.subTest(bad=bad), mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": bad}), \
+                    self.assertRaises(ValueError):
+                aios.docker_image()
+
+    def test_require_digest_refuses_a_tag(self):
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_REQUIRE_DIGEST": "1"}), \
+                mock.patch.object(aios.shutil, "which", return_value=None):
+            self.assertIn("not pinned", aios.DockerSandbox.unavailable("python:3.12-slim"))
+            aios.DockerSandbox.unavailable.cache_clear()
+            pinned = "python@sha256:" + "b" * 64
+            self.assertIn("not installed", aios.DockerSandbox.unavailable(pinned))  # passes the pin check
+
+    def test_provenance_names_the_daemon_and_how_to_pin(self):
+        digest = "sha256:" + "c" * 64
+
+        def fake_run(args, **kw):
+            if args[1:3] == ["context", "inspect"]:
+                out = "unix:///var/run/docker.sock"
+            elif args[1:3] == ["image", "inspect"]:
+                out = json.dumps([f"other/repo@{digest.replace('c', 'd')}", f"python@{digest}"])
+            else:
+                out = ""
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(aios.subprocess, "run", side_effect=fake_run), \
+                mock.patch.dict(os.environ, {"DOCKER_HOST": ""}):
+            notes = aios.DockerSandbox.provenance("python:3.12-slim")
+            self.assertEqual(notes[0], "docker executable: /usr/bin/docker")
+            self.assertIn("docker daemon: unix:///var/run/docker.sock", notes)
+            self.assertIn(f"AIOS_DOCKER_IMAGE=python@{digest}", notes[-1])
+            self.assertEqual(aios.DockerSandbox.provenance(f"python@{digest}")[-1], f"image pinned: python@{digest}")
+            with mock.patch.dict(os.environ, {"DOCKER_HOST": "tcp://10.0.0.5:2376"}):
+                self.assertTrue(any("remote" in n and "10.0.0.5" in n
+                                    for n in aios.DockerSandbox.provenance("python:3.12-slim")))
+
     def test_unavailable_explains_what_is_missing(self):
         u = aios.DockerSandbox.unavailable
         with mock.patch.object(aios.shutil, "which", return_value=None):
@@ -1500,6 +1544,17 @@ class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nonet", out)
         self.assertIn("readonly", out)
         self.assertIn("[]", out)  # an empty scratch dir: the workspace is not mounted
+
+    async def test_pinned_digest_runs_and_a_wrong_one_fails_closed(self):
+        r = subprocess.run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", aios.DOCKER_IMAGE],
+                           capture_output=True, text=True, timeout=20)
+        pinned = json.loads(r.stdout)[0]  # python@sha256:<index digest>, recorded by the pull
+        aios.DockerSandbox.unavailable.cache_clear()
+        self.assertIsNone(aios.DockerSandbox.unavailable(pinned))
+        out = await aios.DockerSandbox(pinned, timeout=20).run_python("print('pinned')")
+        self.assertEqual(out.strip(), "exit=0\npinned")
+        wrong = pinned.split("@")[0] + "@sha256:" + "0" * 64
+        self.assertIn("not present", aios.DockerSandbox.unavailable(wrong))  # never pulled, never run
 
     async def test_memory_cap(self):
         out = await aios.DockerSandbox(timeout=20, mem_mb=64).run_python("x = bytearray(512 * 1024 * 1024)")
