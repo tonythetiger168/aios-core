@@ -1476,13 +1476,17 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             if args[1] == 'start':
                 return 137, 'partial output'
             if args[1:3] == ['container', 'inspect']:
-                return 0, 'true\n' if oom else 'false\n'
+                inspects.append(1)
+                return 0, 'true\n' if oom and len(inspects) >= oom else 'false\n'
             return 0, ''
 
-        for oom, want in ((True, 'killed: out of memory (64 MiB limit)\npartial output'),
-                          (False, 'exit=137\npartial output')):
+        # oom: on which inspect Docker reports OOMKilled (it records it asynchronously), 0 = never
+        for oom, want in ((1, 'killed: out of memory (64 MiB limit)\npartial output'),
+                          (3, 'killed: out of memory (64 MiB limit)\npartial output'),
+                          (0, 'exit=137\npartial output')):
+            inspects = []
             with self.subTest(oom=oom), mock.patch.object(box, '_invoke', side_effect=invoke), \
-                    mock.patch.object(box, '_cleanup'):
+                    mock.patch.object(box, '_cleanup'), mock.patch.object(aios.asyncio, 'sleep', new=mock.AsyncMock()):
                 self.assertEqual(await box.run_python('x'), want)
 
     async def test_unknown_creates_are_reconciled_on_later_calls(self):

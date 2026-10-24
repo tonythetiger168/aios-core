@@ -1183,13 +1183,22 @@ class DockerSandbox:
             print(f"[sandbox] too many unknown creates; no longer watching {name}", file=sys.stderr)
             DockerSandbox.unknown.pop(name)
 
-    async def _oom_killed(self, container) -> bool:
-        try:
-            rc, out = await self._invoke([self.docker, "container", "inspect", "--format",
-                                          "{{.State.OOMKilled}}", container], timeout=self.cleanup_timeout)
-        except (OSError, asyncio.TimeoutError):
-            return False
-        return rc == 0 and out.strip() == "true"
+    async def _oom_killed(self, container, exit_code: int) -> bool:
+        # Docker records OOMKilled from a separate containerd event, so right after a SIGKILL exit
+        # (137) it can still read false for a moment: look again briefly before saying no.
+        tries = 10 if exit_code == 137 else 1
+        for i in range(tries):
+            try:
+                rc, out = await self._invoke([self.docker, "container", "inspect", "--format",
+                                              "{{.State.OOMKilled}}", container], timeout=self.cleanup_timeout)
+            except (OSError, asyncio.TimeoutError):
+                return False
+            if rc == 0 and out.strip() == "true":
+                return True
+            if rc or i == tries - 1:
+                return False
+            await asyncio.sleep(0.2)
+        return False
 
     async def run_python(self, code: str) -> str:
         if DockerSandbox.unknown:
@@ -1209,7 +1218,7 @@ class DockerSandbox:
             rc, out = await self._invoke(
                 [self.docker, "start", "--attach", "--interactive", container], code.encode(),
                 timeout=remaining, limit=self.max_out)
-            if rc and await self._oom_killed(container):
+            if rc and await self._oom_killed(container, rc):
                 return f"killed: out of memory ({self.mem_mb} MiB limit)\n{out}"
             return f"exit={rc}\n{out}"
         except asyncio.TimeoutError:
@@ -2506,10 +2515,25 @@ def print_hook_secret(name: str, secret: str):
 
 
 def skills_cmd(action: str, target: str | None, home: str, force: bool = False, yes: bool = False,
-               key: str | None = None, signers: str | None = None, require_signed: bool = False) -> int:
+               key: str | None = None, signers: str | None = None, require_signed: bool = False,
+               registry: str | None = None, _use: str | None = None) -> int:
     import aios_skills as sk
     signers = signers or os.environ.get("AIOS_SKILL_SIGNERS") or str(Path(home).resolve() / "allowed_signers")
     require_signed = require_signed or os.environ.get("AIOS_SKILLS_REQUIRE_SIGNED") == "1"
+    registry = registry or os.environ.get("AIOS_SKILL_REGISTRY") or ""
+
+    if action == "search":
+        try:
+            hits = sk.search(registry, target or "")
+        except sk.SkillError as e:
+            print(f"cannot search: {e}")
+            return 1
+        for e in hits:
+            print(f"{e['name']:<24} {('v' + e['version']) if e['version'] else '-':<11} "
+                  f"{'signed' if e['signed'] else 'unsigned':<9} {' '.join(e['description'].split())[:80]}")
+        if not hits:
+            print("(no matching skills)")
+        return 0
 
     if action == "list":
         db = Path(home).resolve() / "aios.db"
@@ -2536,6 +2560,51 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
         store.db.close()
         print(f"removed trust for '{target}'" if ok else f"'{target}' was not trusted")
         return 0 if ok else 1
+    if action == "publish":
+        kind = sk._location(registry)[0] if registry else ""
+        if kind != "dir":
+            print("usage: aios skills publish <folder> --registry <registry folder> (publish to a folder, then host it)")
+            return 2
+        try:
+            e = sk.publish(target, registry)
+        except sk.SkillError as err:
+            print(f"cannot publish: {err}")
+            return 1
+        print(f"published {sk.label(e['name'], e['version'])} ({e['sha256'][:12]}, "
+              f"{'signed' if e['signed'] else 'UNSIGNED'}) -> {Path(registry) / e['archive']}")
+        if not e["signed"]:
+            print("Users who require signatures will refuse it: sign it first with `aios skills sign`.")
+        return 0
+    if action == "install":
+        if not sk.NAME_RE.match(target.partition("@")[0]):
+            print(f"not a skill name: {target!r} (use name or name@version)")
+            return 2
+        try:
+            entry = sk.find(registry, target)
+        except sk.SkillError as e:
+            print(f"cannot install: {e}")
+            return 1
+        folder = base / "skills"
+        dest, tmp = folder / entry["name"], folder / f".install-{entry['name']}-{os.getpid()}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            sk.fetch(registry, entry, tmp)
+        except sk.SkillError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            print(f"cannot install: {e}")
+            return 1
+        print(f"downloaded {sk.label(entry['name'], entry['version'])} from {registry}; reviewing it before it is trusted")
+        code = skills_cmd("trust", str(tmp), home, force, yes, signers=signers, require_signed=require_signed,
+                          _use=str(dest))
+        if code:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return code
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        elif dest.exists():
+            shutil.rmtree(dest)
+        os.replace(tmp, dest)
+        return 0
     if action == "sign":
         if not key:
             print("usage: aios skills sign <folder> --key <ssh private key>")
@@ -2596,7 +2665,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     store.pin_skill(skill.name, skill.sha256, skill.version, forced=high, signer=signer)
     store.db.close()
     print(f"trusted {sk.label(skill.name, skill.version)} ({skill.sha256[:12]})"
-          + (f", signed by {signer}" if signer else "") + f". Use it with: chat --skill {target}")
+          + (f", signed by {signer}" if signer else "") + f". Use it with: chat --skill {_use or target}")
     return 0
 
 
@@ -2820,8 +2889,12 @@ def cli():
     c.add_argument("--skill", action="append", default=[], metavar="FOLDER",
                    help="load a skill folder you have pinned with `aios skills trust` (repeatable)")
     k_ = sub.add_parser("skills", help="review, pin and list skills (instruction packs)")
-    k_.add_argument("action", choices=["scan", "trust", "list", "untrust", "sign"])
-    k_.add_argument("target", nargs="?", help="skill folder (scan/trust/sign) or skill name (untrust)")
+    k_.add_argument("action", choices=["scan", "trust", "list", "untrust", "sign", "publish", "search", "install"])
+    k_.add_argument("target", nargs="?",
+                    help="skill folder (scan/trust/sign/publish), skill name (untrust), name[@version] (install) "
+                         "or search words")
+    k_.add_argument("--registry", help="registry folder or https:// URL (default: $AIOS_SKILL_REGISTRY); "
+                                       "install puts skills in <home>/skills/<name>")
     k_.add_argument("--key", help="sign: SSH private key (ed25519 recommended) to sign with")
     k_.add_argument("--signers", help="allowed-signers file (default: <home>/allowed_signers or $AIOS_SKILL_SIGNERS)")
     k_.add_argument("--require-signed", action="store_true",
@@ -2979,7 +3052,7 @@ def cli():
             ap.error(f"cannot listen on 127.0.0.1:{a.port}: {e}")
     if a.cmd == "skills":
         raise SystemExit(skills_cmd(a.action, a.target, a.home, a.force, a.yes, a.key, a.signers,
-                                    a.require_signed))
+                                    a.require_signed, a.registry))
     if a.cmd == "serve":
         policy = None
         if a.policy:
