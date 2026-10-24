@@ -33,7 +33,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
 - **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果。權限、審批、污染標記與審計和單次委派完全相同（見下方）。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
-- **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign`，可選的發布者簽章、`chat --skill <資料夾>`（見下）。
+- **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
@@ -186,7 +186,19 @@ python aios.py skills untrust meeting-notes
   ```
 
   `scan` 與 `trust` 會回報簽章狀態：有效（並顯示簽署者）、未簽章、簽署者不明、未檢查（沒有 `ssh-keygen` 或沒有簽署者清單），或**無效**。簽章無效一律不能信任。加上 `--require-signed` 時，只有允許的簽署者所簽的有效簽章才能通過。`skills list` 會顯示信任當下記錄的簽署者。簽章只說明來源，不代表安全：你仍要審查並確認。
-- **限制**：固定摘要證明內容就是*你審查過的那份*；簽章證明是誰發布的，但只限你選擇允許的金鑰。目前還沒有註冊表或金鑰發佈機制（P3）。掃描乾淨只是警報，不是保證。你信任的技能仍可能誤導模型：請實際讀過它。
+- **註冊中心**（選用）：註冊中心就是一個資料夾，裡面有 `index.json`，每個發布的版本一個 `.tar.gz`，所以任何靜態主機（GitHub Pages、儲存桶、共用資料夾）都能提供，不需要架伺服器：
+
+  ```bash
+  # 發布者：把（已簽章的）技能加進註冊中心資料夾，再上傳這個資料夾
+  python aios.py skills publish my-skill --registry ./registry
+  # 你：搜尋並安裝；和 `trust` 一樣要經過掃描、簽章檢查與輸入確認
+  python aios.py skills search notes --registry https://example.com/registry   # 或 AIOS_SKILL_REGISTRY
+  python aios.py skills install meeting-notes --require-signed                  # 或 meeting-notes@1.0.0
+  python aios.py chat --skill <home>/skills/meeting-notes
+  ```
+
+  `install` 先下載到暫存資料夾，比對壓縮檔的 SHA-256，以及技能名稱、版本和摘要是否與索引相符，再完全照 `trust` 的流程審查；只有你確認後才會取代 `<home>/skills/<名稱>` 和固定紀錄。已發布的名稱與版本不能用不同內容重新發布。壓縮檔只能包含一般檔案與單純的相對路徑，且受技能大小上限限制。遠端註冊中心必須用 `https://`（`http://` 只限 localhost）。索引本身沒有簽章：它幫你找到技能，也能抓出損壞或被調包的下載，但技能是誰發布的，只能由它的 `SKILL.sig` 與你允許的簽署者判斷，所以對不是你管理的註冊中心請加 `--require-signed`。
+- **限制**：固定摘要證明內容就是*你審查過的那份*；簽章證明是誰發布的，但只限你選擇允許的金鑰。金鑰要怎麼取得由你決定（沒有金鑰伺服器）；註冊中心收錄不代表背書。掃描乾淨只是警報，不是保證。你信任的技能仍可能誤導模型：請實際讀過它。
 
 ## 當作 MCP 伺服器使用
 
@@ -330,7 +342,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；尚未用真實客戶端試過） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話與串流）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
-| **P3 生態** | 第 6–9 月 | 簽章驗證的技能註冊中心（✅ 發布者簽章；註冊中心尚未）· 可選的託管版本 | 有外部貢獻者提交技能 |
+| **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`；尚未架設公開的註冊中心）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。

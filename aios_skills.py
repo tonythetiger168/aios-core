@@ -25,6 +25,12 @@ Publisher signatures (optional): `aios skills sign` writes SKILL.sig, an OpenSSH
 itself is left out of the digest. `scan`/`trust` check it against an allowed-signers file (the
 format git uses for SSH signing) and say who signed it. A signature tells you who published this
 exact content; it is not a review, so trusting still needs your confirmation.
+
+Registry (optional): a static folder or HTTPS site with index.json and one .tar.gz per published
+version. `publish` adds a skill to a registry folder; `search` and `install` read one. The index
+is not signed: it only helps you find a skill and catches corrupted downloads. Who published it is
+answered by SKILL.sig and your allowed signers, and installing still goes through the same scan,
+signature check and typed confirmation as `trust`.
 """
 import hashlib
 import os
@@ -369,3 +375,196 @@ def verify(skill: Skill, signers, keygen: str | None = None) -> tuple[str, str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         return "unavailable", f"ssh-keygen failed: {e}"
     return "invalid", "the signature does not match this content (changed after signing?)"
+
+
+# ---- registry: a static index.json plus archives, served from a folder or over HTTPS ----
+REGISTRY_FORMAT = "aios-skill-registry-1"
+INDEX_FILE = "index.json"
+MAX_ARCHIVE = 8_000_000
+MAX_INDEX = 4_000_000
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_ARCHIVE_RE = re.compile(r"^skills/[a-z0-9][a-z0-9_-]{0,63}/[A-Za-z0-9._+-]{1,120}\.tar\.gz$")
+
+
+def pack(path) -> bytes:
+    """A deterministic .tar.gz of the skill (its files plus SKILL.sig), the same bytes every time."""
+    import gzip
+    import io
+    import tarfile
+    skill = load(path)
+    files = _files(skill.path)
+    sig = skill.path / SIG_FILE
+    if sig.is_file() and not sig.is_symlink():
+        files.append(sig)
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for p in sorted(files, key=lambda p: p.relative_to(skill.path).as_posix()):
+            data = p.read_bytes()
+            info = tarfile.TarInfo(p.relative_to(skill.path).as_posix())
+            info.size, info.mode, info.mtime = len(data), 0o644, 0
+            tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue(), mtime=0)
+
+
+def unpack(data: bytes, dest) -> Path:
+    """Extract a skill archive into the new folder `dest`. Only plain files with plain relative
+    names are accepted (no links, devices, absolute paths or '..'), within the skill size limits."""
+    import io
+    import tarfile
+    dest = Path(dest)
+    dest.mkdir(parents=True)
+    count, total = 0, 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for m in tar:
+                name = m.name
+                parts = name.split("/")
+                if (not name or name.startswith("/") or "\\" in name or ":" in name
+                        or any(p in ("", ".", "..") for p in parts)):
+                    raise SkillError(f"archive has an unsafe path: {name[:100]!r}")
+                if m.isdir():
+                    continue
+                if not m.isreg():
+                    raise SkillError(f"archive may hold only plain files ({name[:100]})")
+                count, total = count + 1, total + m.size
+                if count > MAX_FILES + 1 or total > MAX_TOTAL_BYTES + SIG_MAX:
+                    raise SkillError("archive is larger than a skill may be")
+                out = dest.joinpath(*parts)
+                if out.exists():
+                    raise SkillError(f"archive lists {name[:100]} twice")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                f = tar.extractfile(m)
+                out.write_bytes(f.read(m.size))
+                if out.stat().st_size != m.size:
+                    raise SkillError(f"archive member {name[:100]} is truncated")
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise SkillError(f"not a valid skill archive: {e}") from None
+    return dest
+
+
+def _location(registry: str) -> tuple[str, str]:
+    """-> ('dir', path) or ('url', base URL ending in '/')."""
+    from urllib.parse import urlsplit
+    if not registry:
+        raise SkillError("no registry: pass --registry or set AIOS_SKILL_REGISTRY")
+    u = urlsplit(registry)
+    if u.scheme == "file":
+        from urllib.request import url2pathname
+        return "dir", url2pathname(u.path)
+    if u.scheme in ("http", "https"):
+        if u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise SkillError("a remote registry must use https:// (plain http only for localhost)")
+        return "url", registry if registry.endswith("/") else registry + "/"
+    if u.scheme and len(u.scheme) > 1:
+        raise SkillError(f"unsupported registry location: {registry}")
+    return "dir", registry
+
+
+def _get(registry: str, rel: str, limit: int) -> bytes:
+    kind, where = _location(registry)
+    if kind == "dir":
+        p = Path(where) / rel
+        try:
+            if p.stat().st_size > limit:
+                raise SkillError(f"{rel} is too large (max {limit} bytes)")
+            return p.read_bytes()
+        except OSError as e:
+            raise SkillError(f"cannot read {rel} from the registry: {e}") from None
+    from urllib.error import URLError
+    from urllib.parse import urljoin
+    from urllib.request import Request, urlopen
+    try:
+        with urlopen(Request(urljoin(where, rel), headers={"User-Agent": "aios-skills"}), timeout=30) as r:
+            data = r.read(limit + 1)
+    except (URLError, OSError, ValueError) as e:
+        raise SkillError(f"cannot fetch {rel} from the registry: {e}") from None
+    if len(data) > limit:
+        raise SkillError(f"{rel} is too large (max {limit} bytes)")
+    return data
+
+
+def _check_entry(e) -> dict:
+    if not isinstance(e, dict):
+        raise SkillError("registry index has a malformed entry")
+    out = {k: e.get(k) for k in ("name", "version", "description", "sha256", "archive", "archive_sha256", "signed")}
+    if not (isinstance(out["name"], str) and NAME_RE.match(out["name"])
+            and isinstance(out["version"], str) and len(out["version"]) <= 40
+            and isinstance(out["sha256"], str) and _HEX64.match(out["sha256"])
+            and isinstance(out["archive_sha256"], str) and _HEX64.match(out["archive_sha256"])
+            and isinstance(out["archive"], str) and _ARCHIVE_RE.match(out["archive"])
+            and ".." not in out["archive"]):
+        raise SkillError(f"registry index has a malformed entry ({str(e.get('name'))[:64]})")
+    out["description"] = out["description"] if isinstance(out["description"], str) else ""
+    out["signed"] = out["signed"] is True
+    return out
+
+
+def read_index(registry: str) -> list[dict]:
+    import json
+    try:
+        doc = json.loads(_get(registry, INDEX_FILE, MAX_INDEX).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise SkillError(f"registry index is not valid JSON: {e}") from None
+    if not isinstance(doc, dict) or doc.get("format") != REGISTRY_FORMAT or not isinstance(doc.get("skills"), list):
+        raise SkillError(f"not an aios skill registry (expected format {REGISTRY_FORMAT!r})")
+    return [_check_entry(e) for e in doc["skills"]]
+
+
+def search(registry: str, query: str = "") -> list[dict]:
+    """Newest entry per skill name, matching `query` in the name or description."""
+    latest = {}
+    for e in read_index(registry):
+        latest[e["name"]] = e  # later entries were published later
+    q = query.lower()
+    return [e for e in latest.values() if q in e["name"] or q in e["description"].lower()]
+
+
+def find(registry: str, spec: str) -> dict:
+    """`name` (newest published) or `name@version`."""
+    name, _, version = spec.partition("@")
+    hits = [e for e in read_index(registry) if e["name"] == name and (not version or e["version"] == version)]
+    if not hits:
+        raise SkillError(f"{spec} is not in the registry")
+    return hits[-1]
+
+
+def fetch(registry: str, entry: dict, dest) -> Skill:
+    """Download `entry`, check it against the index, unpack it into the new folder `dest`."""
+    data = _get(registry, entry["archive"], MAX_ARCHIVE)
+    if hashlib.sha256(data).hexdigest() != entry["archive_sha256"]:
+        raise SkillError("the archive does not match the registry index (corrupted or replaced)")
+    skill = load(unpack(data, dest))
+    if (skill.name, skill.version, skill.sha256) != (entry["name"], entry["version"], entry["sha256"]):
+        raise SkillError("the archive's content does not match what the registry index says it is")
+    return skill
+
+
+def publish(path, registry_dir) -> dict:
+    """Add the skill at `path` to the registry folder `registry_dir` (created if missing). A
+    published name and version is immutable: publishing it again with other content is refused."""
+    import json
+    skill = load(path)
+    reg = Path(registry_dir)
+    index = reg / INDEX_FILE
+    entries = read_index(str(reg)) if index.exists() else []
+    for e in entries:
+        if e["name"] == skill.name and e["version"] == skill.version:
+            if e["sha256"] == skill.sha256:
+                return e
+            raise SkillError(f"{label(skill.name, skill.version)} is already published with other content; "
+                             "bump the version")
+    data = pack(path)
+    rel = f"skills/{skill.name}/{skill.name}-{skill.version or skill.sha256[:12]}.tar.gz"
+    out = reg / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    entry = {"name": skill.name, "version": skill.version, "description": skill.description,
+             "sha256": skill.sha256, "archive": rel, "archive_sha256": hashlib.sha256(data).hexdigest(),
+             "signed": (skill.path / SIG_FILE).is_file()}
+    _check_entry(entry)
+    entries.append(entry)
+    tmp = index.with_name(INDEX_FILE + ".tmp")
+    tmp.write_text(json.dumps({"format": REGISTRY_FORMAT, "skills": entries}, indent=1, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, index)
+    return entry

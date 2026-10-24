@@ -33,7 +33,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
 - **Agent swarms**: hand hundreds of sub-tasks to helper agents at once with the `swarm` tool or `aios swarm`, under a worker pool, a process-wide limit on model calls in flight, a shared token/cost budget and per-task timeouts, optionally combined by a reducer agent. Same permissions, approvals, taint and audit as one delegation (see below).
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
-- **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign`, optional publisher signatures, `chat --skill <folder>` (see below).
+- **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign|publish|search|install`, optional publisher signatures, a static skill registry, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
@@ -186,7 +186,19 @@ python aios.py skills untrust meeting-notes
   ```
 
   `scan` and `trust` report the signature as valid (and who signed), unsigned, unknown signer, not checked (no `ssh-keygen` or no signers file), or **invalid**. An invalid signature always blocks `trust`. With `--require-signed`, anything other than a valid signature from an allowed signer is refused. `skills list` shows the signer recorded at trust time. A signature is about origin, not safety: you still review and confirm.
-- **Limits**: pinning proves the content is what *you reviewed*; a signature proves who published it, but only for keys you chose to allow. There is no registry or key distribution yet (P3). A clean scan is a tripwire, not proof. A skill you trust can still mislead the model: read it.
+- **Registry** (optional): a registry is just a folder with `index.json` and one `.tar.gz` per published version, so any static host (GitHub Pages, a bucket, a file share) can serve it. No server to run:
+
+  ```bash
+  # publisher: add a (signed) skill to a registry folder, then upload the folder
+  python aios.py skills publish my-skill --registry ./registry
+  # you: find and install; same scan, signature check and typed confirmation as `trust`
+  python aios.py skills search notes --registry https://example.com/registry   # or AIOS_SKILL_REGISTRY
+  python aios.py skills install meeting-notes --require-signed                  # or meeting-notes@1.0.0
+  python aios.py chat --skill <home>/skills/meeting-notes
+  ```
+
+  `install` downloads to a temporary folder, checks the archive's SHA-256 and the skill's name, version and digest against the index, then reviews it exactly like `trust`; only if you confirm does it replace `<home>/skills/<name>` and the pin. A published name and version cannot be republished with other content. Archives may hold only plain files with plain relative paths, within the skill size limits. Remote registries must use `https://` (plain `http://` only for localhost). The index is not signed: it helps you find skills and catches corrupted or swapped downloads, but who published a skill is answered only by its `SKILL.sig` and your allowed signers, so use `--require-signed` for registries you do not control.
+- **Limits**: pinning proves the content is what *you reviewed*; a signature proves who published it, but only for keys you chose to allow. Key distribution is up to you (there is no key server); a registry entry is not an endorsement. A clean scan is a tripwire, not proof. A skill you trust can still mislead the model: read it.
 
 ## Use it as an MCP server
 
@@ -330,7 +342,7 @@ Months are relative estimates (month 1 = project start) and will move.
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
 | **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn and streaming) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
-| **P3 Ecosystem** | months 6–9 | Signed skill registry (✅ publisher signatures; registry not yet) · optional hosted version | External contributors ship skills |
+| **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`; no public registry hosted yet) · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
 Explicit non-goal for now: writing an actual OS kernel.
