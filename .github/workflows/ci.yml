@@ -158,6 +158,7 @@ jobs:
           echo "$FC_SHA256  $RUNNER_TEMP/fc.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/fc.tgz" -C "$RUNNER_TEMP"
           install -m 0755 "$RUNNER_TEMP/release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64" "$d/firecracker"
+          install -m 0755 "$RUNNER_TEMP/release-$FC_VERSION-x86_64/jailer-$FC_VERSION-x86_64" "$d/jailer"
           curl -fsSL -o "$d/vmlinux" "https://s3.amazonaws.com/spec.ccfc.min/$KERNEL_KEY"
           echo "$KERNEL_SHA256  $d/vmlinux" | sha256sum -c -
           docker pull python:3.12-slim
@@ -173,6 +174,8 @@ jobs:
             sha256sum "$AIOS_MICROVM_DIR"/firecracker "$AIOS_MICROVM_DIR"/vmlinux "$AIOS_MICROVM_DIR"/rootfs.ext4
             docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
             python -m unittest tests.test_microvm -v 2>&1
+            echo "--- jailed (as root, AIOS_MICROVM_JAILER=1)"
+            sudo -E env "PATH=$PATH" AIOS_MICROVM_JAILER=1 python -m unittest tests.test_microvm -v 2>&1
           } 2>&1 | tee microvm-evidence.txt
       - uses: actions/upload-artifact@v4
         if: always()
