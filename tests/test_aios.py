@@ -1267,13 +1267,16 @@ else:
 
 class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        aios.DockerSandbox.unknown.clear()
+        self.addCleanup(aios.DockerSandbox.unknown.clear)
         aios.DockerSandbox.unavailable.cache_clear()
         self.addCleanup(aios.DockerSandbox.unavailable.cache_clear)
 
     def test_command_isolates_the_container(self):
         cmd = aios.DockerSandbox(mem_mb=128, pids=32).command("aios-sbx-x")
         joined = " ".join(cmd)
-        for flag in ("create", "--rm", "--cpus 1.0", "--tmpfs /tmp:rw,nosuid,nodev,size=16m", "--network none", "--read-only", "--cap-drop ALL", "--pull never",
+        self.assertNotIn("--rm", cmd)  # kept until cleanup, so an OOM kill can be read back
+        for flag in ("create", "--cpus 1.0", "--tmpfs /tmp:rw,nosuid,nodev,size=16m", "--network none", "--read-only", "--cap-drop ALL", "--pull never",
                      "--security-opt no-new-privileges", "--user 65534:65534", "--memory 128m",
                      "--memory-swap 128m", "--pids-limit 32", "--name aios-sbx-x"):
             self.assertIn(flag, joined)
@@ -1464,6 +1467,60 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 await box.run_python('print(42)')
             cleanup.assert_awaited_once()
 
+    async def test_oom_kill_is_identified(self):
+        box = aios.DockerSandbox(mem_mb=64)
+
+        async def invoke(args, *a, **kw):
+            if args[1] == 'create':
+                return 0, 'id'
+            if args[1] == 'start':
+                return 137, 'partial output'
+            if args[1:3] == ['container', 'inspect']:
+                return 0, 'true\n' if oom else 'false\n'
+            return 0, ''
+
+        for oom, want in ((True, 'killed: out of memory (64 MiB limit)\npartial output'),
+                          (False, 'exit=137\npartial output')):
+            with self.subTest(oom=oom), mock.patch.object(box, '_invoke', side_effect=invoke), \
+                    mock.patch.object(box, '_cleanup'):
+                self.assertEqual(await box.run_python('x'), want)
+
+    async def test_unknown_creates_are_reconciled_on_later_calls(self):
+        box = aios.DockerSandbox()
+        with mock.patch.object(box, '_invoke', side_effect=asyncio.TimeoutError), \
+                mock.patch.object(box, '_cleanup'):
+            with self.assertRaises(RuntimeError):
+                await box.run_python('print(1)')
+        (late,) = aios.DockerSandbox.unknown
+        calls = []
+
+        async def invoke(args, *a, **kw):
+            calls.append(args[1:])
+            if args[1] == 'rm':
+                return 0, late  # the daemon did create it after all
+            return (0, 'id') if args[1] == 'create' else (0, 'ok')
+
+        err = io.StringIO()
+        with mock.patch.object(box, '_invoke', side_effect=invoke), mock.patch.object(box, '_cleanup'), \
+                contextlib.redirect_stderr(err):
+            await box.run_python('print(1)')
+        self.assertEqual(calls[0], ['rm', '--force', late])  # exact name, before this call's create
+        self.assertIn(f'removed {late}', err.getvalue())
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+
+    async def test_reconciliation_gives_up_after_its_window(self):
+        box = aios.DockerSandbox()
+        aios.DockerSandbox.unknown['aios-sbx-old'] = asyncio.get_running_loop().time() - 10_000
+        with mock.patch.object(box, '_invoke', return_value=(1, 'No such container')), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            await box._reconcile()
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+        self.assertIn('stopped watching aios-sbx-old', err.getvalue())
+        aios.DockerSandbox.unknown['aios-sbx-new'] = asyncio.get_running_loop().time()
+        with mock.patch.object(box, '_invoke', return_value=(1, 'No such container')):
+            await box._reconcile()
+        self.assertIn('aios-sbx-new', aios.DockerSandbox.unknown)  # still inside the window
+
     async def test_create_failure_never_starts_code(self):
         box = aios.DockerSandbox()
         with mock.patch.object(box, '_invoke', return_value=(125, 'image missing')) as invoke, \
@@ -1555,6 +1612,72 @@ class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.strip(), "exit=0\npinned")
         wrong = pinned.split("@")[0] + "@sha256:" + "0" * 64
         self.assertIn("not present", aios.DockerSandbox.unavailable(wrong))  # never pulled, never run
+
+    async def test_effective_cgroup_limits(self):
+        box = aios.DockerSandbox(timeout=20, mem_mb=96, cpus=0.5, pids=32)
+        out = await box.run_python(
+            "import json, os\n"
+            "def read(n):\n"
+            "    try: return open('/sys/fs/cgroup/' + n).read().strip()\n"
+            "    except OSError: return None\n"
+            "print(json.dumps({k: read(k) for k in ('memory.max', 'memory.swap.max', 'pids.max', 'cpu.max')}))\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        got = json.loads(out.split("\n", 1)[1])
+        if got["memory.max"] is None:
+            self.skipTest("not cgroup v2: limits are not readable from inside the container")
+        self.assertEqual(got["memory.max"], str(96 * 1024 * 1024))
+        self.assertEqual(got["memory.swap.max"], "0")  # --memory-swap equal to --memory: no swap
+        self.assertEqual(got["pids.max"], "32")
+        quota, period = got["cpu.max"].split()
+        self.assertAlmostEqual(int(quota) / int(period), 0.5, places=2)
+
+    async def test_pid_limit_is_enforced(self):
+        out = await aios.DockerSandbox(timeout=20, pids=16).run_python(
+            "import os, time\nn = 0\n"
+            "for _ in range(64):\n"
+            "    try:\n        pid = os.fork()\n"
+            "    except OSError:\n        break\n"
+            "    if pid == 0:\n        time.sleep(5); os._exit(0)\n"
+            "    n += 1\n"
+            "print('forked', n)\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        self.assertLess(int(out.split()[-1]), 16)
+
+    async def test_cpu_quota_is_enforced(self):
+        out = await aios.DockerSandbox(timeout=30, cpus=0.5).run_python(
+            "import os, time\nkids = []\n"
+            "for _ in range(2):\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        end = time.time() + 2\n"
+            "        while time.time() < end: pass\n"
+            "        os._exit(0)\n"
+            "    kids.append(pid)\n"
+            "t = time.time()\n"
+            "for k in kids: os.waitpid(k, 0)\n"
+            "c = os.times()\n"
+            "print((c.children_user + c.children_system) / max(time.time() - t, 0.1))\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        self.assertLess(float(out.split()[-1]), 0.8)  # two busy processes share half a CPU
+
+    async def test_memory_kill_is_identified_as_oom(self):
+        out = await aios.DockerSandbox(timeout=30, mem_mb=64).run_python(
+            "chunks = []\n"
+            "for _ in range(64):\n"
+            "    chunks.append(b'x' * (8 * 1024 * 1024))\n"  # written, so really resident
+            "print('not killed')\n")
+        self.assertTrue(out.startswith("killed: out of memory (64 MiB limit)"), out)
+
+    async def test_concurrent_calls_are_separate_and_cleaned_up(self):
+        outs = await asyncio.gather(*(self.box.run_python("import os; print(os.uname().nodename)")
+                                      for _ in range(3)))
+        ids = [o.split()[-1] for o in outs]
+        self.assertTrue(all(o.startswith("exit=0") for o in outs), outs)
+        self.assertEqual(len(set(ids)), 3)  # three containers
+        for cid in ids:  # each exact container is gone
+            r = subprocess.run(["docker", "ps", "-aq", "--no-trunc", "--filter", f"id={cid}"],
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.strip(), "", cid)
 
     async def test_memory_cap(self):
         out = await aios.DockerSandbox(timeout=20, mem_mb=64).run_python("x = bytearray(512 * 1024 * 1024)")
