@@ -19,9 +19,10 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
 - **Images and PDFs (multimodal input)**: attach a picture or PDF to your next chat message with `/attach <file>` (`/attach` lists, `/detach` drops), or let the agent look at one in the workspace with `view_file`. Images that MCP tools return (screenshots from a browser server, for example) reach the model as images instead of being dropped. PNG, JPEG, GIF and WebP up to 5 MB, PDFs up to 20 MB; the type is read from the file's bytes, not its name. Only the newest 4 images/PDFs stay in an agent's history (older ones become a short note), so a long chat does not resend every picture on every step. With `--provider openai`, images are sent as `image_url` parts (needs a vision model) and PDFs are replaced by a note. An attached file counts as untrusted content like a file the agent read: a picture or a PDF can carry written instructions.
-- **Sandboxed code execution** (`run_python`), two backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
+- **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (default on Linux/macOS): separate process, CPU/memory/file-size limits, no network (Linux with unprivileged user namespaces).
   - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform. Only Ubuntu has real-Docker CI coverage so far. The image is never pulled for you: run `docker pull python:3.12-slim` once. On Windows `auto` picks it when it is ready; otherwise `run_python` is off there.
+  - `microvm` (experimental, Linux with KVM): a fresh [Firecracker](https://firecracker-microvm.github.io/) microVM per call with its own kernel, no network device, nothing from your machine except the code, a read-only root and an unprivileged user. Only chosen explicitly, never by `auto`, and AIOS refuses to start if KVM, Firecracker or the images are missing. Setup and threat model: [docs/microvm-sandbox.md](docs/microvm-sandbox.md).
 - **MCP client**: attach stdio MCP servers; their tools are registered as `<server>__<tool>` and are *not* granted to agents unless you allow them.
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
 - **Budgets**: per-run limits on model calls (`--max-steps`), tokens (`--max-tokens`) and cost (`--max-cost` with `--price-in/--price-out`). A run that hits a limit stops *before* running more tools and says why. Each run's usage is written to the audit log.
@@ -29,9 +30,10 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Untrusted-content tagging + taint policy**: output of `read_file`, `view_file`, `list_files`, `run_python` and every MCP tool, and every file you `/attach`, is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
 - **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Argument rules (`args`) allow or deny values of any argument with glob patterns and a length cap, so MCP tools are no longer all-or-nothing (for example a fetch tool limited to `https://docs.python.org/*`), and `auto_args` skips the prompt for pre-approved values the same way `auto_paths` does for paths. Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
-- **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
+- **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy, with a heartbeat and a rule-based watchdog (`aios status`, `aios alerts`; see below).
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
-- **Skills with digest pinning and a scanner**: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
+- **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
+- **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
@@ -116,9 +118,27 @@ curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <secret
 - The listener runs nothing itself: each request becomes one run on the next tick, under the job's policy, caps and daily limit. The body reaches the model **tagged as untrusted data** and the run is *tainted* from the start, so `auto_paths` stop applying (unless `auto_when_tainted`). An empty body is just a ping and does not taint. The body is deleted after the run.
 - To receive webhooks from the internet, put your own HTTPS reverse proxy or tunnel in front and keep the secret private; aios does not do TLS.
 
+**Watchdog and status.** Nobody watches an unattended run live, so the daemon watches its own log. On every tick it writes a heartbeat and checks the audit log and job runs against fixed rules; no model is involved, because a model reading the log would read attacker-written text.
+
+```bash
+python aios.py status --home ~/aios-data     # daemon alive or down, open alerts, approvals waiting; exit 1 = look
+python aios.py alerts --home ~/aios-data     # open alerts; --ack <id>|all, --all, --check (run the rules now)
+```
+
+| Rule | Severity | Raised when (last 15 minutes) |
+|---|---|---|
+| `tainted-refused` | critical | a risky call was refused because the run had read untrusted content: what a prompt injection trying to act looks like |
+| `unattended-refused` | warning | a job tried a risky call its policy does not pre-allow |
+| `refusal-spike` | warning | one agent was refused 10 or more times |
+| `budget-stop` | info | a run stopped on its token or cost budget |
+| `job-failing` | warning | a job's last 3 runs ended in error or timeout |
+
+- Alerts go to the daemon's stderr, `aios status`, `aios alerts` and the console's overview. The same rule for the same agent is not repeated within an hour. Alerts only report; they never stop, block or change anything.
+- "Down" means no heartbeat for longer than 3 ticks plus one job timeout (at least 2 minutes), so a long job does not look like a dead daemon. Put `aios status` in cron or a monitoring check to be told when the daemon dies.
+
 ## Skills
 
-A skill is a folder with `skill.toml` (name, version) and `SKILL.md` (instructions for the agent). aios **never runs code inside a skill**; it only reads `SKILL.md`. Because those instructions go into the system prompt, a skill is a prompt-injection channel, so you review it and **pin its digest** first:
+A skill is a folder in the open [Agent Skills](https://agentskills.io) format: `SKILL.md` with `name` and `description` front matter, followed by the instructions for the agent, so skills written for Claude, Codex, Gemini CLI or Copilot (for example [anthropics/skills](https://github.com/anthropics/skills)) load as they are. `skill.toml` (name, version, description) is optional; when present it wins, and a different `name` in the front matter is refused. Only the text after the front matter goes into the prompt. aios **never runs code inside a skill**; it only reads `SKILL.md`. Because those instructions go into the system prompt, a skill is a prompt-injection channel, so you review it and **pin its digest** first:
 
 ```bash
 python aios.py skills scan examples/skills/meeting-notes     # tripwire scan + digest
@@ -163,6 +183,22 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
 - **Status**: written against the MCP SDK's low-level server API and tested only against a stand-in, not a real client. If your client does not connect or lists no tools, please open an issue with the stderr output.
 
+## Talk to other agents (A2A)
+
+[A2A](https://a2a-protocol.org) lets agents from different vendors call each other. aios speaks both versions in use, 1.0 and 0.3 (JSON-RPC), and was checked against the official `a2a-sdk` in both directions.
+
+```bash
+# offer one of your agents to others (prints a token; or set AIOS_A2A_TOKEN)
+python aios.py a2a-serve --agent researcher --policy policy.example.toml --port 8770 --description "Finds facts in my notes"
+
+# call a remote agent as the tool a2a__research (its token, if it needs one, from $AIOS_A2A_TOKEN_RESEARCH)
+AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.0.1:8770
+```
+
+- **Serving**: listens on 127.0.0.1; every call needs the token (the agent card at `/.well-known/agent-card.json` is public and only names the agent). The caller is **not trusted**: each request is a fresh run of that policy agent with its own permissions and a capped budget (50,000 tokens by default), starts *tainted* so `auto_paths`/`auto_args` never apply, keeps no history between requests, and is audited. Nobody can approve risky calls, so a served agent should be read-only or tightly scoped.
+- **Calling**: `--a2a NAME=URL` (in `chat` and `daemon`) makes the tool `a2a__NAME`. Grant it per agent like any tool. It sends your text to another machine, so every call needs approval (in `daemon`: refused unless a scope pre-allows it with `auto_args`, or you answer it with `--approvals console`), and the answer comes back tagged untrusted. A token is never sent over plain `http` to anything but this machine, and calls always go to the URL you gave, not to a URL the remote card names.
+- Not supported yet: streaming, push notifications, files, and multi-turn conversations (each request stands alone).
+
 ## Architecture
 
 ```
@@ -180,7 +216,7 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 | `read_file` / `write_file` / `list_files` | Workspace-only file access |
 | `view_file` | Look at an image (PNG, JPEG, GIF, WebP) or PDF in the workspace |
 | `remember` / `recall` / `list_facts` | Per-agent long-term memory |
-| `run_python` | Sandboxed Python (`--sandbox process` or `docker`) |
+| `run_python` | Sandboxed Python (`--sandbox process`, `docker` or `microvm`) |
 
 ## Security status
 
@@ -188,13 +224,13 @@ Honest list of what this does **not** do yet:
 
 - **Prompt-injection defense is partial.** Tagging only asks the model to behave; the real protection is the taint policy plus scopes, which stop a *hijacked* model from acting without a person. It does **not** stop a person who types `y` without reading the prompt, content that merely misleads the answer (no tool involved), or a malicious tool that lies. Our suite models the worst case (a model that obeys every injected instruction); real models vary and we have not measured them yet.
 - Argument rules are glob patterns on the text of top-level arguments, not a parser: `*` also matches `/`, so write `https://host/*` rather than `https://host*` (which matches `https://host.evil.com`). They check what the tool is asked to do, not what it really does (a fetch can still follow a redirect). `allow` is case-sensitive, `deny` ignores case. There is still no network-level egress control.
-- Scheduled jobs are the riskiest way to run an agent: unattended, so nobody notices odd behavior live. Keep job permissions read-only where you can, scope writes to one output folder, and read `aios audit` now and then. `auto_when_tainted` trades safety for usefulness on purpose. Times are local wall-clock time (a daily job can shift by an hour once at a daylight-saving change). The daemon is one process: if it dies, jobs stop until you restart it.
+- Scheduled jobs are the riskiest way to run an agent: unattended, so nobody notices odd behavior live. Keep job permissions read-only where you can, scope writes to one output folder, and read `aios audit` now and then. `auto_when_tainted` trades safety for usefulness on purpose. Times are local wall-clock time (a daily job can shift by an hour once at a daylight-saving change). The daemon is one process: if it dies, jobs stop until you restart it; `aios status` tells you it is down, but nothing restarts it for you yet.
 - Memory search covers the saved notes only (not chat history). Vector search sends each note's text to the embedding server you configure: use a local one for private notes. It has been tested against a stand-in server, not yet a real Ollama or OpenAI endpoint; keyword search needs no setup.
 - Skills are trusted by **content you reviewed**, not by author. The scanner catches obvious tricks and nothing subtle, and a skill you trust can still steer the model. Treat `--force` as "I read every line".
 - `serve` cannot ask over stdio (it is the protocol channel). Use `--approvals console`, pre-allow paths with `auto_paths` (or argument values with `auto_args`) or leave risky tools off. The session taint lasts until the server restarts.
 - The audit log records actions but is not tamper-proof: anyone with write access to `aios.db` can edit it.
 - The console link is a password while the console runs: anyone who has it (or the browser cookie it sets) can read your log and notes, and with `--approve` answer approval requests. A new one is made each start. It does not protect against other software running as your own user, which can read `aios.db` directly anyway.
-- **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
+- **The `process` sandbox is not a full security boundary.** It requests resource limits and, where available, a Linux network namespace, but code can still read files its user can read, and process count is unlimited. For untrusted code use `--sandbox docker`. A container shares the Docker host kernel: a kernel or Docker escape bug can break isolation. Docker Desktop adds its own VM, but this backend does not implement microVM isolation; for that use `--sandbox microvm` on Linux with KVM. Each call creates then attaches to a container, with no extra Python packages installed by AIOS. Treat the image, Docker CLI, daemon and selected Docker context as trusted.
 - Docker output is drained in bounded chunks; at most 10,000 UTF-8 bytes are retained by default. Timeout/cancellation triggers bounded container kill, force removal and an absence check. Cleanup failure is reported, not treated as a confirmed kill. A create timeout has an unknown outcome: a delayed daemon operation may still create a container; check the named container on that daemon. See [validation scope](docs/docker-sandbox-validation.md).
 - **Windows**: without Docker, `run_python` is disabled (timeout-only isolation is not safe). Use `--sandbox docker`, or set `AIOS_ALLOW_WEAK_SANDBOX=1` to enable the weak one at your own risk.
 - Treat MCP servers as untrusted code and untrusted data sources; grant them per agent explicitly.
@@ -226,7 +262,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning and scanning (publisher signatures wait for the P3 registry) · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; not yet tried with a real client) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`; the A2A network protocol not yet) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker; microVM not yet) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · 🧪 Firecracker microVM, verified only in its own CI job) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | Signed skill registry · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
