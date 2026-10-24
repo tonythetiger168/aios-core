@@ -29,7 +29,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Untrusted-content tagging + taint policy**: output of `read_file`, `list_files`, `run_python` and every MCP tool is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
 - **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Argument rules (`args`) allow or deny values of any argument with glob patterns and a length cap, so MCP tools are no longer all-or-nothing (for example a fetch tool limited to `https://docs.python.org/*`), and `auto_args` skips the prompt for pre-approved values the same way `auto_paths` does for paths. Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
-- **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy (see below).
+- **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy, with a heartbeat and a rule-based watchdog (`aios status`, `aios alerts`; see below).
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust`, `chat --skill <folder>` (see below).
@@ -115,6 +115,24 @@ curl -X POST http://127.0.0.1:8766/hook/triage -H "Authorization: Bearer <secret
 - The listener binds 127.0.0.1 only and accepts `POST /hook/<job>` with the job's own secret (only its hash is stored; `aios jobs secret <job>` makes a new one). A wrong secret and an unknown job get the same 401, so names cannot be probed. Bodies are capped at 64 KB, and at most 20 requests wait per job (then 429).
 - The listener runs nothing itself: each request becomes one run on the next tick, under the job's policy, caps and daily limit. The body reaches the model **tagged as untrusted data** and the run is *tainted* from the start, so `auto_paths` stop applying (unless `auto_when_tainted`). An empty body is just a ping and does not taint. The body is deleted after the run.
 - To receive webhooks from the internet, put your own HTTPS reverse proxy or tunnel in front and keep the secret private; aios does not do TLS.
+
+**Watchdog and status.** Nobody watches an unattended run live, so the daemon watches its own log. On every tick it writes a heartbeat and checks the audit log and job runs against fixed rules; no model is involved, because a model reading the log would read attacker-written text.
+
+```bash
+python aios.py status --home ~/aios-data     # daemon alive or down, open alerts, approvals waiting; exit 1 = look
+python aios.py alerts --home ~/aios-data     # open alerts; --ack <id>|all, --all, --check (run the rules now)
+```
+
+| Rule | Severity | Raised when (last 15 minutes) |
+|---|---|---|
+| `tainted-refused` | critical | a risky call was refused because the run had read untrusted content: what a prompt injection trying to act looks like |
+| `unattended-refused` | warning | a job tried a risky call its policy does not pre-allow |
+| `refusal-spike` | warning | one agent was refused 10 or more times |
+| `budget-stop` | info | a run stopped on its token or cost budget |
+| `job-failing` | warning | a job's last 3 runs ended in error or timeout |
+
+- Alerts go to the daemon's stderr, `aios status`, `aios alerts` and the console's overview. The same rule for the same agent is not repeated within an hour. Alerts only report; they never stop, block or change anything.
+- "Down" means no heartbeat for longer than 3 ticks plus one job timeout (at least 2 minutes), so a long job does not look like a dead daemon. Put `aios status` in cron or a monitoring check to be told when the daemon dies.
 
 ## Skills
 
@@ -203,7 +221,7 @@ Honest list of what this does **not** do yet:
 
 - **Prompt-injection defense is partial.** Tagging only asks the model to behave; the real protection is the taint policy plus scopes, which stop a *hijacked* model from acting without a person. It does **not** stop a person who types `y` without reading the prompt, content that merely misleads the answer (no tool involved), or a malicious tool that lies. Our suite models the worst case (a model that obeys every injected instruction); real models vary and we have not measured them yet.
 - Argument rules are glob patterns on the text of top-level arguments, not a parser: `*` also matches `/`, so write `https://host/*` rather than `https://host*` (which matches `https://host.evil.com`). They check what the tool is asked to do, not what it really does (a fetch can still follow a redirect). `allow` is case-sensitive, `deny` ignores case. There is still no network-level egress control.
-- Scheduled jobs are the riskiest way to run an agent: unattended, so nobody notices odd behavior live. Keep job permissions read-only where you can, scope writes to one output folder, and read `aios audit` now and then. `auto_when_tainted` trades safety for usefulness on purpose. Times are local wall-clock time (a daily job can shift by an hour once at a daylight-saving change). The daemon is one process: if it dies, jobs stop until you restart it.
+- Scheduled jobs are the riskiest way to run an agent: unattended, so nobody notices odd behavior live. Keep job permissions read-only where you can, scope writes to one output folder, and read `aios audit` now and then. `auto_when_tainted` trades safety for usefulness on purpose. Times are local wall-clock time (a daily job can shift by an hour once at a daylight-saving change). The daemon is one process: if it dies, jobs stop until you restart it; `aios status` tells you it is down, but nothing restarts it for you yet.
 - Memory search covers the saved notes only (not chat history). Vector search sends each note's text to the embedding server you configure: use a local one for private notes. It has been tested against a stand-in server, not yet a real Ollama or OpenAI endpoint; keyword search needs no setup.
 - Skills are trusted by **content you reviewed**, not by author. The scanner catches obvious tricks and nothing subtle, and a skill you trust can still steer the model. Treat `--force` as "I read every line".
 - `serve` cannot ask over stdio (it is the protocol channel). Use `--approvals console`, pre-allow paths with `auto_paths` (or argument values with `auto_args`) or leave risky tools off. The session taint lasts until the server restarts.
