@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
 import textwrap
@@ -382,19 +383,24 @@ class RealJailedMicroVMTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.assertIsNotNone(pid, "no running VMM found")
         status = dict(l.split(":", 1) for l in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in l)
-        root = os.readlink(f"/proc/{pid}/root")
+        # The jailer pivot_roots in a new mount namespace, so from here /proc/PID/root reads "/":
+        # look through it instead, and find the jail id from the VMM's cgroup.
+        own_mounts = os.stat(f"/proc/{pid}/ns/mnt").st_ino != os.stat("/proc/self/ns/mnt").st_ino
+        visible = set(os.listdir(f"/proc/{pid}/root"))
         cgroup = Path(f"/proc/{pid}/cgroup").read_text()
         out = await run
         self.assertEqual(out, "exit=0\ndone\n")
         self.assertEqual(status["Uid"].split()[:2], ["65534", "65534"])
         self.assertEqual(status["Gid"].split()[:2], ["65534", "65534"])
         self.assertEqual(int(status["CapEff"], 16), 0)
-        jail = Path(root)
-        self.assertEqual(jail.name, "root")
-        self.assertEqual(jail.parent.parent.parent, aios.MicroVMSandbox.paths()["jails"])
-        self.assertIn(f"firecracker/{jail.parent.name}", cgroup)
-        self.assertFalse(jail.parent.exists())  # removed after the call
-        self.assertFalse(Path(f"/sys/fs/cgroup/firecracker/{jail.parent.name}").exists())
+        self.assertTrue(own_mounts)
+        self.assertIn("vmlinux", visible)
+        self.assertFalse(visible & {"etc", "home", "usr", "proc"}, visible)  # none of the host's files
+        jail_id = re.search(r"firecracker/(aios-mvm-[0-9a-f]{16})", cgroup)
+        self.assertIsNotNone(jail_id, cgroup)
+        jail = aios.MicroVMSandbox.paths()["jails"] / "firecracker" / jail_id[1]
+        self.assertFalse(jail.exists())  # removed after the call
+        self.assertFalse(Path(f"/sys/fs/cgroup/firecracker/{jail_id[1]}").exists())
         self.assertIsNone(self.vmm())
 
     async def test_the_guest_sandbox_still_holds(self):
