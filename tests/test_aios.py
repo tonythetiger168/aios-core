@@ -1432,6 +1432,43 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(prof.index("(deny file-read*"), prof.index("(allow file-read*"))
         self.assertIn(json.dumps(os.path.realpath(str(aios.WORKSPACE))), prof)
 
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(),
+                         "needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
+    def test_a_confined_mcp_server_keeps_the_network_but_not_your_files(self):
+        import socket
+        import subprocess
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as prog:
+            Path(outside, "secret.txt").write_text("key", encoding="utf-8")
+            server = Path(prog, "server.py")
+            server.write_text("\n".join([
+                "import os, socket, sys",
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(Path(outside, 'secret.txt'))!r}).read()))",
+                f"print(try_(lambda: open({str(Path(outside, 'new.txt'))!r}, 'w')))",
+                "print(try_(lambda: open(os.path.join(sys.argv[1], 'state.txt'), 'w').write('ok')))",
+                "print(try_(lambda: open(__file__).read()[:6]))",  # its own program
+                f"print(try_(lambda: socket.create_connection(('127.0.0.1', {srv.getsockname()[1]})) and 'net'))",
+            ]), encoding="utf-8")
+            argv = aios.confine_command(sys.executable, [str(server), state], state)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        srv.close()
+        self.assertEqual(r.stdout.splitlines(), ["PermissionError", "PermissionError", "2", "import", "net"],
+                         r.stderr)
+
+    def test_confining_an_mcp_server_refuses_where_it_cannot(self):
+        with mock.patch.object(aios, "landlock_abi", return_value=0), \
+                mock.patch.object(aios, "seatbelt_ok", return_value=False):
+            with self.assertRaises(RuntimeError):
+                aios.confine_command(sys.executable, [], tempfile.gettempdir())
+
     def test_landlock_failure_is_fatal_not_ignored(self):
         if not aios.landlock_abi():
             self.skipTest("needs Landlock")

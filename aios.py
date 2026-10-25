@@ -725,12 +725,19 @@ class Kernel:
         # this many requests at once (the rest queue here, not at the provider's rate limiter).
         self.model_slots = asyncio.Semaphore(model_slots or MODEL_SLOTS)
 
-    async def connect_mcp(self, server: str, command: str, args=(), env=None) -> list[str]:
+    async def connect_mcp(self, server: str, command: str, args=(), env=None, confine=False) -> list[str]:
         """Start an MCP server (stdio) and register its tools as '<server>__<tool>'.
-        Agents must be granted them explicitly, e.g. permissions={'<server>__*'}."""
+        Agents must be granted them explicitly, e.g. permissions={'<server>__*'}.
+        confine: run it under confine_command (no access to your files; HOME and TMPDIR point to a
+        throwaway folder that is deleted when the kernel closes)."""
         from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        from mcp.client.stdio import get_default_environment, stdio_client
 
+        if confine:
+            state = tempfile.mkdtemp(prefix="aios-mcp-" + re.sub(r"[^\w-]", "_", server) + "-")
+            self._stack.callback(shutil.rmtree, state, ignore_errors=True)
+            command, *args = confine_command(command, list(args), state)
+            env = {**(env or get_default_environment()), "HOME": state, "TMPDIR": state}
         params = StdioServerParameters(command=command, args=list(args), env=env)
         read, write = await self._stack.enter_async_context(stdio_client(params))
         session = await self._stack.enter_async_context(ClientSession(read, write))
@@ -1009,7 +1016,8 @@ def _user_tasks() -> int | None:
 
 # First code in a process-sandbox child (Linux): confines it with Landlock, which survives exec,
 # then execs the real run. Files: read-only for argv[1]["ro"], full access for argv[1]["rw"], nothing
-# else. Also no TCP bind/connect (Landlock ABI 4+) and no signals or abstract unix sockets to
+# else; argv[1]["exec"], if set, is the program to exec instead. Also no TCP bind/connect (ABI 4+;
+# argv[1]["net"] = true keeps it) and no signals or abstract unix sockets to
 # processes outside (ABI 6+). Without Landlock in the kernel it runs the code unconfined; the
 # parent knows that from landlock_abi() and says so. A failure to apply it is fatal, not ignored.
 LANDLOCK_BOOT = """\
@@ -1022,7 +1030,7 @@ def fail(what):
 abi = libc.syscall(444, None, ctypes.c_size_t(0), ctypes.c_uint32(1))
 if abi >= 1:
     fs = (1 << 13) - 1 | (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0)
-    attr = (ctypes.c_uint64 * 3)(fs, 3 if abi >= 4 else 0, 3 if abi >= 6 else 0)
+    attr = (ctypes.c_uint64 * 3)(fs, 3 if abi >= 4 and not cfg.get("net") else 0, 3 if abi >= 6 else 0)
     rs = libc.syscall(444, attr, ctypes.c_size_t(8 if abi < 4 else 16 if abi < 6 else 24), ctypes.c_uint32(0))
     if rs < 0:
         fail("landlock_create_ruleset")
@@ -1044,7 +1052,8 @@ if abi >= 1:
     if libc.syscall(446, ctypes.c_int(rs), ctypes.c_uint32(0)) < 0:
         fail("landlock_restrict_self")
     os.close(rs)
-os.execv(sys.executable, [sys.executable, "-I"] + sys.argv[2:])
+argv = cfg.get("exec") or [sys.executable, "-I"] + sys.argv[2:]
+os.execv(argv[0], argv)
 """
 
 
@@ -1085,20 +1094,49 @@ def _sbpl(path) -> str:
     return json.dumps(os.path.realpath(str(path)))  # SBPL strings use the same escapes as JSON
 
 
-def _seatbelt_profile(cwd: str) -> str:
+def _seatbelt_profile(cwd: str, ro_extra=(), network: bool = False) -> str:
     """Everything else allowed, but no network, no writes outside the code's own folder and no reads
     under the places that hold your data (homes, other volumes, temp folders), apart from Python
     itself and the workspace."""
     ro = {str(WORKSPACE), sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
-          os.path.dirname(os.path.realpath(sys.executable))}
+          os.path.dirname(os.path.realpath(sys.executable)), *ro_extra}
     return "\n".join([
-        "(version 1)", "(allow default)", "(deny network*)",
+        "(version 1)", "(allow default)", *([] if network else ["(deny network*)"]),
         "(deny file-write*)",
         f'(allow file-write* (subpath {_sbpl(cwd)}) (literal "/dev/null") (literal "/dev/zero"))',
         '(deny file-read* (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders") '
         '(subpath "/private/tmp") (subpath "/private/var/root") (subpath "/Library/Keychains"))',
         "(allow file-read* " + " ".join(f"(subpath {_sbpl(p)})" for p in sorted(ro | {cwd})) + ")",
     ])
+
+
+# what a confined MCP server may read on top of LANDLOCK_SYSTEM: name resolution and TLS roots
+MCP_SYSTEM = ("/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts",
+              "/etc/gai.conf", "/etc/host.conf", "/etc/services", "/etc/protocols")
+
+
+def confine_command(command: str, args, state_dir: str) -> list[str]:
+    """argv that runs an MCP server confined: it may read Python, system libraries, its own program
+    and the files named in its arguments, write only state_dir, and use the network (most servers
+    are API clients). Landlock on Linux, sandbox-exec on macOS; refuses where neither exists."""
+    exe = shutil.which(command) or command
+    if not os.path.isabs(exe):
+        raise ValueError(f"cannot find the MCP server program '{command}'")
+    ro = {os.path.dirname(os.path.realpath(exe)), os.path.dirname(os.path.abspath(exe))}
+    for a in args:  # a script or folder it is given: python server.py, node dist/index.js
+        if os.path.exists(a):
+            real = os.path.realpath(a)
+            ro.add(real if os.path.isdir(real) else os.path.dirname(real))
+    if landlock_abi() >= 1:
+        ro |= {sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
+               os.path.dirname(os.path.realpath(sys.executable))}
+        cfg = {"ro": [*LANDLOCK_SYSTEM, *MCP_SYSTEM, *sorted(ro)],
+               "rw": [state_dir, "/dev/null", "/dev/zero", "/dev/urandom"],
+               "net": True, "exec": [exe, *args]}
+        return [sys.executable, "-I", "-c", LANDLOCK_BOOT, json.dumps(cfg)]
+    if seatbelt_ok():
+        return ["sandbox-exec", "-p", _seatbelt_profile(state_dir, ro, network=True), exe, *args]
+    raise RuntimeError("cannot confine an MCP server here: needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
 
 
 class Sandbox:
@@ -2222,7 +2260,8 @@ def load_policy(path: str) -> dict:
 
 async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False,
                provider=None, budget: Budget | None = None, policy: dict | None = None,
-               skills: list[str] | None = None, embedder=None, a2a_specs: list[str] | None = None):
+               skills: list[str] | None = None, embedder=None, a2a_specs: list[str] | None = None,
+               confine_mcp: set[str] = frozenset()):
     WORKSPACE.mkdir(exist_ok=True)
     if auto_approve:
         print("[aios] WARNING: --auto-approve: risky tools run without asking.")
@@ -2261,7 +2300,8 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
     for spec in mcp_specs:  # "name=command arg1 arg2"
         name, _, cmdline = spec.partition("=")
         cmd, *args = shlex.split(cmdline)
-        print(f"MCP {name}:", await k.connect_mcp(name, cmd, args))
+        print(f"MCP {name}{' (confined)' if name in confine_mcp else ''}:",
+              await k.connect_mcp(name, cmd, args, confine=name in confine_mcp))
         if explicit:
             print(f"[aios] policy lists explicit permissions: add '{name}__*' there to let the agent use these tools")
         else:
@@ -3261,6 +3301,9 @@ def cli():
     c.add_argument("--agent", default="main", help="agent name (own memory per name)")
     c.add_argument("--mcp", action="append", default=[], metavar="NAME=CMD ARGS",
                    help='attach an MCP server, e.g. --mcp "demo=python demo_mcp_server.py"')
+    c.add_argument("--confine-mcp", action="append", default=[], metavar="NAME",
+                   help="run that --mcp server without access to your files (network stays; Landlock on "
+                        "Linux 5.13+, sandbox-exec on macOS)")
     c.add_argument("--auto-approve", action="store_true",
                    help="run risky tools (write_file, run_python, MCP) without asking. Unsafe.")
     add_model_flags(c)
@@ -3491,7 +3534,11 @@ def cli():
     if a.embed_model:
         import aios_memory
         embedder = aios_memory.Embedder(a.embed_model, a.embed_url, os.environ.get("OPENAI_API_KEY"))
-    asyncio.run(chat(a.agent, a.mcp, a.auto_approve, provider, budget, policy, a.skill, embedder, a.a2a))
+    unknown = set(a.confine_mcp) - {s.partition("=")[0] for s in a.mcp}
+    if unknown:
+        raise SystemExit(f"--confine-mcp names no --mcp server: {', '.join(sorted(unknown))}")
+    asyncio.run(chat(a.agent, a.mcp, a.auto_approve, provider, budget, policy, a.skill, embedder, a.a2a,
+                     set(a.confine_mcp)))
 
 
 if __name__ == "__main__":
