@@ -57,9 +57,16 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
                 await self.gate.wait()
             return f"answer to {t}"
 
+        self.run_fn = run
         self.srv = aios_a2a.Server("helper", "Helps.", TOKEN, run, lambda: "agent-object",
-                                   asyncio.get_running_loop(), port=0, timeout=0.5).start()
-        self.addAsyncCleanup(asyncio.to_thread, self.srv.close)
+                                   asyncio.get_running_loop(), port=0, timeout=0.5, **self.server_options()).start()
+
+        async def close():  # the server in place at the end (a test may replace it)
+            await asyncio.to_thread(self.srv.close)
+        self.addAsyncCleanup(close)
+
+    def server_options(self) -> dict:
+        return {}
 
     def _http(self, method, path, body=None, token=TOKEN, raw=None):
         c = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
@@ -416,6 +423,176 @@ class ServerTests(ServerCase):
             await asyncio.to_thread(bad.send, "hi")
 
 
+class Receiver:
+    """A local HTTP server that records the push notifications it gets."""
+
+    def __init__(self, status=200):
+        import http.server
+        import queue
+        self.got = queue.Queue()
+        got = self.got
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                got.put((self.path, dict(self.headers), json.loads(body)))
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        import threading
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def next(self, timeout=10):
+        return self.got.get(timeout=timeout)
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class PushTests(ServerCase):
+    def server_options(self):
+        p = mock.patch("urllib.request.getproxies", lambda: {})  # never through the machine's proxy
+        p.start()
+        self.addCleanup(p.stop)
+        self.hook = Receiver()
+        self.addCleanup(self.hook.close)
+        return {"push_to": [self.hook.url + "/hooks/*", "http://example.com/*"]}
+
+    async def nothing_more(self):
+        import queue
+        await asyncio.sleep(0.3)
+        with self.assertRaises(queue.Empty):
+            self.hook.got.get_nowait()
+
+    async def test_off_unless_the_server_names_where_pushes_may_go(self):
+        await asyncio.to_thread(self.srv.close)
+        self.srv = aios_a2a.Server("helper", "Helps.", TOKEN, self.run_fn, lambda: "a",
+                                   asyncio.get_running_loop(), port=0).start()
+        _, card = await self.http("GET", aios_a2a.CARD_PATHS[0], token=None)
+        self.assertFalse(card["capabilities"]["pushNotifications"])
+        body = await self.rpc("CreateTaskPushNotificationConfig", {"taskId": "x", "url": self.hook.url + "/hooks/a"})
+        self.assertEqual(body["error"]["code"], aios_a2a.UNSUPPORTED)
+        body = await self.rpc("SendMessage", {"message": dict(user_msg(), role="ROLE_USER"), "configuration": {
+            "taskPushNotificationConfig": {"url": self.hook.url + "/hooks/a"}}})
+        self.assertEqual(body["error"]["code"], aios_a2a.UNSUPPORTED)
+        self.assertEqual(self.seen, [])
+
+    async def test_version_1_0_the_finished_task_is_pushed_with_its_token(self):
+        _, card = await self.http("GET", aios_a2a.CARD_PATHS[0], token=None)
+        self.assertTrue(card["capabilities"]["pushNotifications"])
+        body = await self.rpc("SendMessage", {"message": dict(user_msg("hi"), role="ROLE_USER"), "configuration": {
+            "returnImmediately": True,
+            "taskPushNotificationConfig": {"url": self.hook.url + "/hooks/1", "token": "tok-1"}}})
+        tid = body["result"]["task"]["id"]
+        path, headers, sent = await asyncio.to_thread(self.hook.next)
+        self.assertEqual(path, "/hooks/1")
+        self.assertEqual(headers["X-A2A-Notification-Token"], "tok-1")
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(sent["task"]["id"], tid)
+        self.assertEqual(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(sent["task"]["artifacts"][0]["parts"][0]["text"], "answer to hi")
+        await self.nothing_more()  # once per task
+
+    async def test_version_1_0_config_methods(self):
+        body = await self.rpc("SendMessage", {"message": dict(user_msg("gate"), role="ROLE_USER"),
+                                              "configuration": {"returnImmediately": True}})
+        tid = body["result"]["task"]["id"]
+        made = []
+        for n in ("a", "b"):
+            res = (await self.rpc("CreateTaskPushNotificationConfig", {
+                "taskId": tid, "id": n, "url": f"{self.hook.url}/hooks/{n}",
+                "authentication": {"scheme": "Bearer", "credentials": "cred-" + n}}))["result"]
+            made.append(res)
+        self.assertEqual(made[0], {"taskId": tid, "id": "a", "url": self.hook.url + "/hooks/a",
+                                   "authentication": {"scheme": "Bearer"}})  # credentials are not echoed
+        got = (await self.rpc("GetTaskPushNotificationConfig", {"taskId": tid, "id": "b"}))["result"]
+        self.assertEqual(got, made[1])
+        listed = (await self.rpc("ListTaskPushNotificationConfigs", {"taskId": tid}))["result"]
+        self.assertEqual(listed, {"configs": made, "nextPageToken": ""})
+        self.assertEqual((await self.rpc("DeleteTaskPushNotificationConfig", {"taskId": tid, "id": "a"}))["result"], {})
+        self.assertEqual((await self.rpc("GetTaskPushNotificationConfig", {"taskId": tid, "id": "a"}))["error"]["code"],
+                         aios_a2a.INVALID_PARAMS)
+        self.gate.set()
+        path, headers, sent = await asyncio.to_thread(self.hook.next)
+        self.assertEqual((path, headers["Authorization"]), ("/hooks/b", "Bearer cred-b"))
+        await self.nothing_more()  # the deleted config gets nothing
+
+    async def test_version_0_3_the_task_itself_is_pushed(self):
+        body = await self.rpc("message/send", {"message": user_msg("gate"), "configuration": {"blocking": False}})
+        tid = body["result"]["id"]
+        res = (await self.rpc("tasks/pushNotificationConfig/set", {"taskId": tid, "pushNotificationConfig": {
+            "url": self.hook.url + "/hooks/x", "token": "t", "authentication": {"schemes": ["Bearer"],
+                                                                                 "credentials": "c"}}}))["result"]
+        cfg = res["pushNotificationConfig"]
+        self.assertEqual((res["taskId"], cfg["url"], cfg["token"], cfg["authentication"]),
+                         (tid, self.hook.url + "/hooks/x", "t", {"schemes": ["Bearer"]}))
+        self.assertEqual((await self.rpc("tasks/pushNotificationConfig/get", {"id": tid}))["result"], res)
+        self.assertEqual((await self.rpc("tasks/pushNotificationConfig/list", {"id": tid}))["result"], [res])
+        self.gate.set()
+        _, headers, sent = await asyncio.to_thread(self.hook.next)
+        self.assertEqual((sent["kind"], sent["id"], sent["status"]["state"]), ("task", tid, "completed"))
+        self.assertEqual((headers["X-A2A-Notification-Token"], headers["Authorization"]), ("t", "Bearer c"))
+        self.assertIsNone((await self.rpc("tasks/pushNotificationConfig/delete", {
+            "id": tid, "pushNotificationConfigId": cfg["id"]}))["result"])
+        self.assertEqual((await self.rpc("tasks/pushNotificationConfig/list", {"id": tid}))["result"], [])
+
+    async def test_failed_and_canceled_tasks_are_pushed_too(self):
+        for t in ("boom", "gate"):
+            body = await self.rpc("message/send", {"message": user_msg(t), "configuration": {
+                "blocking": False, "pushNotificationConfig": {"url": self.hook.url + "/hooks/" + t}}})
+            if t == "gate":
+                await self.rpc("tasks/cancel", {"id": body["result"]["id"]})
+            _, _, sent = await asyncio.to_thread(self.hook.next)
+            self.assertEqual(sent["status"]["state"], {"boom": "failed", "gate": "canceled"}[t])
+        await self.nothing_more()
+
+    async def test_urls_outside_the_patterns_and_unsafe_configs_are_refused(self):
+        body = await self.rpc("message/send", {"message": user_msg("gate"), "configuration": {"blocking": False}})
+        tid = body["result"]["id"]
+
+        def set_(cfg):
+            return self.rpc("CreateTaskPushNotificationConfig", {"taskId": tid, **cfg})
+
+        for cfg, why in (({"url": self.hook.url + "/other"}, "does not send"),
+                         ({"url": "http://169.254.169.254/latest"}, "does not send"),
+                         ({"url": "file:///etc/passwd"}, "only http"),
+                         ({}, "needs a url"),
+                         ({"url": "http://example.com/x", "token": "t"}, "only sent over https"),
+                         ({"url": self.hook.url + "/hooks/a", "id": "bad id!"}, "config id")):
+            with self.subTest(cfg=cfg):
+                err = (await set_(cfg))["error"]
+                self.assertEqual(err["code"], aios_a2a.INVALID_PARAMS)
+                self.assertIn(why, err["message"])
+        for n in range(aios_a2a.PUSH_PER_TASK):
+            self.assertIn("result", await set_({"id": f"c{n}", "url": self.hook.url + "/hooks/a"}))
+        self.assertIn("at most", (await set_({"id": "one-more", "url": self.hook.url + "/hooks/a"}))["error"]["message"])
+        self.assertIn("result", await set_({"id": "c0", "url": self.hook.url + "/hooks/b"}))  # same id: replaced
+        self.assertEqual((await set_({"taskId": "nope", "url": self.hook.url + "/hooks/a"}))["error"]["code"],
+                         aios_a2a.TASK_NOT_FOUND)
+        self.gate.set()
+        paths = sorted([(await asyncio.to_thread(self.hook.next))[0] for _ in range(aios_a2a.PUSH_PER_TASK)])
+        self.assertEqual(paths, ["/hooks/a"] * 3 + ["/hooks/b"])
+        await self.nothing_more()
+
+    def test_a_host_name_must_resolve_to_public_addresses_only(self):
+        import socket
+        cfg = {"id": "c", "url": "http://hooks.example/x", "token": "", "scheme": "", "credentials": "", "v1": True}
+        err = io.StringIO()
+        fake = lambda host, port, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]  # noqa: E731
+        with mock.patch("socket.getaddrinfo", fake), \
+                mock.patch("socket.create_connection", side_effect=AssertionError("must not connect")), \
+                contextlib.redirect_stderr(err):
+            self.srv._deliver(cfg, {"task": {}})
+        self.assertIn("not a public address", err.getvalue())
+
+
 class ClientCancelTests(unittest.TestCase):
     def test_a_task_that_takes_too_long_is_canceled(self):
         c = aios_a2a.Client("http://127.0.0.1:1/", timeout=0.05)
@@ -573,12 +750,21 @@ class CliTests(unittest.TestCase):
 
     def test_daily_limits_reach_the_server_and_bad_ones_are_refused(self):
         srv, _ = self.run_cli("--daily-max-tokens", "5000")
-        self.assertEqual(srv.call_args.args[-2:], (5000, None))
+        self.assertEqual(srv.call_args.args[-3:-1], (5000, None))
         srv, err = self.run_cli("--daily-max-cost", "1")
         srv.assert_not_called()
         self.assertIn("--daily-max-cost needs --price-in / --price-out", err)
         srv, err = self.run_cli("--daily-max-tokens", "0")
         self.assertIn("must be positive", err)
+
+    def test_push_patterns_need_a_fixed_host(self):
+        srv, _ = self.run_cli("--push-to", "https://hooks.example.com/a2a/*")
+        self.assertEqual(srv.call_args.args[-1], ["https://hooks.example.com/a2a/*"])
+        for bad in ("https://hooks.example.com*", "https://*.example.com/", "hooks.example.com/*", "ftp://h/x"):
+            with self.subTest(bad=bad):
+                srv, err = self.run_cli("--push-to", bad)
+                srv.assert_not_called()
+                self.assertIn("no wildcard in the host", err)
 
 
 if __name__ == "__main__":

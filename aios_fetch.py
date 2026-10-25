@@ -198,5 +198,22 @@ def _fetch(url: str, max_bytes: int, timeout: float, allow_private: bool) -> str
             + (f"\n...(truncated after {max_bytes} bytes)" if cut else ""))
 
 
+def post_json(url: str, body: bytes, headers: dict, timeout: float = TIMEOUT, allow_private: bool = False) -> int:
+    """POST body to url with the same address checks as a fetch (used for A2A push notifications);
+    the HTTP status. Redirects are not followed and at most 64 KB of the reply is read."""
+    u = check_url(url)
+    conn, target = _connection(u, allow_private, timeout)
+    try:
+        conn.request("POST", target, body=body, headers={"Host": u.netloc, "User-Agent": "aios-fetch/1",
+                                                         "Connection": "close", **headers})
+        r = conn.getresponse()
+        r.read(65536)
+        return r.status
+    except (OSError, http.client.HTTPException) as e:
+        raise FetchError(f"cannot reach {urllib.parse.urlunsplit(u)}: {type(e).__name__}: {e}") from None
+    finally:
+        conn.close()
+
+
 async def fetch(url: str, max_bytes: int = MAX_BYTES, timeout: float = TIMEOUT, allow_private: bool = False) -> str:
     return await asyncio.to_thread(_fetch, url, max_bytes, timeout, allow_private)
