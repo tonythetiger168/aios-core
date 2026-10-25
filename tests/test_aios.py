@@ -1534,6 +1534,48 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.stdout.splitlines(), ["PermissionError", "PermissionError", "2", "import", "net"],
                          r.stderr)
 
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(), "needs Landlock or sandbox-exec")
+    def test_confined_code_cannot_reach_unix_sockets(self):
+        """A socket file is not a file read: without this, confined code could talk to the Docker
+        daemon, ssh-agent or the D-Bus session bus and get out that way."""
+        import socket
+        import subprocess
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, tempfile.TemporaryDirectory() as state:
+            path = os.path.join(d, "s.sock")
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(path)
+            srv.listen()
+            probe = Path(d, "probe.py")
+            probe.write_text("\n".join([
+                "import socket",
+                "try:",
+                "    s = socket.socket(socket.AF_UNIX)",
+                f"    s.connect({path!r})",
+                "    print('connected')",
+                "except OSError as e:",
+                "    print('refused', type(e).__name__)",
+                "a, b = socket.socketpair()",  # still fine: asyncio needs it, and it reaches nothing
+                "a.send(b'x')",
+                "print('pair', b.recv(1).decode())",
+            ]), encoding="utf-8")
+            for network in (True, False):
+                if not network and not aios.offline_level():
+                    continue
+                with self.subTest(network=network):
+                    argv = aios.confine_command(sys.executable, [str(probe)], state, network=network)
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.stdout.split()[0], "refused", r.stdout + r.stderr)
+                    self.assertIn("pair x", r.stdout, r.stderr)
+            old = aios.WORKSPACE
+            aios.WORKSPACE = Path(d).resolve()
+            try:
+                out = asyncio.run(aios.Sandbox().run_python(probe.read_text(encoding="utf-8")))
+            finally:
+                aios.WORKSPACE = old
+            self.assertIn("refused", out)
+            self.assertIn("pair x", out)
+            srv.close()
+
     @unittest.skipUnless(aios.offline_level(), "needs a network namespace, Landlock ABI 4 or sandbox-exec")
     def test_an_offline_mcp_server_has_no_network_and_still_no_files(self):
         import socket

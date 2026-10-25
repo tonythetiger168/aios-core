@@ -1081,6 +1081,26 @@ if abi >= 1:
     if libc.syscall(446, ctypes.c_int(rs), ctypes.c_uint32(0)) < 0:
         fail("landlock_restrict_self")
     os.close(rs)
+# seccomp: no new Unix sockets (Landlock does not cover connecting to a socket file, so the code
+# could otherwise reach the Docker daemon, ssh-agent or the D-Bus session bus) and no io_uring
+# (its operations bypass seccomp). socketpair() still works: it reaches nothing outside.
+arch = {"x86_64": (0xC000003E, 41), "aarch64": (0xC00000B7, 198), "riscv64": (0xC00000F3, 198)}.get(os.uname().machine)
+if arch:
+    import struct
+    deny, allow = 0x00050000 | 13, 0x7FFF0000  # SECCOMP_RET_ERRNO | EACCES, SECCOMP_RET_ALLOW
+    prog = [(0x20, 0, 0, 4), (0x15, 1, 0, arch[0]), (0x06, 0, 0, deny),  # other ABIs (i386): refused
+            (0x20, 0, 0, 0), (0x35, 4, 0, 0x40000000),                     # x32 syscalls: refused
+            (0x15, 3, 0, 425),                                             # io_uring_setup
+            (0x15, 0, 3, arch[1]),                                         # socket(...)
+            (0x20, 0, 0, 16), (0x15, 0, 1, 1),                             # domain == AF_UNIX
+            (0x06, 0, 0, deny), (0x06, 0, 0, allow)]
+    # jumps above count from the next instruction: 4 and 3 land on the deny at index 9
+    buf = ctypes.create_string_buffer(b"".join(struct.pack("HBBI", *i) for i in prog))
+    class Prog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+    fprog = Prog(len(prog), ctypes.cast(buf, ctypes.c_void_p))
+    if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(22, 2, ctypes.byref(fprog), 0, 0):  # PR_SET_SECCOMP, FILTER
+        fail("seccomp")
 argv = cfg.get("exec") or [sys.executable, "-I"] + sys.argv[2:]
 os.execv(argv[0], argv)
 """
@@ -1131,6 +1151,9 @@ def _seatbelt_profile(cwd: str, ro_extra=(), network: bool = False, egress_port=
           os.path.dirname(os.path.realpath(sys.executable)), *ro_extra}
     return "\n".join([
         "(version 1)", "(allow default)", *([] if network else ["(deny network*)"]),
+        # no Unix sockets (Docker daemon, ssh-agent, ...) except name lookups through mDNSResponder
+        '(deny network-outbound (subpath "/"))',
+        *(['(allow network-outbound (literal "/private/var/run/mDNSResponder"))'] if network else []),
         *([f'(allow network-outbound (remote ip "localhost:{int(egress_port)}"))'] if egress_port else []),
         "(deny file-write*)",
         f'(allow file-write* (subpath {_sbpl(cwd)}) (literal "/dev/null") (literal "/dev/zero"))',
