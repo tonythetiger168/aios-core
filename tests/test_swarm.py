@@ -347,5 +347,51 @@ class SwarmCliTests(SwarmCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class HttpProviderConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_calls_are_not_capped_by_the_default_thread_pool(self):
+        # urllib blocks a thread per call; Python's shared pool (min(32, CPUs + 4)) used to cap a
+        # swarm at ~8 model calls in flight on a 4-core machine whatever --model-slots said.
+        import threading
+        import time
+        p = aios.OpenAICompatProvider("m")
+        k = aios.Kernel(store=aios.Store(":memory:"), provider=p, model_slots=40)
+        self.addCleanup(k.store.db.close)
+        self.assertEqual(p.workers, 40)
+        lock, state = threading.Lock(), {"now": 0, "peak": 0}
+
+        def post(payload):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.2)
+            with lock:
+                state["now"] -= 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        with mock.patch.object(p, "_post", post):
+            out = await asyncio.gather(*(p.complete("s", [{"role": "user", "content": "x"}], [])
+                                         for _ in range(40)))
+        self.assertEqual(len(out), 40)
+        self.assertEqual(state["peak"], 40)
+
+
+class StressScriptTests(unittest.TestCase):
+    def test_ramp_runs_the_real_swarm_path(self):
+        import subprocess
+        script = Path(__file__).resolve().parent.parent / "scripts" / "stress-swarm.py"
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "r.jsonl"
+            p = subprocess.run([sys.executable, str(script), "--start", "1", "--factor", "4", "--max", "16",
+                                "--latency", "0.01", "--out", str(out)], capture_output=True, text=True,
+                               timeout=120)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            rows = [json.loads(line) for line in out.read_text().splitlines()]
+        self.assertEqual([r["agents"] for r in rows], [1, 4, 16])
+        self.assertTrue(all(r["fail_rate"] == 0 and r["ok"] == r["agents"] for r in rows))
+        self.assertEqual(rows[-1]["peak_in_flight"], 16)  # all 16 really ran at once
+        self.assertGreaterEqual(rows[-1]["audit_rows"], 16)  # every helper call is in the audit log
+        self.assertIn("| agents |", p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

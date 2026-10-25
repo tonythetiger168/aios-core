@@ -117,6 +117,11 @@ class OpenAICompatProvider:
                  api_key: str | None = None, timeout: int = 300, temperature: float | None = None):
         self.model, self.base_url = model, base_url.rstrip("/")
         self.api_key, self.timeout, self.temperature = api_key, timeout, temperature
+        # urllib blocks a thread per call: give the provider its own pool, as large as the kernel's
+        # model slots (Python's shared default pool has min(32, CPUs + 4) threads, so a swarm on a
+        # 4-core machine could only reach the model server 8 calls at a time).
+        self.workers: int | None = None  # set by Kernel to its model slots; MODEL_SLOTS if unset
+        self._pool = None
 
     # -- translation: neutral blocks <-> OpenAI wire format (pure functions, unit-tested) --
     @staticmethod
@@ -191,7 +196,10 @@ class OpenAICompatProvider:
             payload["tools"] = self.to_wire_tools(tools)
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        return self.from_wire(await asyncio.to_thread(self._post, payload))
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(self.workers or MODEL_SLOTS, thread_name_prefix="aios-model")
+        return self.from_wire(await asyncio.get_running_loop().run_in_executor(self._pool, self._post, payload))
 
 
 # ---- Budget: hard limits per run ----
@@ -747,6 +755,8 @@ class Kernel:
         # Every model call of every agent waits for a slot: a 1000-helper swarm still sends at most
         # this many requests at once (the rest queue here, not at the provider's rate limiter).
         self.model_slots = asyncio.Semaphore(model_slots or MODEL_SLOTS)
+        if getattr(self.provider, "workers", 0) is None:  # OpenAICompatProvider: one thread per slot
+            self.provider.workers = model_slots or MODEL_SLOTS
 
     async def connect_mcp(self, server: str, command: str, args=(), env=None, confine=False,
                           network=True, egress=None) -> list[str]:
