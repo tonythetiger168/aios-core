@@ -102,7 +102,7 @@ jobs:
       AIOS_TEST_EMBED_URL: http://127.0.0.1:11434/v1
       AIOS_TEST_EMBED_MODEL: nomic-embed-text
       AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
-      AIOS_TEST_CHAT_MODEL: qwen2.5:1.5b
+      AIOS_TEST_CHAT_MODEL: qwen2.5:3b
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
