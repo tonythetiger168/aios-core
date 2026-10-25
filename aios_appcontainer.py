@@ -104,7 +104,8 @@ TIMED_OUT = -1  # run()'s exit code when it was stopped for taking too long
 
 
 def _fail(what: str):
-    raise OSError(f"{what} failed: {ctypes.FormatError(ctypes.get_last_error())}")
+    err = ctypes.get_last_error()
+    raise OSError(f"{what} failed: {ctypes.FormatError(err)} (error {err})")
 
 
 @functools.lru_cache(maxsize=1)

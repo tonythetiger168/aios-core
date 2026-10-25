@@ -1167,6 +1167,11 @@ def confine_command(command: str, args, state_dir: str, network: bool = True) ->
     raise RuntimeError("cannot confine an MCP server here: needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
 
 
+APPCONTAINER_ENV = ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS", "PROCESSOR_ARCHITECTURE",
+                    "NUMBER_OF_PROCESSORS", "USERNAME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA",
+                    "ALLUSERSPROFILE", "PROGRAMFILES", "PUBLIC")
+
+
 class Sandbox:
     """run_python as a local child process: rlimits + no network on Linux, an AppContainer in a job
     object on Windows (see aios_appcontainer). With Landlock (Linux 5.13+) it reads only Python,
@@ -1286,7 +1291,10 @@ class Sandbox:
         for path in ac.python_dirs() + [str(WORKSPACE)]:
             await asyncio.to_thread(ac.grant, path)
         await asyncio.to_thread(ac.grant, d, True)
-        env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"), "TEMP": d, "TMP": d}
+        # Windows fills in the container's own LOCALAPPDATA and TEMP from these and refuses to start
+        # the process without them; nothing secret (API keys, tokens) is passed on
+        env = {k: os.environ[k] for k in APPCONTAINER_ENV if k in os.environ}
+        env.update(TEMP=d, TMP=d)
         code, out = await asyncio.to_thread(ac.run, [ac.base_python(), "-I", "main.py"], d, env, self.timeout,
                                             self.cpu_s, self.mem, self.max_procs, self.max_out * 4)
         if code == ac.TIMED_OUT:
