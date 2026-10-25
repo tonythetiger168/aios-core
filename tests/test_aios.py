@@ -1333,6 +1333,74 @@ class WorkspaceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("list_facts"), "k: v")
 
 
+def _appcontainer_ok() -> bool:
+    import aios_appcontainer
+    return aios_appcontainer.unavailable() is None
+
+
+@unittest.skipUnless(aios.IS_WINDOWS and _appcontainer_ok(), "needs Windows with AppContainers")
+class WindowsSandboxTests(unittest.IsolatedAsyncioTestCase):
+    """The process sandbox on Windows: an AppContainer in a job object, really run."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(setattr, aios, "WORKSPACE", aios.WORKSPACE)
+        aios.WORKSPACE = Path(self._tmp.name).resolve()
+
+    async def test_code_runs_and_reads_only_python_and_the_workspace(self):
+        box = aios.Sandbox()
+        self.assertEqual((box.fs_isolated, box.net_isolated), ("appcontainer", "all"))
+        home = Path(os.environ["USERPROFILE"])
+        with tempfile.TemporaryDirectory(dir=home) as outside:  # in your user folder, not the workspace
+            secret = Path(outside, "secret.txt")
+            secret.write_text("key", encoding="utf-8")
+            (aios.WORKSPACE / "data.txt").write_text("ws", encoding="utf-8")
+            code = "\n".join([
+                "import json, os, sqlite3, tempfile",  # stdlib and C extensions load
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(secret)!r}).read()))",
+                f"print(try_(lambda: os.listdir({outside!r})))",
+                "print(try_(lambda: open('../data.txt').read()))",  # the workspace: read-only
+                "print(try_(lambda: open('../new.txt', 'w')))",
+                "print(try_(lambda: open('mine.txt', 'w').write('ok')))",  # its own folder
+                "print(try_(lambda: tempfile.mkstemp()[0] > 0))",
+                "print(6 * 7)",
+            ])
+            out = (await box.run_python(code)).splitlines()
+        self.assertEqual(out, ["exit=0", "PermissionError", "PermissionError", "ws", "PermissionError",
+                               "2", "True", "42"])
+
+    async def test_no_network_not_even_this_machine(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        try:
+            out = await aios.Sandbox().run_python(
+                f"import socket\ntry:\n    socket.create_connection(('127.0.0.1', {srv.getsockname()[1]}), timeout=3)\n"
+                "    print('connected')\nexcept OSError as e:\n    print('refused', type(e).__name__)")
+        finally:
+            srv.close()
+        self.assertIn("refused", out)
+
+    async def test_memory_processes_and_time_are_limited(self):
+        out = await aios.Sandbox(mem_mb=128).run_python(
+            "try:\n    b = bytearray(400 * 2**20)\n    print('allocated')\nexcept MemoryError:\n    print('MemoryError')")
+        self.assertIn("MemoryError", out)
+        code = ("import subprocess, sys\nkids, n = [], 0\nfor i in range(8):\n    try:\n"
+                "        kids.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']))\n"
+                "        n += 1\n    except OSError:\n        pass\nprint('started', n)\nfor k in kids:\n    k.kill()")
+        out = await aios.Sandbox(max_procs=3, timeout=30).run_python(code)
+        self.assertIn("started 2", out)  # the job holds 3 processes: this one and two children
+        self.assertEqual(await aios.Sandbox(timeout=2).run_python("while True:\n    pass"),
+                         "killed: timeout after 2s")
+
+
 @unittest.skipIf(aios.IS_WINDOWS, "real sandbox limits are Linux-only")
 class SandboxTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1733,10 +1801,14 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             with ok:
                 self.assertIsInstance(aios.make_sandbox("auto"), aios.DockerSandbox)
-            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):
+            no_box = mock.patch.object(aios, "_appcontainer_unavailable", return_value="no AppContainer")
+            with missing, no_box, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):
                 self.assertIsNone(aios.make_sandbox("auto"))
                 self.assertIsNone(aios.make_sandbox("process"))
-            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": "1"}):
+            with missing, no_box, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": "1"}):
+                self.assertIs(aios.make_sandbox("auto"), weak.return_value)
+            with missing, mock.patch.object(aios, "_appcontainer_unavailable", return_value=None), \
+                    mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):  # a real one: no opt-in needed
                 self.assertIs(aios.make_sandbox("auto"), weak.return_value)
         if not aios.IS_WINDOWS:
             self.assertIsInstance(aios.make_sandbox("auto"), aios.Sandbox)
