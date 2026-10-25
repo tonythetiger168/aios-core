@@ -989,14 +989,32 @@ def _clip(text: str, max_out: int) -> str:
     return text[:max_out] + "\n...(truncated)" if len(text) > max_out else text
 
 
+def _user_tasks() -> int | None:
+    """Processes and threads of our real uid right now: what RLIMIT_NPROC counts (Linux only)."""
+    uid, n = str(os.getuid()), 0
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+        except OSError:  # it exited meanwhile, or is hidden from us
+            continue
+        if fields.get("Uid", "").split()[:1] == [uid]:
+            n += int(fields.get("Threads", "1").strip() or 1)
+    return n or None
+
+
 class Sandbox:
     """run_python as a local child process: rlimits + no network on Linux, timeout only on Windows.
     The code can still read whatever files the user can read."""
     name = "process"
 
-    def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000):
+    def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000, max_procs=64):
         self.timeout, self.cpu_s, self.mem = timeout, cpu_s, mem_mb * 1024 * 1024
-        self.max_out = max_out
+        self.max_out, self.max_procs = max_out, max_procs
         # network isolation via a fresh network namespace (Linux, needs unprivileged userns)
         self.net_isolated = (not IS_WINDOWS and bool(shutil.which("unshare"))
                              and subprocess.run(["unshare", "-rn", "true"],
@@ -1009,11 +1027,19 @@ class Sandbox:
 
     def _limits(self):
         cpu, mem = self.cpu_s, self.mem
+        # RLIMIT_NPROC caps every process of the user, not just ours, so allow what runs now plus
+        # max_procs: a fork bomb stops there. The kernel does not apply it to root.
+        now = _user_tasks() if sys.platform.startswith("linux") else None
+        nproc = now + self.max_procs if now else None
         def apply():
             resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
             resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
             resource.setrlimit(resource.RLIMIT_FSIZE, (10 << 20, 10 << 20))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if nproc:
+                hard = resource.getrlimit(resource.RLIMIT_NPROC)[1]
+                cap = nproc if hard == resource.RLIM_INFINITY else min(nproc, hard)
+                resource.setrlimit(resource.RLIMIT_NPROC, (cap, cap))
         return apply
 
     async def _kill(self, proc):

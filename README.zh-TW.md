@@ -19,7 +19,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
-  - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、無網路（Linux 且支援非特權 user namespace）。
+  - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace）。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
   - `microvm`（實驗性，需 Linux 與 KVM）：每次呼叫啟動一台全新的 [Firecracker](https://firecracker-microvm.github.io/) microVM，有自己的核心、沒有網路裝置、除了程式碼之外不帶入你電腦上的任何東西、根目錄唯讀、非特權使用者。只在明確指定時使用，`auto` 永遠不會選它；KVM、Firecracker 或映像檔缺少時 AIOS 會拒絕啟動。AIOS 以 root 執行時，設定 `AIOS_MICROVM_JAILER=1` 還會用 Firecracker 的 jailer 把 VMM 本身也關起來（chroot、非特權 uid、有記憶體上限的 cgroup）。設定方式與威脅模型見 [docs/microvm-sandbox.md](docs/microvm-sandbox.md)。
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。
@@ -311,7 +311,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - `serve` 無法透過 stdio 詢問（它是協議通道）。請用 `--approvals console`、用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
 - 審計日誌能發現竄改，但無法防止竄改。每筆紀錄的雜湊都涵蓋前一筆，所以 `aios audit --verify`（以及看門狗）查得出手動修改、刪除、插入的紀錄，也查得出最新幾筆被截掉。不過能寫入 `aios.db` 的人仍可把整條鏈重算一遍。要連這種情況也抓到，請把 `--verify` 印出的 head 存到 `aios.db` 碰不到的地方，之後用 `--verify --head <雜湊>` 比對。啟用雜湊鏈之前寫入的紀錄會被計數，但不在保護範圍內。
 - 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶，在 `--approve` 模式下也能回答審批請求。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
-- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
+- **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案。在 Linux 上，它最多只能比你的使用者現有的數量多開 64 個行程或執行緒，fork 炸彈會在那裡停下；AIOS 以 root 執行時核心不套用這個限制。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權。
