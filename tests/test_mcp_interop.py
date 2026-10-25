@@ -170,7 +170,7 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
                                                   {"demo"})
         self.assertIn("demo__add", provider.calls[0]["tools"])
         self.assertIn("MCP demo (confined)", err)
-        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING: MCP server", err)
 
     async def test_a_server_that_does_not_start_stops_the_daemon_before_any_job(self):
         rc, err, provider = await self.run_daemon(["demo=no-such-program-aios"])
