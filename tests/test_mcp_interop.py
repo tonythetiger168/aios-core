@@ -143,7 +143,7 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
 
-    async def run_daemon(self, specs, confine=frozenset(), offline=frozenset()):
+    async def run_daemon(self, specs, confine=frozenset(), offline=frozenset(), egress=None):
         from test_schedule import Scripted, iso, text
         from datetime import datetime, timedelta
         st = aios.Store(str(self.home / "aios.db"))
@@ -154,7 +154,8 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
         provider, err = Scripted(text("done")), io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = await aios.daemon(str(self.home), aios.load_policy(str(policy)), provider=provider, once=True,
-                                   mcp_specs=specs, confine_mcp=confine, offline_mcp=offline)
+                                   mcp_specs=specs, confine_mcp=confine, offline_mcp=offline,
+                                   egress_mcp=egress)
         return rc, err.getvalue(), provider
 
     async def test_jobs_get_the_tools_the_policy_grants_and_an_unconfined_server_is_flagged(self):
@@ -178,6 +179,15 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("demo__add", provider.calls[0]["tools"])
         self.assertIn("job j: ok", err)
         self.assertIn("MCP demo (offline", err)
+        self.assertNotIn("WARNING: MCP server", err)
+
+    @unittest.skipUnless(aios.egress_ok(), "needs a network namespace or sandbox-exec")
+    async def test_a_server_with_an_egress_allowlist_works_and_says_where_it_may_go(self):
+        rc, err, provider = await self.run_daemon([self.DEMO], {"demo"},
+                                                  egress={"demo": [("api.github.com", 443), ("*.example.com", 8443)]})
+        self.assertIn("demo__add", provider.calls[0]["tools"])
+        self.assertIn("job j: ok", err)
+        self.assertIn("MCP demo (network: only api.github.com, *.example.com:8443)", err)
         self.assertNotIn("WARNING: MCP server", err)
 
     async def test_a_server_that_does_not_start_stops_the_daemon_before_any_job(self):
@@ -216,7 +226,27 @@ class McpFlagTests(unittest.TestCase):
                 mock.patch.object(aios, "daemon", mock.Mock()) as d, mock.patch.object(aios.asyncio, "run"), \
                 mock.patch.object(aios, "build_model", return_value=(None, None)):
             aios.cli()
-        self.assertEqual(d.call_args.args[-2:], ({"demo"}, {"demo"}))
+        self.assertEqual(d.call_args.args[-3:], ({"demo"}, {"demo"}, {}))
+
+    def test_egress_flags(self):
+        with mock.patch.object(sys, "argv", ["aios", "daemon", "--mcp", "gh=python s.py", "--mcp-egress",
+                                             "gh=api.github.com, *.githubusercontent.com"]), \
+                mock.patch.object(aios, "egress_ok", return_value=True), \
+                mock.patch.object(aios, "daemon", mock.Mock()) as d, mock.patch.object(aios.asyncio, "run"), \
+                mock.patch.object(aios, "build_model", return_value=(None, None)):
+            aios.cli()
+        self.assertEqual(d.call_args.args[-3:], ({"gh"}, set(), {"gh": [("api.github.com", 443),
+                                                                        ("*.githubusercontent.com", 443)]}))
+        spec = ("--mcp", "gh=python s.py")
+        with mock.patch.object(aios, "egress_ok", return_value=True):
+            self.assertIn("NAME=HOST", self.parse(*spec, "--mcp-egress", "api.github.com"))
+            self.assertIn("bad host 'https://x'", self.parse(*spec, "--mcp-egress", "gh=https://x"))
+            self.assertIn("give each server once", self.parse(*spec, "--mcp-egress", "gh=a.com", "--mcp-egress", "gh=b.com"))
+            self.assertIn("--mcp-egress names no --mcp server: x", self.parse(*spec, "--mcp-egress", "x=a.com"))
+            self.assertIn("not both", self.parse(*spec, "--mcp-egress", "gh=a.com", "--offline-mcp", "gh"))
+        with mock.patch.object(aios, "egress_ok", return_value=False):
+            self.assertIn("cannot cut a server off the network completely",
+                          self.parse(*spec, "--mcp-egress", "gh=a.com"))
 
 
 if __name__ == "__main__":
