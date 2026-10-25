@@ -1,6 +1,8 @@
 """A2A: serving an agent over the Agent2Agent protocol and calling remote agents as tools."""
 import asyncio
+import contextlib
 import http.client
+import io
 import json
 import os
 import sys
@@ -487,6 +489,22 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not your user", self.remote_prov.calls[0]["system"])
         self.assertEqual(set(self.remote_prov.calls[0]["tools"]), {"write_file", "now"})
 
+    async def test_a_daily_limit_covers_every_request_together(self):
+        self.srv.close()
+        self.srv = aios.make_a2a_server(self.remote, "helper", self.POLICY, aios.Budget(max_total_tokens=1000), TOKEN,
+                                        port=0, daily_tokens=300)
+        url = f"http://127.0.0.1:{self.srv.port}/"
+        big = aios.Completion([{"type": "text", "text": "big"}], "end_turn", 100, 150)
+        self.remote_prov.script = [big, big]
+        # another agent's spending in the same aios.db does not count against this one
+        self.remote.store.log_audit("helper2", aios.RUN_ENTRY, {}, "tokens_in=900 tokens_out=900 cost_usd=0", "ok")
+        c = aios_a2a.Client(url, TOKEN, timeout=10)
+        self.assertEqual(await asyncio.to_thread(c.send, "one"), "big")  # 250 of 300 used
+        self.assertEqual(await asyncio.to_thread(c.send, "two"), "big")  # gets the 50 left, overshoots once
+        with self.assertRaisesRegex(RuntimeError, r"task failed: .*daily token budget of 300 reached \(500 used in 24h\)"):
+            await asyncio.to_thread(c.ask, "three")
+        self.assertEqual(len(self.remote_prov.calls), 2)  # the model was not called for the third
+
     async def test_the_a2a_tool_needs_approval_and_is_untrusted(self):
         self.remote_prov.script = [text("remote says hi")]
         k = aios.Kernel(store=aios.Store(":memory:"), provider=Scripted(), approver=None)
@@ -539,6 +557,28 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
                 await aios.install_a2a_tools(k, [spec])
         with self.assertRaisesRegex(RuntimeError, "no A2A agent card"):
             await aios.install_a2a_tools(k, ["gone=http://127.0.0.1:9/"])
+
+
+
+class CliTests(unittest.TestCase):
+    def run_cli(self, *argv):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["aios", "a2a-serve", "--provider", "openai", "--model", "m", *argv]), \
+                mock.patch.object(aios, "a2a_serve") as srv, contextlib.redirect_stderr(err):
+            try:
+                aios.cli()
+            except SystemExit:
+                pass
+        return srv, err.getvalue()
+
+    def test_daily_limits_reach_the_server_and_bad_ones_are_refused(self):
+        srv, _ = self.run_cli("--daily-max-tokens", "5000")
+        self.assertEqual(srv.call_args.args[-2:], (5000, None))
+        srv, err = self.run_cli("--daily-max-cost", "1")
+        srv.assert_not_called()
+        self.assertIn("--daily-max-cost needs --price-in / --price-out", err)
+        srv, err = self.run_cli("--daily-max-tokens", "0")
+        self.assertIn("must be positive", err)
 
 
 if __name__ == "__main__":

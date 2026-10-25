@@ -437,9 +437,13 @@ class Store:
 
     def job_usage_since(self, since: str) -> tuple[int, float]:
         """Tokens and cost of every scheduled-job run since `since`, from the audit's run summaries."""
+        return self.usage_since(since, "job-%")
+
+    def usage_since(self, since: str, agent_like: str) -> tuple[int, float]:
+        """Tokens and cost of the runs since `since` of agents matching `agent_like` (SQL LIKE)."""
         tokens, cost = 0, 0.0
-        for (summary,) in self.db.execute("SELECT result FROM audit WHERE tool=? AND agent LIKE 'job-%' AND ts>=?",
-                                          (RUN_ENTRY, since)):
+        for (summary,) in self.db.execute("SELECT result FROM audit WHERE tool=? AND agent LIKE ? ESCAPE '\\' "
+                                          "AND ts>=?", (RUN_ENTRY, agent_like, since)):
             if m := re.search(r"tokens_in=(\d+) tokens_out=(\d+) cost_usd=([\d.]+)", summary or ""):
                 tokens, cost = tokens + int(m[1]) + int(m[2]), cost + float(m[3])
         return tokens, cost
@@ -2134,7 +2138,8 @@ async def install_a2a_tools(k: Kernel, specs: list[str]) -> list[str]:
 
 
 async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=None, budget: Budget | None = None,
-                    port: int = 8770, description: str = "", timeout: float = 300, token: str | None = None):
+                    port: int = 8770, description: str = "", timeout: float = 300, token: str | None = None,
+                    daily_tokens: int | None = None, daily_cost: float | None = None):
     """Serve one policy agent over A2A on 127.0.0.1 (see aios_a2a). Each request is a fresh, tainted
     run with that agent's permissions; nobody can approve risky calls."""
     import secrets
@@ -2147,7 +2152,7 @@ async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=No
     install_agent_tools(k, policy)
     shown = token is None
     token = token or secrets.token_urlsafe(32)
-    srv = make_a2a_server(k, agent_name, policy, budget, token, port, description, timeout)
+    srv = make_a2a_server(k, agent_name, policy, budget, token, port, description, timeout, daily_tokens, daily_cost)
     print(f"[aios] A2A agent '{agent_name}' at http://127.0.0.1:{srv.port}/ (data in {base})"
           + (f"\n  token (callers send 'Authorization: Bearer <token>'): {token}" if shown else
              "\n  token from $AIOS_A2A_TOKEN") + "\n  Ctrl+C to stop.", file=sys.stderr)
@@ -2162,8 +2167,10 @@ async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=No
 
 
 def make_a2a_server(k: Kernel, agent_name: str, policy: dict | None, budget: Budget | None, token: str,
-                    port: int = 8770, description: str = "", timeout: float = 300):
-    """Start the A2A server for one policy agent on the running loop (see a2a_serve)."""
+                    port: int = 8770, description: str = "", timeout: float = 300,
+                    daily_tokens: int | None = None, daily_cost: float | None = None):
+    """Start the A2A server for one policy agent on the running loop (see a2a_serve). daily_tokens /
+    daily_cost: what all requests together may use in any 24 hours (callers are strangers)."""
     import aios_a2a
     pol = (policy or {}).get(agent_name)
     perms = set(pol["permissions"]) if pol and pol["permissions"] is not None else set(SERVE_DEFAULT_TOOLS)
@@ -2175,8 +2182,14 @@ def make_a2a_server(k: Kernel, agent_name: str, policy: dict | None, budget: Bud
         agent.session_tainted = k.harden  # the caller is not trusted: no pre-allowed risky calls
         return agent
 
-    return aios_a2a.Server(agent_name, description or f"The AIOS agent '{agent_name}'.", token,
-                           lambda agent, text: k._run(agent, text, budget), make_agent,
+    async def run(agent: Agent, text: str) -> str:
+        day_ago = (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")
+        b, why = daily_budget(k.store, budget or Budget(), daily_tokens, daily_cost, day_ago, like_exact(agent_name))
+        if b is None:
+            raise DailyLimitReached(why + "; try again later")
+        return await k._run(agent, text, b)
+
+    return aios_a2a.Server(agent_name, description or f"The AIOS agent '{agent_name}'.", token, run, make_agent,
                            asyncio.get_running_loop(), port, timeout).start()
 
 
@@ -2266,6 +2279,20 @@ def load_policy(path: str) -> dict:
         Agent(name, set(), scopes=scopes)  # validates the scopes (typos in security config must fail loudly)
         out[name] = {"permissions": set(perms) if perms is not None else None, "scopes": scopes}
     return out
+
+
+def add_daily_flags(p, who: str, then: str):
+    p.add_argument("--daily-max-tokens", type=int, metavar="N",
+                   help=f"tokens {who} may use in any 24 hours; {then} (default: no limit)")
+    p.add_argument("--daily-max-cost", type=float, metavar="USD",
+                   help="the same in dollars (needs --price-in/--price-out)")
+
+
+def check_daily_flags(a, ap):
+    if (a.daily_max_tokens is not None and a.daily_max_tokens < 1) or (a.daily_max_cost is not None and a.daily_max_cost <= 0):
+        ap.error("--daily-max-tokens / --daily-max-cost must be positive")
+    if a.daily_max_cost is not None and not (a.price_in or a.price_out):
+        ap.error("--daily-max-cost needs --price-in / --price-out")
 
 
 def add_mcp_flags(p):
@@ -2562,6 +2589,36 @@ def watch_fingerprint(root: Path, pattern: str) -> str:
     return hashlib.sha256(json.dumps(entries).encode()).hexdigest()
 
 
+def daily_budget(store: "Store", budget: Budget, daily_tokens: int | None, daily_cost: float | None,
+                 since: str, agent_like: str) -> tuple[Budget | None, str]:
+    """`budget`, shrunk to what is left of a limit shared by the runs of agents matching `agent_like`
+    since `since`; (None, why) when nothing is left."""
+    if daily_tokens is None and daily_cost is None:
+        return budget, ""
+    tokens, cost = store.usage_since(since, agent_like)
+    b = dataclasses.replace(budget)
+    if daily_tokens is not None:
+        if tokens >= daily_tokens:
+            return None, f"daily token budget of {daily_tokens} reached ({tokens} used in 24h)"
+        left = daily_tokens - tokens
+        b.max_total_tokens = left if b.max_total_tokens is None else min(b.max_total_tokens, left)
+    if daily_cost is not None:
+        if cost >= daily_cost:
+            return None, f"daily cost budget of ${daily_cost:.4f} reached (${cost:.4f} used in 24h)"
+        left = daily_cost - cost
+        b.max_cost_usd = left if b.max_cost_usd is None else min(b.max_cost_usd, left)
+    return b, ""
+
+
+class DailyLimitReached(RuntimeError):
+    pass
+
+
+def like_exact(s: str) -> str:
+    """`s` as a LIKE pattern that matches only itself."""
+    return re.sub(r"([\\%_])", r"\\\1", s)
+
+
 class Scheduler:
     """Runs due jobs without a person present. Same policy pipeline as chat, but nobody can answer a
     prompt, so risky tools are refused unless a policy scope pre-allows the path. Each job runs as its
@@ -2580,21 +2637,7 @@ class Scheduler:
     def budget_left(self, since: str) -> tuple[Budget | None, str]:
         """The run budget, shrunk to what is left of the daily limits shared by all jobs; None when
         nothing is left. A single model call can still overshoot, as with any budget."""
-        if self.daily_tokens is None and self.daily_cost is None:
-            return self.budget, ""
-        tokens, cost = self.k.store.job_usage_since(since)
-        b = dataclasses.replace(self.budget)
-        if self.daily_tokens is not None:
-            if tokens >= self.daily_tokens:
-                return None, f"daily token budget of {self.daily_tokens} reached ({tokens} used in 24h)"
-            left = self.daily_tokens - tokens
-            b.max_total_tokens = left if b.max_total_tokens is None else min(b.max_total_tokens, left)
-        if self.daily_cost is not None:
-            if cost >= self.daily_cost:
-                return None, f"daily cost budget of ${self.daily_cost:.4f} reached (${cost:.4f} used in 24h)"
-            left = self.daily_cost - cost
-            b.max_cost_usd = left if b.max_cost_usd is None else min(b.max_cost_usd, left)
-        return b, ""
+        return daily_budget(self.k.store, self.budget, self.daily_tokens, self.daily_cost, since, "job-%")
 
     def agent_for(self, job: dict) -> Agent:
         pol = self.policy.get(job["agent"])
@@ -3372,6 +3415,7 @@ def cli():
     aa.add_argument("--port", type=int, default=8770, help="port on 127.0.0.1 (default 8770)")
     aa.add_argument("--description", default="", help="what the agent does, shown in its agent card")
     aa.add_argument("--timeout", type=float, default=300, help="seconds one request may run (default 300)")
+    add_daily_flags(aa, "all requests together", "later requests fail")
     add_model_flags(aa)
     co = sub.add_parser("console", help="local web console: audit log, jobs, memory, skills; read-only unless --approve")
     co.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
@@ -3414,10 +3458,7 @@ def cli():
     dm.add_argument("--tick", type=float, default=10, help="seconds between checks (default 10)")
     dm.add_argument("--timeout", type=float, default=300, help="seconds one job may run (default 300)")
     dm.add_argument("--max-runs-per-day", type=int, default=200, help="per job, a runaway guard (default 200)")
-    dm.add_argument("--daily-max-tokens", type=int, metavar="N",
-                    help="tokens all jobs together may use in any 24 hours; later runs are skipped (default: no limit)")
-    dm.add_argument("--daily-max-cost", type=float, metavar="USD",
-                    help="the same in dollars (needs --price-in/--price-out)")
+    add_daily_flags(dm, "all jobs together", "later runs are skipped")
     add_mcp_flags(dm)
     dm.add_argument("--webhook-port", type=int, metavar="PORT",
                     help="accept POST /hook/<job> on 127.0.0.1:PORT for `on webhook` jobs (off by default)")
@@ -3544,16 +3585,14 @@ def cli():
             ap.error("--webhook-port needs a long-running daemon (not --once) and a port 0-65535")
         if a.approvals == "console" and a.approve_timeout >= a.timeout:
             ap.error("--approve-timeout must be shorter than --timeout (the job would be stopped first)")
-        if (a.daily_max_tokens is not None and a.daily_max_tokens < 1) or (a.daily_max_cost is not None and a.daily_max_cost <= 0):
-            ap.error("--daily-max-tokens / --daily-max-cost must be positive")
-        if a.daily_max_cost is not None and not (a.price_in or a.price_out):
-            ap.error("--daily-max-cost needs --price-in / --price-out")
+        check_daily_flags(a, ap)
         check_mcp_flags(a, ap)
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
                                   a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
                                   a.mcp, set(a.confine_mcp)))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
+        check_daily_flags(a, ap)
         policy = None
         if a.policy:
             try:
@@ -3562,7 +3601,8 @@ def cli():
                 ap.error(f"--policy {a.policy}: {e}")
         try:
             return asyncio.run(a2a_serve(a.agent, policy, a.home, provider, budget, a.port, a.description,
-                                         a.timeout, os.environ.get("AIOS_A2A_TOKEN")))
+                                         a.timeout, os.environ.get("AIOS_A2A_TOKEN"),
+                                         a.daily_max_tokens, a.daily_max_cost))
         except OSError as e:
             ap.error(f"cannot listen on 127.0.0.1:{a.port}: {e}")
     if a.cmd == "skills":
