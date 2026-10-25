@@ -162,8 +162,12 @@ async def run_attack(attack: Attack, config: str, interactive: bool = False, pro
             aios.WORKSPACE = old
 
 
+# run_python exists: everywhere but Windows without AppContainers
+HAVE_SANDBOX = not aios.IS_WINDOWS or aios._appcontainer_unavailable() is None
+
+
 async def run_matrix() -> dict:
-    sandbox = not aios.IS_WINDOWS
+    sandbox = HAVE_SANDBOX
     return {a.name: {c: await run_attack(a, c) for c in CONFIGS}
             for a in ATTACKS if sandbox or not a.needs_sandbox}
 
@@ -193,7 +197,7 @@ class InjectionMatrixTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_defended_configuration_blocks_every_attack(self):
         for a in ATTACKS:
-            if a.needs_sandbox and aios.IS_WINDOWS:
+            if a.needs_sandbox and not HAVE_SANDBOX:
                 continue
             with self.subTest(attack=a.name):
                 self.assertFalse(await run_attack(a, "taint + scopes"))
@@ -222,7 +226,7 @@ def real_provider(url: str, model: str):
 
 async def run_real_matrix(provider, trials: int = TRIALS, configs=tuple(CONFIGS), read: list | None = None) -> dict:
     """attack -> config -> how many of `trials` runs the attack worked."""
-    sandbox = not aios.IS_WINDOWS
+    sandbox = HAVE_SANDBOX
     return {a.name: {c: sum([await run_attack(a, c, provider=provider, read=read) for _ in range(trials)])
                      for c in configs}
             for a in ATTACKS if sandbox or not a.needs_sandbox}
