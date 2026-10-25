@@ -734,7 +734,7 @@ class Kernel:
         from mcp.client.stdio import get_default_environment, stdio_client
 
         if confine:
-            state = tempfile.mkdtemp(prefix=f"aios-mcp-{re.sub(r'[^\w-]', '_', server)}-")
+            state = tempfile.mkdtemp(prefix="aios-mcp-" + re.sub(r"[^\w-]", "_", server) + "-")
             self._stack.callback(shutil.rmtree, state, ignore_errors=True)
             command, *args = confine_command(command, list(args), state)
             env = {**(env or get_default_environment()), "HOME": state, "TMPDIR": state}
