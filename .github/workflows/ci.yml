@@ -97,7 +97,7 @@ jobs:
     # Real models on a real Ollama server: vector memory search with an embedding model (not the
     # stand-in), and the prompt-injection suite measured against a small local chat model.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60  # the injection suite on qwen2.5:3b takes about 25 minutes
     env:
       AIOS_TEST_EMBED_URL: http://127.0.0.1:11434/v1
       AIOS_TEST_EMBED_MODEL: nomic-embed-text
