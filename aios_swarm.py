@@ -9,6 +9,8 @@ this module only schedules, it never decides what a worker may do.
 """
 import asyncio
 
+MIN_REPLY_TOKENS = 64  # same as aios.MIN_REPLY_TOKENS
+
 RESULT_CHARS = 1_500  # chars of one worker's answer shown to the calling agent
 ANSWER_CHARS = 20_000  # chars of the whole swarm answer shown to the calling agent
 REDUCE_ITEM_CHARS = 4_000  # chars of one answer handed to a reducer
@@ -45,10 +47,23 @@ class Ledger:
             led.calls += 1
             led = led.parent
 
+    def output_room(self, next_in: int, room: int) -> int:
+        """Like Budget.output_room, for this ledger and every one above it: room, or less."""
+        led = self
+        while led is not None:
+            if led.max_tokens is not None:
+                room = min(room, led.max_tokens - led.tokens - next_in)
+            if led.max_cost_usd is not None:
+                left = led.max_cost_usd - (led.cost() + next_in * led.price_in / 1e6)
+                room = min(room, int(left * 1e6 / led.price_out) if led.price_out else room if left > 0 else 0)
+            led = led.parent
+        return max(room, 0)
+
     def exceeded(self) -> str | None:
         led = self
         while led is not None:
-            if led.max_tokens is not None and led.tokens >= led.max_tokens:
+            # exhausted once too little is left for one more reply (aios.MIN_REPLY_TOKENS)
+            if led.max_tokens is not None and led.tokens > led.max_tokens - MIN_REPLY_TOKENS:
                 return f"swarm token budget exhausted ({led.tokens}/{led.max_tokens})"
             if led.max_cost_usd is not None and led.cost() >= led.max_cost_usd:
                 return f"swarm cost budget exhausted (${led.cost():.4f}/${led.max_cost_usd:.4f})"

@@ -85,7 +85,7 @@ SWARM_TIMEOUT = 600.0  # seconds one helper may run inside a swarm
 @dataclass
 class Completion:
     content: list[dict]  # blocks: {"type":"text","text"} | {"type":"tool_use","id","name","input"}
-    stop_reason: str  # "tool_use" | "end_turn"
+    stop_reason: str  # "tool_use" | "end_turn" | "max_tokens" (the reply was cut at max_tokens)
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -105,7 +105,7 @@ class AnthropicProvider:
         usage = getattr(resp, "usage", None)
         return Completion(
             [b.model_dump(exclude_none=True) for b in resp.content],
-            "tool_use" if resp.stop_reason == "tool_use" else "end_turn",
+            resp.stop_reason if resp.stop_reason in ("tool_use", "max_tokens") else "end_turn",
             getattr(usage, "input_tokens", 0) or 0, getattr(usage, "output_tokens", 0) or 0)
 
 
@@ -164,7 +164,9 @@ class OpenAICompatProvider:
             blocks.append({"type": "tool_use", "id": tc.get("id") or f"call_{i}",
                            "name": tc["function"]["name"], "input": args})
         u = resp.get("usage") or {}
-        return Completion(blocks, "tool_use" if msg.get("tool_calls") else "end_turn",
+        stop = ("tool_use" if msg.get("tool_calls") else
+                "max_tokens" if resp["choices"][0].get("finish_reason") == "length" else "end_turn")
+        return Completion(blocks, stop,
                           u.get("prompt_tokens", 0) or 0, u.get("completion_tokens", 0) or 0)
 
     def _post(self, payload: dict) -> dict:
@@ -193,6 +195,8 @@ class OpenAICompatProvider:
 
 
 # ---- Budget: hard limits per run ----
+REPLY_TOKENS = 1024  # longest reply asked for in one model call
+MIN_REPLY_TOKENS = 64  # with less room than this left, the run stops instead of calling
 @dataclass
 class Budget:
     max_steps: int = 8
@@ -210,8 +214,21 @@ class Budget:
     def cost(self, tokens_in: int, tokens_out: int) -> float:
         return (tokens_in * self.price_in_per_mtok + tokens_out * self.price_out_per_mtok) / 1e6
 
+    def output_room(self, tokens_in: int, tokens_out: int, next_in: int) -> int:
+        """How long the next reply may be (in tokens) so the run stays within its limits, if the
+        next prompt is next_in tokens; at most REPLY_TOKENS."""
+        room = REPLY_TOKENS
+        if self.max_total_tokens is not None:
+            room = min(room, self.max_total_tokens - tokens_in - tokens_out - next_in)
+        if self.max_cost_usd is not None:
+            left = self.max_cost_usd - self.cost(tokens_in + next_in, tokens_out)
+            room = min(room, int(left * 1e6 / self.price_out_per_mtok) if self.price_out_per_mtok
+                       else room if left > 0 else 0)
+        return max(room, 0)
+
     def exceeded(self, tokens_in: int, tokens_out: int) -> str | None:
-        """Checked after every model call. A single call can overshoot the limit."""
+        """Checked after every model call. Before each call output_room caps the reply, so only a
+        prompt that grew (tool results) can still take a run past its limit."""
         if self.max_total_tokens is not None and tokens_in + tokens_out >= self.max_total_tokens:
             return f"token budget exhausted ({tokens_in + tokens_out}/{self.max_total_tokens})"
         if self.max_cost_usd is not None and self.cost(tokens_in, tokens_out) >= self.max_cost_usd:
@@ -952,7 +969,7 @@ class Kernel:
         system = self._system(agent, task)  # frozen for the whole run (thinking blocks bind to it)
         self._push(agent, {"role": "user", "content": task})
 
-        t_in = t_out = steps = 0
+        t_in = t_out = steps = last_in = 0
         counts = agent.run_counts = {}  # per-run call counters for max_calls (swarm jobs count too)
         stop, answer = "max_steps", "(max steps reached)"
         try:
@@ -961,17 +978,27 @@ class Kernel:
                 if over:  # other helpers of the swarm spent the shared budget
                     stop, answer = "budget", f"(stopped: {over})"
                     break
+                # the next prompt is at least as long as the last one: leave room for it
+                room = budget.output_room(t_in, t_out, last_in)
+                if agent.ledger:
+                    room = agent.ledger.output_room(last_in, room)
+                if room < MIN_REPLY_TOKENS:
+                    stop, answer = "budget", ("(stopped: the budget has no room for another model call: "
+                                              f"{t_in + t_out} tokens used, the last prompt was {last_in})")
+                    break
                 steps += 1
                 async with self.model_slots:
                     comp = await self.provider.complete(
-                        system, agent.history, self.tools.schemas_for(agent.permissions))
-                t_in, t_out = t_in + comp.input_tokens, t_out + comp.output_tokens
+                        system, agent.history, self.tools.schemas_for(agent.permissions), max_tokens=room)
+                t_in, t_out, last_in = t_in + comp.input_tokens, t_out + comp.output_tokens, comp.input_tokens
                 if agent.ledger:
                     agent.ledger.add(comp.input_tokens, comp.output_tokens)
                 self._push(agent, {"role": "assistant", "content": comp.content})
                 if comp.stop_reason != "tool_use":
                     stop = "finished"
                     answer = "".join(b.get("text", "") for b in comp.content if b.get("type") == "text")
+                    if comp.stop_reason == "max_tokens" and room < REPLY_TOKENS:  # cut short by the budget
+                        stop, answer = "budget", answer + "\n(stopped: the reply was cut off at the budget)"
                     break
                 over = budget.exceeded(t_in, t_out) or (agent.ledger.exceeded() if agent.ledger else None)
                 if over:  # stop before running more tools; the dangling tool_use is cleaned next run
@@ -2759,15 +2786,16 @@ def daily_budget(store: "Store", budget: Budget, daily_tokens: int | None, daily
     tokens, cost = store.usage_since(since, agent_like)
     b = dataclasses.replace(budget)
     if daily_tokens is not None:
-        if tokens >= daily_tokens:
-            return None, f"daily token budget of {daily_tokens} reached ({tokens} used in 24h)"
         left = daily_tokens - tokens
         b.max_total_tokens = left if b.max_total_tokens is None else min(b.max_total_tokens, left)
+        if left < MIN_REPLY_TOKENS:  # also when a little is left: too little for one more call
+            return None, f"daily token budget of {daily_tokens} reached ({tokens} used in 24h)"
     if daily_cost is not None:
-        if cost >= daily_cost:
-            return None, f"daily cost budget of ${daily_cost:.4f} reached (${cost:.4f} used in 24h)"
         left = daily_cost - cost
         b.max_cost_usd = left if b.max_cost_usd is None else min(b.max_cost_usd, left)
+        if left <= 0 or dataclasses.replace(b, max_total_tokens=None, max_cost_usd=left).output_room(0, 0, 0) \
+                < MIN_REPLY_TOKENS:
+            return None, f"daily cost budget of ${daily_cost:.4f} reached (${cost:.4f} used in 24h)"
     return b, ""
 
 
