@@ -294,6 +294,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *Worker 池與背壓*：固定 `--parallel` 個 worker（預設 8）從任務清單取工作，所以 10 萬個任務也不會在記憶體裡同時有 10 萬個執行；任務檔只有在有 worker 空出來時才會往下讀。
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
+- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每秒約 2,300 個，每個約 8 KB），經 HTTP 跑過 10,000 個；接真模型時瓶頸是 GPU。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
 - *資料庫*：SQLite 改用 WAL，上百個 worker 寫審計日誌時不會卡住，控制台也能同時讀取。已用 3,000 個任務、400 個 worker、150 個模型槽位測試。
