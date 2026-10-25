@@ -134,8 +134,8 @@ class ClientOfARealServerTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(HAVE_MCP, "needs the mcp SDK (pip install mcp)")
 class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
-    # forward slashes: shlex.split drops the backslashes of a Windows path
-    DEMO = f'demo="{Path(sys.executable).as_posix()}" "{(ROOT / "demo_mcp_server.py").as_posix()}"'
+    # native paths, as a user types them: backslashes on Windows
+    DEMO = f'demo="{sys.executable}" "{ROOT / "demo_mcp_server.py"}"'
 
     def setUp(self):
         self.addCleanup(setattr, aios, "WORKSPACE", aios.WORKSPACE)
@@ -188,6 +188,11 @@ class McpFlagTests(unittest.TestCase):
             aios.cli()
         d.assert_not_called()
         return err.getvalue()
+
+    def test_windows_paths_keep_their_backslashes(self):
+        self.assertEqual(aios.split_command(r'C:\Py\python.exe "C:\My Tools\s.py" --x', windows=True),
+                         [r"C:\Py\python.exe", r"C:\My Tools\s.py", "--x"])
+        self.assertEqual(aios.split_command(r'python a\ b.py "#1"', windows=False), ["python", "a b.py", "#1"])
 
     def test_bad_specs_and_unknown_confine_names_are_refused(self):
         self.assertIn("NAME=COMMAND", self.parse("--mcp", "python server.py"))
