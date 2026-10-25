@@ -42,6 +42,16 @@ jobs:
           echo "AIOS_TEST_DOCKER_STOP=sudo systemctl stop docker.socket docker.service" >> "$GITHUB_ENV"
           echo "AIOS_TEST_DOCKER_START=sudo systemctl start docker.socket docker.service && until docker info >/dev/null 2>&1; do sleep 0.5; done" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
+      - name: Install as a package and run the aios command outside the checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/pkg"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$RUNNER_TEMP/pkg/Scripts"; else bin="$RUNNER_TEMP/pkg/bin"; fi
+          "$bin/python" -m pip install -q .
+          cd "$RUNNER_TEMP"
+          "$bin/aios" --help > /dev/null
+          "$bin/aios" doctor --home "$RUNNER_TEMP/aios-home" || true  # exits 1 when something is unavailable
+          "$bin/python" -c "import aios, aios_egress, aios_a2a; print('installed', aios.__file__)"
 
   docker-rootless:
     # Rootless Docker: without cgroup delegation the daemon ignores --memory/--pids-limit/--cpus and

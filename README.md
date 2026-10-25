@@ -44,7 +44,13 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 
 ## Quick start
 
-Requires Python 3.10+ and an [Anthropic API key](https://platform.claude.com/settings/keys).
+Requires Python 3.11+ and an [Anthropic API key](https://platform.claude.com/settings/keys) (or a local model, below). Run it from a checkout as `python aios.py`, or install the `aios` command (standard library only; the extras add the Anthropic SDK and the MCP SDK):
+
+```bash
+pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # then: aios chat, aios doctor, ...
+```
+
+From a checkout:
 
 ```bash
 pip install anthropic            # optional: pip install mcp
