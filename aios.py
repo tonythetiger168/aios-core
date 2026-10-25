@@ -1168,10 +1168,11 @@ def confine_command(command: str, args, state_dir: str, network: bool = True) ->
 
 
 class Sandbox:
-    """run_python as a local child process: rlimits + no network on Linux, timeout only on Windows.
-    With Landlock (Linux 5.13+) it reads only Python, system libraries and the workspace, and writes
-    only its own throwaway folder; on macOS sandbox-exec keeps it out of home folders, temp folders
-    and the network. Otherwise it reads whatever files the user can read."""
+    """run_python as a local child process: rlimits + no network on Linux, an AppContainer in a job
+    object on Windows (see aios_appcontainer). With Landlock (Linux 5.13+) it reads only Python,
+    system libraries and the workspace, and writes only its own throwaway folder; on macOS
+    sandbox-exec keeps it out of home folders, temp folders and the network. Otherwise it reads
+    whatever files the user can read."""
     name = "process"
 
     def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000, max_procs=64):
@@ -1186,8 +1187,13 @@ class Sandbox:
         if not self.net_isolated and landlock_abi() >= 4:
             self.net_isolated = "tcp"  # Landlock blocks TCP bind/connect; UDP still works
         if IS_WINDOWS:
-            print("[sandbox] WARNING: Windows = timeout only (no memory/network limits). "
-                  "Use WSL2 or Docker for real isolation.", file=sys.stderr)
+            import aios_appcontainer
+            why = aios_appcontainer.unavailable()
+            if why is None:
+                self.fs_isolated, self.net_isolated = "appcontainer", "all"
+            else:
+                print(f"[sandbox] WARNING: Windows = timeout only (no memory/network limits): {why}. "
+                      "Use WSL2 or Docker for real isolation.", file=sys.stderr)
         else:
             if not self.net_isolated:
                 print("[sandbox] WARNING: network isolation unavailable on this host", file=sys.stderr)
@@ -1249,6 +1255,8 @@ class Sandbox:
         WORKSPACE.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=WORKSPACE) as d:  # throwaway cwd
             Path(d, "main.py").write_text(code, encoding="utf-8")
+            if self.fs_isolated == "appcontainer":
+                return await self._run_appcontainer(d)
             cmd = [sys.executable, "-I", "main.py"]  # -I: ignore env vars and user site
             if self.fs_isolated == "landlock":
                 cmd = [sys.executable, "-I", "-c", LANDLOCK_BOOT, _landlock_config(d), "main.py"]
@@ -1272,6 +1280,18 @@ class Sandbox:
                 await self._kill(proc)
                 return f"killed: timeout after {self.timeout}s"
             return f"exit={proc.returncode}\n{_clip(out.decode(errors='replace'), self.max_out)}"
+
+    async def _run_appcontainer(self, d: str) -> str:
+        import aios_appcontainer as ac
+        for path in ac.python_dirs() + [str(WORKSPACE)]:
+            await asyncio.to_thread(ac.grant, path)
+        await asyncio.to_thread(ac.grant, d, True)
+        env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"), "TEMP": d, "TMP": d}
+        code, out = await asyncio.to_thread(ac.run, [ac.base_python(), "-I", "main.py"], d, env, self.timeout,
+                                            self.cpu_s, self.mem, self.max_procs, self.max_out * 4)
+        if code == ac.TIMED_OUT:
+            return f"killed: timeout after {self.timeout}s"
+        return f"exit={code}\n{_clip(out.decode(errors='replace'), self.max_out)}"
 
 
 def docker_image() -> str:
@@ -1786,6 +1806,11 @@ class MicroVMSandbox:
                     shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _appcontainer_unavailable() -> str | None:
+    import aios_appcontainer
+    return aios_appcontainer.unavailable()
+
+
 def make_sandbox(choice: str | None = None):
     """The run_python backend for `choice` (see SANDBOXES), or None when run_python stays off.
     An explicit "docker" or "microvm" that cannot run raises RuntimeError (asked-for isolation
@@ -1813,7 +1838,7 @@ def make_sandbox(choice: str | None = None):
         for note in DockerSandbox.provenance(docker_image()):  # the only real isolation on Windows
             print(f"[sandbox] {note}", file=sys.stderr)
         return DockerSandbox()
-    if IS_WINDOWS and not weak_ok:  # "process" on Windows is timeout-only: opt-in
+    if IS_WINDOWS and not weak_ok and _appcontainer_unavailable():  # timeout-only "process": opt-in
         print("[aios] run_python disabled on Windows (no real sandbox). Use --sandbox docker "
               f"(after `docker pull {DOCKER_IMAGE}`), WSL2, or set AIOS_ALLOW_WEAK_SANDBOX=1 to enable "
               "it unsafely.", file=sys.stderr)
@@ -1836,6 +1861,8 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
             network = {True: "network namespace enabled", "tcp": "no TCP connections",
                        "all": "no network"}.get(box.net_isolated, "network NOT isolated")
             files = {"landlock": "reads only Python, system libraries and the workspace, writes only its own folder",
+                     "appcontainer": "Windows AppContainer: reads only Windows, Program Files, Python and the "
+                                     "workspace, writes only its own folder",
                      "seatbelt": "cannot read home or temp folders except the workspace, writes only its own folder"
                      }.get(box.fs_isolated, "can read files accessible to this user")
             isolation = f"Local process; {files}; {network}. "
@@ -3359,9 +3386,17 @@ def doctor_cmd(home: str) -> int:
     print("sandboxes (run_python):")
     quiet = io.StringIO()
     with contextlib.redirect_stderr(quiet):
-        box = None if IS_WINDOWS else Sandbox()
-    if IS_WINDOWS:
-        row("--", "process", "timeout only: off unless AIOS_ALLOW_WEAK_SANDBOX=1")
+        box = Sandbox()
+    if IS_WINDOWS and box.fs_isolated != "appcontainer":
+        row("--", "process", f"timeout only ({_appcontainer_unavailable()}): off unless AIOS_ALLOW_WEAK_SANDBOX=1")
+    elif IS_WINDOWS:
+        import aios_appcontainer
+        row("ok", "process", "a local subprocess with these limits:")
+        row("ok", "  files", f"AppContainer {aios_appcontainer.container_sid()[1]}: no access to your user "
+            "folder; reads Windows, Program Files, Python and the workspace")
+        row("ok", "  network", "no network (no capabilities)")
+        row("ok", "  memory", f"{box.mem // 2**20} MB per process (job object)")
+        row("ok", "  processes", f"at most {box.max_procs} at once (job object)")
     else:
         row("ok", "process", "a local subprocess with these limits:")
         files = {"landlock": f"Landlock ABI {landlock_abi()}: no access to your home and other files",
