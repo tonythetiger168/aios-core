@@ -14,8 +14,12 @@ Rules (over the last WINDOW_MINUTES):
   refusal-spike     one agent was refused DENIED_SPIKE or more times
   budget-stop       a run stopped on its token or cost budget
   job-failing       a job's last JOB_FAIL_RUNS runs all ended in error or timeout
+  audit-tampered    the audit log's hash chain no longer checks out: an entry was edited, removed
+                    or inserted outside AIOS (checked over the whole log, not just the window)
 The same rule for the same subject is not raised again within COOLDOWN_MINUTES.
 """
+import hashlib
+import json
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -26,7 +30,7 @@ JOB_FAIL_RUNS = 3
 STALE_AFTER = 120  # seconds without a heartbeat before the daemon counts as down (at least 3 ticks)
 RUN_ENTRY = "(run)"
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
-            "budget-stop": "info", "job-failing": "warning"}
+            "budget-stop": "info", "job-failing": "warning", "audit-tampered": "critical"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
@@ -57,6 +61,43 @@ def liveness(db: sqlite3.Connection, name: str = "daemon", now=None, stale_after
         return {"state": "never", "ts": None, "age": None, "info": ""}
     age = ((now or datetime.now()) - datetime.fromisoformat(row[0])).total_seconds()
     return {"state": "alive" if age <= stale_after else "down", "ts": row[0], "age": age, "info": row[1]}
+
+
+def audit_hash(prev: str, ts, agent, tool, args, result, status) -> str:
+    """One link of the audit chain: each entry's hash covers its fields and the previous hash."""
+    body = json.dumps([ts, agent, tool, args, result, status], ensure_ascii=False)
+    return hashlib.sha256(f"{prev}\n{body}".encode()).hexdigest()
+
+
+def verify_audit(db: sqlite3.Connection, head: str | None = None) -> dict:
+    """Recompute the audit chain. Returns {'ok', 'checked', 'unchained', 'head', 'problem', 'head_found'}.
+    unchained: entries written before chaining existed (they come first and are not covered). head: a
+    head printed earlier; it must still be in the chain, which also catches a chain rebuilt from scratch."""
+    prev, checked, unchained, problem = "", 0, 0, None
+    head_found = None if head is None else False
+    for rid, ts, agent, tool, args, result, status, h in db.execute(
+            "SELECT id, ts, agent, tool, args, result, status, hash FROM audit ORDER BY id"):
+        if h is None:
+            if checked:
+                problem = f"entry {rid} has no hash after chained entries (added outside AIOS?)"
+                break
+            unchained += 1
+            continue
+        if h != audit_hash(prev, ts, agent, tool, args, result, status):
+            problem = f"entry {rid} does not match the chain: it, or one before it, was changed, removed or inserted"
+            break
+        prev, checked = h, checked + 1
+        if h == head:
+            head_found = True
+    if problem is None:
+        seq = db.execute("SELECT seq FROM sqlite_sequence WHERE name='audit'").fetchone()
+        last = db.execute("SELECT MAX(id) FROM audit").fetchone()[0] or 0
+        if seq and seq[0] > last:
+            problem = f"the newest {seq[0] - last} entries were removed (ids up to {seq[0]} were used)"
+    if problem is None and head_found is False:
+        problem = "the saved head is not in the chain: entries up to it were changed or removed"
+    return {"ok": problem is None, "checked": checked, "unchained": unchained,
+            "head": prev or None, "problem": problem, "head_found": head_found}
 
 
 def _raise(db, now, rule: str, subject: str, detail: str) -> dict | None:
@@ -101,6 +142,11 @@ def check(db: sqlite3.Connection, now=None) -> list[dict]:
         if len(last) == JOB_FAIL_RUNS and all(s in ("error", "timeout") for (s,) in last):
             found.append(("job-failing", f"job-{job}",
                           f"job {job} failed its last {JOB_FAIL_RUNS} runs (aios jobs history {job})."))
+    if "hash" in {r[1] for r in db.execute("PRAGMA table_info(audit)")}:
+        v = verify_audit(db)
+        if not v["ok"]:
+            found.append(("audit-tampered", "audit", f"{v['problem']}. Run `aios audit --verify`; "
+                          "do not trust the log past that point."))
     added = [a for rule, subject, detail in found if (a := _raise(db, now, rule, subject, detail))]
     db.commit()
     return added
