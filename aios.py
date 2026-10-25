@@ -1724,11 +1724,23 @@ class MicroVMSandbox:
                  "random.trust_cpu=on init=/aios-init ro")
 
     def __init__(self, home=None, timeout=10, vcpus=1, mem_mb=256, max_out=10_000,
-                 boot_timeout=15, cleanup_timeout=3, max_code=1 << 20, jailed=None):
+                 boot_timeout=15, cleanup_timeout=3, max_code=1 << 20, jailed=None, snapshot=None):
         self.home = Path(home or os.environ.get("AIOS_MICROVM_DIR") or MICROVM_HOME)
         self.timeout, self.vcpus, self.mem_mb, self.max_out = timeout, vcpus, mem_mb, max_out
         self.boot_timeout, self.cleanup_timeout, self.max_code = boot_timeout, cleanup_timeout, max_code
         self.jailed = self.jailer_wanted() if jailed is None else jailed
+        self.snapshot = os.environ.get("AIOS_MICROVM_SNAPSHOT") != "0" if snapshot is None else snapshot
+
+    # Snapshots: instead of booting, each call restores a VM that was booted once and paused
+    # where its init waits for a job (see "Snapshots" in docs/microvm-sandbox.md). The snapshot
+    # lives in $AIOS_MICROVM_DIR/snapshots/<key>; the key changes with firecracker, the images
+    # and the VM shape, so a stale one is never restored. Paths in it are relative, so the same
+    # snapshot restores in a temp dir or a jail. If one cannot be made or restored, calls boot.
+    SNAPSHOT_FORMAT = 1
+    SNAPSHOT_JOB_SIZE = (1 << 20) + 4096  # the job drive's size is fixed in the snapshot
+    WAIT_ARG = "aios_wait=1"
+    _snapshots: dict = {}  # key -> snapshot dir, or the reason it is not used (this process)
+    _snapshot_locks: dict = {}
 
     # With AIOS_MICROVM_JAILER=1 (AIOS running as root, e.g. as a system service) each VMM is
     # started by Firecracker's jailer: chroot into a per-call directory, its own unprivileged
@@ -1772,19 +1784,25 @@ class MicroVMSandbox:
                 return f"jailer not found at {p['jailer']} (it ships in the Firecracker release tarball)"
         return None
 
-    def job_image(self, nonce: str, code: str) -> bytes:
+    def job_image(self, nonce: str, code: str, size: int | None = None) -> bytes:
+        """Header, code, then a fresh random seed and the time for the guest (see
+        aios_microvm_init); padded to 512 bytes, or to exactly size."""
         data = code.encode()
         if len(data) > self.max_code:
             raise ValueError(f"code is larger than {self.max_code} bytes")
-        blob = f"AIOS1 {nonce} {self.timeout} {self.max_out} {len(data)}\n".encode() + data
-        return blob + b"\0" * (-len(blob) % 512)
+        blob = (f"AIOS1 {nonce} {self.timeout} {self.max_out} {len(data)}\n".encode() + data
+                + f"\nAIOSX seed={secrets.token_hex(32)} time={datetime.now().timestamp():.6f}\n".encode())
+        if size is not None and len(blob) > size:
+            raise ValueError(f"code is larger than {size - 512} bytes")
+        return blob + b"\0" * ((size - len(blob)) if size is not None else (-len(blob) % 512))
 
-    def config(self, workdir: Path) -> dict:
+    def config(self, workdir: Path, snapshot=False) -> dict:
         p = self.paths(self.home)
-        if self.jailed:  # paths inside the jail's chroot
-            p, workdir = {"kernel": "vmlinux", "rootfs": "rootfs.ext4"}, Path(".")
+        if self.jailed or snapshot:  # paths inside the jail's chroot, or the snapshot's own dir
+            p, workdir = {"kernel": p["kernel"] if snapshot else "vmlinux", "rootfs": "rootfs.ext4"}, Path(".")
         return {
-            "boot-source": {"kernel_image_path": str(p["kernel"]), "boot_args": self.BOOT_ARGS},
+            "boot-source": {"kernel_image_path": str(p["kernel"]),
+                            "boot_args": self.BOOT_ARGS + (" " + self.WAIT_ARG if snapshot else "")},
             "drives": [
                 {"drive_id": "rootfs", "path_on_host": str(p["rootfs"]),
                  "is_root_device": True, "is_read_only": True},
@@ -1831,18 +1849,21 @@ class MicroVMSandbox:
             raise RuntimeError(f"microVM cleanup unconfirmed: firecracker pid {proc.pid} "
                                "did not exit after SIGKILL") from None
 
-    def _jail(self, jail_id: str) -> tuple[Path, list[str]]:
+    def _jail(self, jail_id: str, snap: Path | None = None) -> tuple[Path, list[str]]:
         """Prepare the chroot for one jailed VMM: its directory and the jailer command line."""
         p = self.paths(self.home)
         root = p["jails"] / "firecracker" / jail_id / "root"
         root.mkdir(parents=True, mode=0o700)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             os.chown(root, self.JAIL_UID, self.JAIL_UID)  # only the VMM's uid can enter its root
-        for key, name in (("kernel", "vmlinux"), ("rootfs", "rootfs.ext4")):
+        files = [(p["kernel"], "vmlinux"), (p["rootfs"], "rootfs.ext4")]
+        if snap:
+            files += [(snap / "vm.snap", "vm.snap"), (snap / "vm.mem", "vm.mem")]
+        for src, name in files:
             try:
-                os.link(p[key], root / name)  # same filesystem: no copy of the root image
+                os.link(src, root / name)  # same filesystem: no copy of the root image
             except OSError:
-                shutil.copyfile(p[key], root / name)
+                shutil.copyfile(src, root / name)
         cgroup = ["--cgroup-version", "2", "--cgroup",
                   f"memory.max={(self.mem_mb + self.JAIL_OVERHEAD_MB) << 20}"] \
             if Path("/sys/fs/cgroup/cgroup.controllers").exists() else []
@@ -1858,25 +1879,56 @@ class MicroVMSandbox:
             pass
 
     async def run_python(self, code: str) -> str:
+        snap = await self._snapshot() if self.snapshot else None
+        if snap is not None:
+            try:
+                return await self._call(code, snap)
+            except _RestoreFailed as e:  # nothing ran yet: the guest never got its job
+                self._snapshots[snap.name] = f"restore failed: {e}"
+                print(f"[aios] microVM snapshot not used, booting instead: {e}", file=sys.stderr)
+        return await self._call(code, None)
+
+    async def _call(self, code: str, snap: Path | None) -> str:
         nonce = secrets.token_hex(16)
+        fc = str(self.paths(self.home)["firecracker"])
         if self.jailed:
             jail_id = f"aios-mvm-{secrets.token_hex(8)}"
-            workdir, prefix = self._jail(jail_id)
+            workdir, prefix = self._jail(jail_id, snap)
             config = "config.json"  # the jailer starts firecracker inside the chroot
         else:
-            workdir, prefix = Path(tempfile.mkdtemp(prefix="aios-mvm-")), [str(self.paths(self.home)["firecracker"])]
+            workdir, prefix = Path(tempfile.mkdtemp(prefix="aios-mvm-")), [fc]
             config = str(workdir / "config.json")
-        proc = None
+        proc, dirfd = None, None
         try:
-            (workdir / "job.img").write_bytes(self.job_image(nonce, code))
-            (workdir / "config.json").write_text(json.dumps(self.config(workdir)))
+            (workdir / "job.img").write_bytes(
+                self.job_image(nonce, code, self.SNAPSHOT_JOB_SIZE if snap else None))
+            if snap:
+                if not self.jailed:
+                    for name in ("vm.snap", "vm.mem"):
+                        os.symlink(snap / name, workdir / name)
+                    os.symlink(self.paths(self.home)["rootfs"], workdir / "rootfs.ext4")
+                args = ["--api-sock", "api.sock"]
+            else:
+                (workdir / "config.json").write_text(json.dumps(self.config(workdir)))
+                args = ["--no-api", "--config-file", config]
             if self.jailed:
                 for name in ("job.img", "config.json"):
-                    os.chmod(workdir / name, 0o444)
+                    if (workdir / name).exists():
+                        os.chmod(workdir / name, 0o444)
             proc = await asyncio.create_subprocess_exec(
-                *prefix, "--no-api", "--config-file", config, "--level", "Error",
-                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, cwd=workdir, start_new_session=True)
+                *prefix, *args, "--level", "Error",
+                stdin=asyncio.subprocess.PIPE if snap else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=workdir,
+                start_new_session=True)
+            if snap:
+                dirfd = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY)
+                try:  # through /proc/self/fd: a jail's socket path is too long for AF_UNIX
+                    await asyncio.wait_for(self._restore(proc, f"/proc/self/fd/{dirfd}/api.sock"),
+                                           self.boot_timeout)
+                except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as e:
+                    raise _RestoreFailed(str(e) or type(e).__name__) from None
+                proc.stdin.write(b"go\n")  # the init reads its job only now
+                await proc.stdin.drain()
             # The guest enforces the code's timeout; the host deadline also covers boot and
             # shutdown, and holds even if the guest never answers.
             limit = 4 * self.max_out + 65536
@@ -1893,6 +1945,8 @@ class MicroVMSandbox:
                                    + (f": {tail}" if tail else ""))
             return result
         finally:
+            if dirfd is not None:
+                os.close(dirfd)
             try:
                 if proc is not None:
                     await asyncio.shield(self._stop(proc))
@@ -1901,6 +1955,133 @@ class MicroVMSandbox:
                     self._unjail(jail_id)
                 else:
                     shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _restore(self, proc, sock: str):
+        """Load the snapshot into a fresh VMM (it has no VM until then) and resume it."""
+        while not os.path.exists(sock):
+            if proc.returncode is not None:
+                raise RuntimeError(f"firecracker exited ({proc.returncode}) before its API was up")
+            await asyncio.sleep(0.002)
+        await _firecracker_api(sock, "PUT", "/snapshot/load", {
+            "snapshot_path": "vm.snap", "mem_backend": {"backend_type": "File", "backend_path": "vm.mem"},
+            "resume_vm": True})
+
+    def snapshot_key(self) -> str:
+        p = self.paths(self.home)
+        parts = [self.SNAPSHOT_FORMAT, self.BOOT_ARGS, self.vcpus, self.mem_mb, self.SNAPSHOT_JOB_SIZE]
+        for key in ("firecracker", "kernel", "rootfs"):
+            st = p[key].stat()
+            parts.append([str(p[key].resolve()), st.st_size, st.st_mtime_ns, st.st_ino])
+        return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:24]
+
+    async def _snapshot(self) -> Path | None:
+        """The snapshot dir to restore from, made (and checked with a probe call) if needed;
+        None if snapshots do not work here, said once per process."""
+        try:
+            key = self.snapshot_key()
+        except OSError:
+            return None
+        loop = asyncio.get_running_loop()
+        lock = self._snapshot_locks.setdefault((id(loop), key), asyncio.Lock())
+        async with lock:
+            got = self._snapshots.get(key)
+            if got is None:
+                final = self.home / "snapshots" / key
+                try:
+                    if not all((final / n).is_file() for n in ("vm.snap", "vm.mem", "job.img")):
+                        await self._make_snapshot(final)
+                    out = await self._call("print('ok')", final)
+                    if out != "exit=0\nok\n":
+                        raise RuntimeError(f"probe call gave {out[:200]!r}")
+                    got = final
+                except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, _RestoreFailed) as e:
+                    got = str(e) or type(e).__name__
+                    print(f"[aios] microVM snapshots off, each call boots instead (rebuild the root "
+                          f"image with scripts/build-microvm-rootfs.sh if it predates them): {got}",
+                          file=sys.stderr)
+                self._snapshots[key] = got
+        return got if isinstance(got, Path) else None
+
+    async def _make_snapshot(self, final: Path):
+        """Boot once (unjailed: the guest has run no code yet), pause where the init waits for
+        its job, and save the VM. Written to a temp dir and renamed into place."""
+        p = self.paths(self.home)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix=".new-", dir=final.parent))
+        proc, dirfd = None, os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.symlink(p["rootfs"], tmp / "rootfs.ext4")
+            with open(tmp / "job.img", "wb") as f:
+                f.truncate(self.SNAPSHOT_JOB_SIZE)
+            (tmp / "config.json").write_text(json.dumps(self.config(tmp, snapshot=True)))
+            proc = await asyncio.create_subprocess_exec(
+                str(p["firecracker"]), "--api-sock", "api.sock", "--config-file", "config.json",
+                "--level", "Error", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, cwd=tmp, start_new_session=True)
+            await asyncio.wait_for(self._wait_ready(proc.stdout), self.boot_timeout)
+            sock = f"/proc/self/fd/{dirfd}/api.sock"
+            await _firecracker_api(sock, "PATCH", "/vm", {"state": "Paused"})
+            await _firecracker_api(sock, "PUT", "/snapshot/create", {
+                "snapshot_type": "Full", "snapshot_path": "vm.snap", "mem_file_path": "vm.mem"})
+            await self._stop(proc)
+            proc = None
+            for name in ("rootfs.ext4", "config.json", "api.sock"):
+                (tmp / name).unlink(missing_ok=True)
+            for name in ("vm.snap", "vm.mem", "job.img"):
+                os.chmod(tmp / name, 0o444)  # a jailed VMM (uid 65534) reads them, nobody writes
+            os.chmod(tmp, 0o755)
+            try:
+                os.rename(tmp, final)
+            except OSError:  # another process made it first
+                if not (final / "vm.snap").is_file():
+                    raise
+                shutil.rmtree(tmp, ignore_errors=True)
+            for old in final.parent.iterdir():  # snapshots of older binaries or images
+                if old.name != final.name and not old.name.startswith(".new-"):
+                    shutil.rmtree(old, ignore_errors=True)
+        finally:
+            os.close(dirfd)
+            if proc is not None:
+                await asyncio.shield(self._stop(proc))
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    async def _wait_ready(stream):
+        seen = b""
+        while True:
+            line = await stream.readline()
+            if not line:
+                raise RuntimeError("the guest stopped before it was ready to snapshot"
+                                   + (f": {seen[-300:].decode(errors='replace').strip()}" if seen else ""))
+            if line.strip() == b"AIOS-READY":
+                return
+            seen = (seen + line)[-4096:]
+
+
+class _RestoreFailed(Exception):
+    """A snapshot could not be restored; the guest never got its job, so booting is safe."""
+
+
+async def _firecracker_api(sock: str, method: str, path: str, body: dict) -> bytes:
+    """One request to Firecracker's API on its Unix socket; raises RuntimeError on an error."""
+    r, w = await asyncio.open_unix_connection(sock)
+    try:
+        data = json.dumps(body).encode()
+        w.write(f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                f"Accept: application/json\r\nContent-Length: {len(data)}\r\n\r\n".encode() + data)
+        await w.drain()
+        head = await r.readuntil(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        m = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+        reply = await r.readexactly(min(int(m[1]), 65536)) if m else b""
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, IndexError):
+        raise RuntimeError(f"firecracker {method} {path}: no valid reply") from None
+    finally:
+        w.close()
+    if status >= 300:
+        raise RuntimeError(f"firecracker {method} {path}: {status} {reply[:300].decode(errors='replace')}")
+    return reply
 
 
 def _appcontainer_unavailable() -> str | None:

@@ -50,6 +50,70 @@ FAKE_FC = textwrap.dedent("""\
     """)
 
 
+# Stands in for firecracker with its API (snapshots): with --config-file it "boots" and waits
+# like the real init in snapshot mode; without, it waits for /snapshot/load, then for the line on
+# stdin, then runs the job drive named in the snapshot. Every step is appended to FAKE_FC_SEEN.log.
+FAKE_FC_API = textwrap.dedent("""\
+    #!{python}
+    import json, os, socket, sys, tempfile
+    sys.path.insert(0, {repo!r})
+    import aios_microvm_init as g
+    args = sys.argv[1:]
+    mode = os.environ.get("FAKE_FC_MODE", "")
+    def note(**kw):
+        with open(os.environ["FAKE_FC_SEEN"] + ".log", "a") as f:
+            f.write(json.dumps({{"cwd": os.getcwd(), **kw}}) + "\\n")
+    if "--api-sock" not in args:
+        print("no api", flush=True); sys.exit(2)
+    cfg = json.load(open(args[args.index("--config-file") + 1])) if "--config-file" in args else None
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(args[args.index("--api-sock") + 1])
+    srv.listen(4)
+    def requests():
+        while True:
+            c, _ = srv.accept()
+            f = c.makefile("rb")
+            line = f.readline().decode().split()
+            n = 0
+            while (h := f.readline()) not in (b"\\r\\n", b""):
+                if h.lower().startswith(b"content-length:"):
+                    n = int(h.split(b":")[1])
+            yield c, line[0], line[1], json.loads(f.read(n) or b"{{}}")
+    def answer(c, code=204, body=b""):
+        c.sendall(b"HTTP/1.1 %d X\\r\\nContent-Length: %d\\r\\n\\r\\n%s" % (code, len(body), body))
+        c.close()
+    if cfg is not None:  # boot for a snapshot
+        note(step="boot", config=cfg)
+        if mode == "noready":  # an init older than snapshots: reads the empty job and fails
+            print("AIOS-INIT-ERROR JobError: bad job header", flush=True); sys.exit(0)
+        print("[    0.000000] Linux version fake\\r\\n\\r\\nAIOS-READY\\r", flush=True)
+        for c, method, path, body in requests():
+            if (method, path) == ("PUT", "/snapshot/create"):
+                json.dump({{"drives": cfg["drives"]}}, open(body["snapshot_path"], "w"))
+                open(body["mem_file_path"], "wb").write(b"m" * 4096)
+                note(step="create", body=body)
+            answer(c)
+    for c, method, path, body in requests():
+        if (method, path) != ("PUT", "/snapshot/load"):
+            answer(c, 400, b'{{"fault_message":"unexpected"}}'); continue
+        if mode == "badload":
+            answer(c, 400, b'{{"fault_message":"bad snapshot"}}'); sys.exit(1)
+        state = json.load(open(body["snapshot_path"]))
+        assert open(body["mem_backend"]["backend_path"], "rb").read() == b"m" * 4096
+        answer(c)
+        break
+    go = sys.stdin.readline()
+    job = [d for d in state["drives"] if d["drive_id"] == "job"][0]["path_on_host"]
+    data = open(job, "rb").read()
+    nonce, timeout, max_out, code = g.parse_job(data)
+    note(step="load", body=body, go=go, job_size=len(data), seed=g.parse_extras(data)["seed"].hex(),
+         links=sorted(n for n in os.listdir(".") if os.path.islink(n)))
+    with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as run:
+        status, rc, out, trunc = g.run_code(code, timeout, max_out, work, run, unprivileged=False)
+    sys.stdout.write(g.result_lines(nonce, status, rc, out, trunc).replace("\\n", "\\r\\n"))
+    """)
+
+
 # Stands in for the jailer (which needs root): checks its arguments, then does what it does
 # minus chroot, uid switch and cgroups: run the exec file inside <base>/firecracker/<id>/root.
 FAKE_JAILER = textwrap.dedent("""\
@@ -78,10 +142,10 @@ def vmm_processes():
     return found
 
 
-def make_home(tmp: Path, fc=True, kernel=True, rootfs=True, jailer=False) -> Path:
+def make_home(tmp: Path, fc=True, kernel=True, rootfs=True, jailer=False, api=False) -> Path:
     if fc:
         p = tmp / "firecracker"
-        p.write_text(FAKE_FC.format(python=sys.executable, repo=str(REPO)))
+        p.write_text((FAKE_FC_API if api else FAKE_FC).format(python=sys.executable, repo=str(REPO)))
         p.chmod(0o755)
     if kernel:
         (tmp / "vmlinux").write_bytes(b"kernel")
@@ -115,6 +179,25 @@ class GuestJobTests(unittest.TestCase):
     def test_code_size_is_bounded(self):
         with self.assertRaises(ValueError):
             aios.MicroVMSandbox(max_code=10).job_image("a" * 32, "x" * 11)
+
+    def test_each_job_carries_a_fresh_seed_and_the_time(self):
+        box = aios.MicroVMSandbox()
+        a, b = (box.job_image("ab" * 16, "print(1)") for _ in range(2))
+        ea, eb = guest.parse_extras(a), guest.parse_extras(b)
+        self.assertEqual(len(ea["seed"]), 32)
+        self.assertNotEqual(ea["seed"], eb["seed"])
+        self.assertLess(abs(ea["time"] - time.time()), 60)
+        self.assertEqual(guest.parse_job(a)[3], b"print(1)")  # an older init still reads it
+        self.assertEqual(guest.parse_extras(b"AIOS1 " + b"a" * 32 + b" 5 100 3\nabc"), {})
+
+    def test_a_snapshot_job_has_the_fixed_size(self):
+        box = aios.MicroVMSandbox()
+        img = box.job_image("ab" * 16, "x" * (1 << 20), box.SNAPSHOT_JOB_SIZE)
+        self.assertEqual(len(img), box.SNAPSHOT_JOB_SIZE)
+        self.assertEqual(len(guest.parse_job(img)[3]), 1 << 20)
+        self.assertIn("seed", guest.parse_extras(img))
+        with self.assertRaises(ValueError):
+            box.job_image("ab" * 16, "x" * 10, 100)
 
 
 class MicroVMSelectionTests(unittest.TestCase):
@@ -183,7 +266,7 @@ class MicroVMHostTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(env.stop)
 
     def box(self, **kw):
-        return aios.MicroVMSandbox(home=self.home, **{"jailed": False, **kw})
+        return aios.MicroVMSandbox(home=self.home, **{"jailed": False, "snapshot": False, **kw})
 
     def workdirs(self):
         return sorted(Path(tempfile.gettempdir()).glob("aios-mvm-*"))
@@ -269,6 +352,128 @@ class MicroVMHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vmm_processes(), [])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "snapshots use /proc/self/fd and Unix sockets")
+class MicroVMSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        (self.tmp / "home").mkdir()
+        self.home = make_home(self.tmp / "home", api=True)
+        self.seen = self.tmp / "seen.json"
+        env = mock.patch.dict(os.environ, {"FAKE_FC_SEEN": str(self.seen), "FAKE_FC_MODE": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        snaps = mock.patch.object(aios.MicroVMSandbox, "_snapshots", {})
+        snaps.start()
+        self.addCleanup(snaps.stop)
+
+    def box(self, **kw):
+        return aios.MicroVMSandbox(home=self.home, **{"jailed": False, "snapshot": True, **kw})
+
+    def steps(self):
+        log = Path(str(self.seen) + ".log")
+        return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+    async def test_one_boot_then_every_call_restores(self):
+        box = self.box()
+        self.assertEqual(await box.run_python("print(6*7)"), "exit=0\n42\n")
+        self.assertEqual(await box.run_python("import sys; sys.exit(3)"), "exit=3\n")
+        steps = self.steps()
+        self.assertEqual([s["step"] for s in steps], ["boot", "create", "load", "load", "load"])  # probe + 2
+        boot = steps[0]["config"]
+        self.assertIn("aios_wait=1", boot["boot-source"]["boot_args"])
+        self.assertEqual([d["path_on_host"] for d in boot["drives"]], ["rootfs.ext4", "job.img"])  # relative
+        self.assertEqual(set(boot), {"boot-source", "drives", "machine-config"})
+        snap = self.home / "snapshots" / box.snapshot_key()
+        for name in ("vm.snap", "vm.mem", "job.img"):
+            self.assertEqual((snap / name).stat().st_mode & 0o777, 0o444)
+        self.assertEqual(sorted(os.listdir(snap)), ["job.img", "vm.mem", "vm.snap"])
+        loads = steps[2:]
+        self.assertTrue(all(s["go"] == "go\n" for s in loads))
+        self.assertTrue(all(s["job_size"] == box.SNAPSHOT_JOB_SIZE for s in loads))
+        self.assertEqual(len({s["seed"] for s in loads}), 3)  # every restored VM gets its own
+        self.assertEqual(loads[0]["links"], ["rootfs.ext4", "vm.mem", "vm.snap"])
+        self.assertTrue(all(Path(s["cwd"]).name.startswith("aios-mvm-") for s in loads))
+        self.assertTrue(all(not Path(s["cwd"]).exists() for s in loads))  # per-call dirs removed
+
+    async def test_a_new_image_makes_a_new_snapshot_and_drops_the_old(self):
+        box = self.box()
+        await box.run_python("print(1)")
+        old = box.snapshot_key()
+        (self.home / "rootfs.ext4").write_bytes(b"rootfs v2")
+        self.assertNotEqual(box.snapshot_key(), old)
+        self.assertEqual(await box.run_python("print(2)"), "exit=0\n2\n")
+        self.assertEqual(os.listdir(self.home / "snapshots"), [box.snapshot_key()])
+        # a snapshot already on disk is reused by a new process
+        aios.MicroVMSandbox._snapshots.clear()
+        self.assertEqual(await self.box().run_python("print(3)"), "exit=0\n3\n")
+        self.assertEqual([s["step"] for s in self.steps()].count("boot"), 2)
+
+    async def test_an_init_without_snapshot_support_means_booting_each_call(self):
+        os.environ["FAKE_FC_MODE"] = "noready"
+        make_home(self.home, api=False)  # the cold boot path, with the classic fake
+        home_fc = self.home / "firecracker"
+        api_fc = self.tmp / "fc-api"
+        api_fc.write_text(FAKE_FC_API.format(python=sys.executable, repo=str(REPO)))
+        api_fc.chmod(0o755)
+        # snapshot creation runs the API fake; per-call boots run the classic fake
+        real = aios.asyncio.create_subprocess_exec
+        def pick(*argv, **kw):
+            if "--api-sock" in argv and "--config-file" in argv:
+                argv = (str(api_fc), *argv[1:])
+            return real(*argv, **kw)
+        with mock.patch.object(aios.asyncio, "create_subprocess_exec", pick), \
+                mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as err:
+            box = self.box()
+            self.assertEqual(await box.run_python("print(1)"), "exit=0\n1\n")
+            self.assertEqual(await box.run_python("print(2)"), "exit=0\n2\n")
+        self.assertEqual(err.getvalue().count("snapshots off"), 1)
+        self.assertIn("stopped before it was ready", err.getvalue())
+        self.assertEqual([s["step"] for s in self.steps()], ["boot"])  # tried once, not per call
+        self.assertFalse((self.home / "snapshots").exists() and os.listdir(self.home / "snapshots"))
+        self.assertTrue(home_fc.exists())
+
+    async def test_a_restore_that_fails_falls_back_before_the_job_is_sent(self):
+        box = self.box()
+        self.assertEqual(await box.run_python("print(1)"), "exit=0\n1\n")
+        os.environ["FAKE_FC_MODE"] = "badload"
+        with mock.patch.object(box, "_call", wraps=box._call) as call, \
+                mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as err:
+            with self.assertRaisesRegex(RuntimeError, "no result"):  # the API fake cannot boot
+                await box.run_python("print(2)")
+        self.assertIn("bad snapshot", err.getvalue())
+        self.assertEqual([c.args[1] for c in call.call_args_list][-1], None)  # booted instead
+        self.assertIsInstance(aios.MicroVMSandbox._snapshots[box.snapshot_key()], str)
+
+    async def test_snapshots_can_be_turned_off(self):
+        with mock.patch.dict(os.environ, {"AIOS_MICROVM_SNAPSHOT": "0"}):
+            self.assertFalse(aios.MicroVMSandbox(home=self.home).snapshot)
+        with mock.patch.dict(os.environ, {"AIOS_MICROVM_SNAPSHOT": ""}):
+            self.assertTrue(aios.MicroVMSandbox(home=self.home).snapshot)
+
+    async def test_a_jailed_vmm_restores_from_links_in_its_chroot(self):
+        make_home(self.home, fc=False, kernel=False, rootfs=False, jailer=True)
+        box = self.box(jailed=True)
+        self.assertEqual(await box.run_python("print(5)"), "exit=0\n5\n")
+        load = self.steps()[-1]
+        self.assertEqual(Path(load["cwd"]).name, "root")
+        self.assertEqual(load["links"], [])  # hard links, not symlinks out of the jail
+        self.assertEqual(list((self.home / "jails" / "firecracker").iterdir()), [])
+
+    async def test_cancelling_a_restored_call_kills_the_vmm(self):
+        box = self.box(timeout=30)
+        await box.run_python("print(1)")
+        task = asyncio.create_task(box.run_python("import time; time.sleep(60)"))
+        for _ in range(200):
+            if [s for s in self.steps() if s["step"] == "load"][1:]:
+                break
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(vmm_processes(), [])
+
+
 @unittest.skipUnless(os.environ.get("AIOS_TEST_MICROVM") == "1",
                      "set AIOS_TEST_MICROVM=1 with KVM, firecracker, vmlinux and rootfs.ext4 "
                      "in $AIOS_MICROVM_DIR to run against real microVMs")
@@ -344,6 +549,30 @@ class RealMicroVMTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - t, 3 + box.boot_timeout + box.cleanup_timeout)
         self.assertEqual(sorted(tmp.glob("aios-mvm-*")), before)
         self.assertEqual(vmm_processes(), [])
+
+    async def test_restored_calls_are_fresh_and_faster_than_booting(self):
+        if not self.box.snapshot:
+            self.skipTest("AIOS_MICROVM_SNAPSHOT=0: every call boots")
+        code = ("import os, json, time\nleft = os.listdir('/tmp')\nopen('/tmp/mine', 'w').write('x')\n"
+                "print(json.dumps({'left': left, 'rand': os.urandom(16).hex(), 'time': time.time()}))\n")
+        await self.run_json(code)  # makes the snapshot if this process has none yet
+        self.assertIsInstance(aios.MicroVMSandbox._snapshots.get(self.box.snapshot_key()), Path,
+                              aios.MicroVMSandbox._snapshots)
+        runs, took = [], []
+        for _ in range(3):
+            t = time.monotonic()
+            runs.append(await self.run_json(code))
+            took.append(time.monotonic() - t)
+        t = time.monotonic()
+        await self.run_json(code, aios.MicroVMSandbox(timeout=20, snapshot=False))
+        cold = time.monotonic() - t
+        print(f"\n[evidence] restored calls {', '.join(f'{x:.3f}s' for x in took)}; booted call {cold:.3f}s",
+              file=sys.stderr)
+        self.assertEqual([r["left"] for r in runs], [[]] * 3)  # nothing from an earlier call
+        self.assertEqual(len({r["rand"] for r in runs}), 3)  # the clones do not share random state
+        for r in runs:
+            self.assertLess(abs(r["time"] - time.time()), 30)  # the clock was set, not the snapshot's
+        self.assertLess(max(took), cold)
 
     async def test_fork_bomb_and_output_flood_are_contained(self):
         out = await aios.MicroVMSandbox(timeout=5, max_out=1000).run_python(
