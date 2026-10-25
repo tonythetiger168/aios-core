@@ -2275,12 +2275,22 @@ def check_mcp_flags(a, ap):
         ap.error(f"--confine-mcp names no --mcp server: {', '.join(sorted(unknown))}")
 
 
+def split_command(cmdline: str, windows: bool = os.name == "nt") -> list[str]:
+    """Shell-style split. On Windows a backslash is a path separator, not an escape, so
+    C:\\Tools\\server.exe keeps its backslashes; quotes still group words."""
+    if not windows:
+        return shlex.split(cmdline)
+    lex = shlex.shlex(cmdline, posix=True)
+    lex.whitespace_split, lex.escape, lex.commenters = True, "", ""
+    return list(lex)
+
+
 async def attach_mcp(k: Kernel, specs, confine=frozenset()) -> list[str]:
     """Connect each "name=command arg1 arg2" server; returns the server names."""
     names = []
     for spec in specs:
         name, _, cmdline = spec.partition("=")
-        cmd, *args = shlex.split(cmdline)
+        cmd, *args = split_command(cmdline)
         print(f"MCP {name}{' (confined)' if name in confine else ''}:",
               await k.connect_mcp(name, cmd, args, confine=name in confine), file=sys.stderr)
         names.append(name)
