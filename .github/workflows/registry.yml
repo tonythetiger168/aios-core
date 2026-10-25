@@ -1,0 +1,71 @@
+name: skill registry
+# Builds the public skill registry from registry/ and deploys it to GitHub Pages
+# (https://<owner>.github.io/<repo>/, the default for `aios skills search/install`).
+# Pull requests build it and install every skill from the built site, without deploying.
+on:
+  push:
+    branches: [main]
+    paths: ["registry/**", "aios_skills.py", "scripts/build-registry.py", ".github/workflows/registry.yml"]
+  pull_request:
+    paths: ["registry/**", "aios_skills.py", "scripts/build-registry.py", ".github/workflows/registry.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skill-registry-${{ github.event_name == 'pull_request' && github.ref || 'pages' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the site on top of what is already published
+        shell: bash
+        env:
+          # optional: an SSH private key; when set, every skill is signed with it
+          SIGNING_KEY: ${{ secrets.AIOS_REGISTRY_SIGNING_KEY }}
+        run: |
+          args=()
+          if [ -n "$SIGNING_KEY" ]; then
+            (umask 077; printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing_key")
+            args=(--key "$RUNNER_TEMP/signing_key")
+          fi
+          python scripts/build-registry.py registry _site --live "$SITE_URL" --url "$SITE_URL" "${args[@]}"
+          rm -f "$RUNNER_TEMP/signing_key"
+      - name: Search and install every skill from the built site, as a user would
+        shell: bash
+        run: |
+          (cd _site && python -m http.server 8000 --bind 127.0.0.1 > /dev/null 2>&1 &)
+          until curl -fsS http://127.0.0.1:8000/index.json > /dev/null; do sleep 0.2; done
+          python aios.py skills search --registry http://127.0.0.1:8000
+          home=$(mktemp -d)
+          for name in $(python -c "import json; print(' '.join(sorted({e['name'] for e in json.load(open('_site/index.json'))['skills']})))"); do
+            python aios.py skills install "$name" --registry http://127.0.0.1:8000 --home "$home" --yes
+          done
+          python aios.py skills list --home "$home"
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
