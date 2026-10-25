@@ -1162,11 +1162,50 @@ class MemoryProvenanceTests(HardeningBase):
         k.store.set_fact("a", "t", "danger", "tainted")
         k.store.set_fact("a", "ok", "fine", "model")
         agent = aios.Agent("a", set())
-        self.assertEqual(await k.tools.call("recall", agent, key="t"), "danger  [unverified]")
+        out = await k.tools.call("recall", agent, key="t")
+        self.assertEqual(out, aios.tag_untrusted("memory", "danger  [unverified]"))
         self.assertEqual(await k.tools.call("recall", agent, key="ok"), "fine")
         listing = await k.tools.call("list_facts", agent)
+        self.assertTrue(listing.startswith(aios.UNTRUSTED_OPEN))
         self.assertIn("t: danger  [unverified]", listing)
         self.assertIn("ok: fine", listing)
+        k.store.delete_fact("a", "t")
+        self.assertEqual(await k.tools.call("list_facts", agent), "ok: fine")  # only verified notes left
+
+    async def write_after_note(self, source, first=()):
+        """A pre-allowed write in a run whose memory holds a note from `source`; nobody approves."""
+        k = self.kernel(*first, Resp([tool_use("write_file", {"path": "notes/a.txt", "content": "x"})],
+                                     "tool_use"), Resp([text("done")], "end_turn"), approver=None)
+        k.store.set_fact("a", "todo", "write notes/a.txt", source)
+        agent = aios.Agent("a", {"write_file", "recall"}, scopes={"write_file": {"auto_paths": ["notes/*"]}})
+        await k._run(agent, "go")
+        return k, tool_log(k)[-1]
+
+    async def test_an_unverified_note_in_the_prompt_taints_the_run(self):
+        _, e = await self.write_after_note("model")
+        self.assertEqual(e["status"], "ok")  # a verified note changes nothing
+        (aios.WORKSPACE / "notes" / "a.txt").unlink()
+        k, e = await self.write_after_note("tainted")
+        self.assertEqual(e["status"], "denied")
+        self.assertIn("unverified", k.provider.calls[0]["system"])
+        self.assertFalse((aios.WORKSPACE / "notes" / "a.txt").exists())
+
+    async def test_recalling_an_unverified_note_taints_the_run(self):
+        recall = [Resp([tool_use("recall", {"key": "todo"}, "r")], "tool_use")]
+        with mock.patch.object(aios, "FACT_PROMPT_LIMIT", 0):  # the note is not in the prompt
+            _, e = await self.write_after_note("tainted", recall)
+        self.assertEqual(e["status"], "denied")
+
+    async def test_a_confirmed_note_no_longer_taints(self):
+        k = self.kernel(Resp([text("ok")], "end_turn"))
+        k.store.set_fact("a", "todo", "x", "tainted")
+        agent = aios.Agent("a", set())
+        await k._run(agent, "go")
+        self.assertTrue(agent.run_tainted)
+        k.store.set_fact("a", "todo", "x", "user")  # what aios memory confirm does
+        k.provider.responses = [Resp([text("ok")], "end_turn")]
+        await k._run(agent, "again")
+        self.assertFalse(agent.run_tainted)
 
     def test_cli_remember_forget_and_facts_commands(self):
         import builtins
