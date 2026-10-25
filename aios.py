@@ -731,18 +731,20 @@ class Kernel:
         # this many requests at once (the rest queue here, not at the provider's rate limiter).
         self.model_slots = asyncio.Semaphore(model_slots or MODEL_SLOTS)
 
-    async def connect_mcp(self, server: str, command: str, args=(), env=None, confine=False) -> list[str]:
+    async def connect_mcp(self, server: str, command: str, args=(), env=None, confine=False,
+                          network=True) -> list[str]:
         """Start an MCP server (stdio) and register its tools as '<server>__<tool>'.
         Agents must be granted them explicitly, e.g. permissions={'<server>__*'}.
         confine: run it under confine_command (no access to your files; HOME and TMPDIR point to a
-        throwaway folder that is deleted when the kernel closes)."""
+        throwaway folder that is deleted when the kernel closes). network=False: confined and also
+        cut off the network, so it cannot send out what it is given."""
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import get_default_environment, stdio_client
 
-        if confine:
+        if confine or not network:
             state = tempfile.mkdtemp(prefix="aios-mcp-" + re.sub(r"[^\w-]", "_", server) + "-")
             self._stack.callback(shutil.rmtree, state, ignore_errors=True)
-            command, *args = confine_command(command, list(args), state)
+            command, *args = confine_command(command, list(args), state, network)
             env = {**(env or get_default_environment()), "HOME": state, "TMPDIR": state}
         params = StdioServerParameters(command=command, args=list(args), env=env)
         read, write = await self._stack.enter_async_context(stdio_client(params))
@@ -1116,15 +1118,34 @@ def _seatbelt_profile(cwd: str, ro_extra=(), network: bool = False) -> str:
     ])
 
 
+@functools.lru_cache(maxsize=1)
+def netns_ok() -> bool:
+    """A fresh network namespace can be made (Linux, `unshare`, unprivileged user namespaces)."""
+    return (not IS_WINDOWS and bool(shutil.which("unshare"))
+            and subprocess.run(["unshare", "-rn", "true"], capture_output=True).returncode == 0)
+
+
+def offline_level() -> str:
+    """How completely confine_command(network=False) cuts a server off: "all" (own network namespace,
+    or sandbox-exec), "tcp" (Landlock ABI 4+ only: no TCP, but UDP such as DNS still works) or ""."""
+    if landlock_abi() >= 1:
+        return "all" if netns_ok() else "tcp" if landlock_abi() >= 4 else ""
+    return "all" if seatbelt_ok() else ""
+
+
 # what a confined MCP server may read on top of LANDLOCK_SYSTEM: name resolution and TLS roots
 MCP_SYSTEM = ("/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts",
               "/etc/gai.conf", "/etc/host.conf", "/etc/services", "/etc/protocols")
 
 
-def confine_command(command: str, args, state_dir: str) -> list[str]:
+def confine_command(command: str, args, state_dir: str, network: bool = True) -> list[str]:
     """argv that runs an MCP server confined: it may read Python, system libraries, its own program
     and the files named in its arguments, write only state_dir, and use the network (most servers
-    are API clients). Landlock on Linux, sandbox-exec on macOS; refuses where neither exists."""
+    are API clients) unless network=False (see offline_level). Landlock on Linux, sandbox-exec on
+    macOS; refuses where neither exists, or where the network cannot be cut off at all."""
+    if not network and not offline_level():
+        raise RuntimeError("cannot cut an MCP server off the network here: needs a network namespace "
+                           "(unshare), Landlock ABI 4 (Linux 6.7+) or sandbox-exec (macOS)")
     exe = shutil.which(command) or command
     if not os.path.isabs(exe):
         raise ValueError(f"cannot find the MCP server program '{command}'")
@@ -1138,10 +1159,11 @@ def confine_command(command: str, args, state_dir: str) -> list[str]:
                os.path.dirname(os.path.realpath(sys.executable))}
         cfg = {"ro": [*LANDLOCK_SYSTEM, *MCP_SYSTEM, *sorted(ro)],
                "rw": [state_dir, "/dev/null", "/dev/zero", "/dev/urandom"],
-               "net": True, "exec": [exe, *args]}
-        return [sys.executable, "-I", "-c", LANDLOCK_BOOT, json.dumps(cfg)]
+               "net": network, "exec": [exe, *args]}
+        argv = [sys.executable, "-I", "-c", LANDLOCK_BOOT, json.dumps(cfg)]
+        return argv if network or not netns_ok() else ["unshare", "-rn", *argv]
     if seatbelt_ok():
-        return ["sandbox-exec", "-p", _seatbelt_profile(state_dir, ro, network=True), exe, *args]
+        return ["sandbox-exec", "-p", _seatbelt_profile(state_dir, ro, network=network), exe, *args]
     raise RuntimeError("cannot confine an MCP server here: needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
 
 
@@ -1156,9 +1178,7 @@ class Sandbox:
         self.timeout, self.cpu_s, self.mem = timeout, cpu_s, mem_mb * 1024 * 1024
         self.max_out, self.max_procs = max_out, max_procs
         # network isolation via a fresh network namespace (Linux, needs unprivileged userns)
-        self.net_isolated = (not IS_WINDOWS and bool(shutil.which("unshare"))
-                             and subprocess.run(["unshare", "-rn", "true"],
-                                                capture_output=True).returncode == 0)
+        self.net_isolated = netns_ok()
         self.fs_isolated = "landlock" if landlock_abi() >= 1 else "seatbelt" if seatbelt_ok() else False
         if self.fs_isolated == "seatbelt":
             self.net_isolated = "all"  # the profile denies every network operation
@@ -2301,15 +2321,23 @@ def add_mcp_flags(p):
     p.add_argument("--confine-mcp", action="append", default=[], metavar="NAME",
                    help="run that --mcp server without access to your files (network stays; Landlock on "
                         "Linux 5.13+, sandbox-exec on macOS)")
+    p.add_argument("--offline-mcp", action="append", default=[], metavar="NAME",
+                   help="like --confine-mcp, and also no network: for servers that need none, so they "
+                        "cannot send out what they are given")
 
 
 def check_mcp_flags(a, ap):
     names = [s.partition("=")[0] for s in a.mcp]
     if any(not n or "=" not in s for n, s in zip(names, a.mcp)):
         ap.error('--mcp takes NAME=COMMAND ARGS, e.g. --mcp "demo=python demo_mcp_server.py"')
-    unknown = set(a.confine_mcp) - set(names)
-    if unknown:
-        ap.error(f"--confine-mcp names no --mcp server: {', '.join(sorted(unknown))}")
+    for flag, given in (("--confine-mcp", a.confine_mcp), ("--offline-mcp", a.offline_mcp)):
+        unknown = set(given) - set(names)
+        if unknown:
+            ap.error(f"{flag} names no --mcp server: {', '.join(sorted(unknown))}")
+    if a.offline_mcp and not offline_level():
+        ap.error("--offline-mcp: this machine cannot cut a server off the network (needs a network "
+                 "namespace, Landlock ABI 4 or sandbox-exec)")
+    a.confine_mcp = sorted(set(a.confine_mcp) | set(a.offline_mcp))  # offline is confined too
 
 
 def split_command(cmdline: str, windows: bool = os.name == "nt") -> list[str]:
@@ -2322,14 +2350,20 @@ def split_command(cmdline: str, windows: bool = os.name == "nt") -> list[str]:
     return list(lex)
 
 
-async def attach_mcp(k: Kernel, specs, confine=frozenset()) -> list[str]:
-    """Connect each "name=command arg1 arg2" server; returns the server names."""
+async def attach_mcp(k: Kernel, specs, confine=frozenset(), offline=frozenset()) -> list[str]:
+    """Connect each "name=command arg1 arg2" server; returns the server names. Names in offline
+    are confined and get no network."""
     names = []
     for spec in specs:
         name, _, cmdline = spec.partition("=")
         cmd, *args = split_command(cmdline)
-        print(f"MCP {name}{' (confined)' if name in confine else ''}:",
-              await k.connect_mcp(name, cmd, args, confine=name in confine), file=sys.stderr)
+        how = ""
+        if name in offline:
+            how = " (offline)" if offline_level() == "all" else " (offline: no TCP, UDP still works)"
+        elif name in confine:
+            how = " (confined)"
+        print(f"MCP {name}{how}:", await k.connect_mcp(name, cmd, args, confine=name in confine,
+                                                       network=name not in offline), file=sys.stderr)
         names.append(name)
     return names
 
@@ -2337,7 +2371,7 @@ async def attach_mcp(k: Kernel, specs, confine=frozenset()) -> list[str]:
 async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False,
                provider=None, budget: Budget | None = None, policy: dict | None = None,
                skills: list[str] | None = None, embedder=None, a2a_specs: list[str] | None = None,
-               confine_mcp: set[str] = frozenset()):
+               confine_mcp: set[str] = frozenset(), offline_mcp: set[str] = frozenset()):
     WORKSPACE.mkdir(exist_ok=True)
     if auto_approve:
         print("[aios] WARNING: --auto-approve: risky tools run without asking.")
@@ -2373,7 +2407,7 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
     pol = (policy or {}).get(agent_name)
     explicit = bool(pol and pol["permissions"] is not None)
     perms = set(pol["permissions"]) if explicit else set(DEFAULT_TOOLS)
-    for name in await attach_mcp(k, mcp_specs, confine_mcp):
+    for name in await attach_mcp(k, mcp_specs, confine_mcp, offline_mcp):
         if explicit:
             print(f"[aios] policy lists explicit permissions: add '{name}__*' there to let the agent use these tools")
         else:
@@ -2806,7 +2840,7 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                  timeout: float = 300, webhook_port: int | None = None,
                  approve_timeout: float | None = None, a2a_specs: list[str] | None = None,
                  daily_tokens: int | None = None, daily_cost: float | None = None,
-                 mcp_specs: list[str] | None = None, confine_mcp=frozenset()):
+                 mcp_specs: list[str] | None = None, confine_mcp=frozenset(), offline_mcp=frozenset()):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -2828,8 +2862,8 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
             return 1
     if mcp_specs:  # granted through the policy ('<name>__*'); MCP tools always need a scope or a person
         try:
-            for name in await attach_mcp(k, mcp_specs, confine_mcp):
-                if name not in confine_mcp:
+            for name in await attach_mcp(k, mcp_specs, confine_mcp, offline_mcp):
+                if name not in confine_mcp and name not in offline_mcp:
                     print(f"[aios] WARNING: MCP server '{name}' runs with all your rights while nobody "
                           f"watches; --confine-mcp {name} keeps it away from your files", file=sys.stderr)
         except Exception as e:  # a server that does not start: say so instead of running jobs without it
@@ -3365,6 +3399,11 @@ def doctor_cmd(home: str) -> int:
         row("ok", "mcp SDK", md.version("mcp"))
     except Exception:
         row("--", "mcp SDK", "not installed: pip install mcp (for --mcp and serve)")
+    confined = "ok" if landlock_abi() >= 1 or seatbelt_ok() else "--"
+    row(confined, "--confine-mcp", "available" if confined == "ok" else "unavailable: needs Landlock or sandbox-exec")
+    level = offline_level()
+    row("ok" if level else "--", "--offline-mcp", {"all": "no network at all", "tcp": "no TCP; UDP still works"}
+        .get(level, "unavailable: needs a network namespace, Landlock ABI 4 or sandbox-exec"))
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         row("ok" if os.environ.get(var) else "--", var, "set" if os.environ.get(var) else "not set")
 
@@ -3674,7 +3713,7 @@ def cli():
         check_mcp_flags(a, ap)
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
                                   a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
-                                  a.mcp, set(a.confine_mcp)))
+                                  a.mcp, set(a.confine_mcp), set(a.offline_mcp)))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         check_daily_flags(a, ap)
@@ -3717,7 +3756,7 @@ def cli():
         embedder = aios_memory.Embedder(a.embed_model, a.embed_url, os.environ.get("OPENAI_API_KEY"))
     check_mcp_flags(a, ap)
     asyncio.run(chat(a.agent, a.mcp, a.auto_approve, provider, budget, policy, a.skill, embedder, a.a2a,
-                     set(a.confine_mcp)))
+                     set(a.confine_mcp), set(a.offline_mcp)))
 
 
 if __name__ == "__main__":
