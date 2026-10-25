@@ -26,6 +26,7 @@ import secrets
 import urllib.error
 import urllib.request
 from contextlib import AsyncExitStack
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -431,6 +432,15 @@ class Store:
                 return None
             return self.db.execute("INSERT INTO hook_events(job, ts, payload) VALUES(?,?,?)",
                                    (job, datetime.now().isoformat(timespec="seconds"), payload)).lastrowid
+
+    def job_usage_since(self, since: str) -> tuple[int, float]:
+        """Tokens and cost of every scheduled-job run since `since`, from the audit's run summaries."""
+        tokens, cost = 0, 0.0
+        for (summary,) in self.db.execute("SELECT result FROM audit WHERE tool=? AND agent LIKE 'job-%' AND ts>=?",
+                                          (RUN_ENTRY, since)):
+            if m := re.search(r"tokens_in=(\d+) tokens_out=(\d+) cost_usd=([\d.]+)", summary or ""):
+                tokens, cost = tokens + int(m[1]) + int(m[2]), cost + float(m[3])
+        return tokens, cost
 
     def pending_hook_events(self) -> list[dict]:
         rows = self.db.execute("SELECT id, job, ts, payload FROM hook_events WHERE status='pending' ORDER BY id")
@@ -939,6 +949,9 @@ class Kernel:
                     results.append({"type": "tool_result", "tool_use_id": b["id"],
                                     "content": content, "is_error": err})
                 self._push(agent, {"role": "user", "content": results})
+        except asyncio.CancelledError:  # a timeout or Ctrl+C: what it already spent still counts
+            self._log_run(agent, task, steps, t_in, t_out, budget, "cancelled", "cancelled")
+            raise
         except Exception as e:
             self._log_run(agent, task, steps, t_in, t_out, budget, "error", f"{type(e).__name__}: {e}")
             raise
@@ -2287,10 +2300,33 @@ class Scheduler:
     own agent (`job-<name>`: separate history and memory) and starts every run with a clean history."""
 
     def __init__(self, kernel: Kernel, policy: dict | None = None, budget: Budget | None = None,
-                 max_runs_per_day: int = 200, timeout: float = 300, now=datetime.now):
+                 max_runs_per_day: int = 200, timeout: float = 300, now=datetime.now,
+                 daily_tokens: int | None = None, daily_cost: float | None = None):
         self.k, self.policy = kernel, policy or {}
         self.budget = budget or Budget(max_total_tokens=50_000)  # unattended runs always have a cap
         self.max_runs_per_day, self.timeout, self.now = max_runs_per_day, timeout, now
+        if daily_cost is not None and not (self.budget.price_in_per_mtok or self.budget.price_out_per_mtok):
+            raise ValueError("a daily cost limit needs prices (--price-in / --price-out)")
+        self.daily_tokens, self.daily_cost = daily_tokens, daily_cost
+
+    def budget_left(self, since: str) -> tuple[Budget | None, str]:
+        """The run budget, shrunk to what is left of the daily limits shared by all jobs; None when
+        nothing is left. A single model call can still overshoot, as with any budget."""
+        if self.daily_tokens is None and self.daily_cost is None:
+            return self.budget, ""
+        tokens, cost = self.k.store.job_usage_since(since)
+        b = dataclasses.replace(self.budget)
+        if self.daily_tokens is not None:
+            if tokens >= self.daily_tokens:
+                return None, f"daily token budget of {self.daily_tokens} reached ({tokens} used in 24h)"
+            left = self.daily_tokens - tokens
+            b.max_total_tokens = left if b.max_total_tokens is None else min(b.max_total_tokens, left)
+        if self.daily_cost is not None:
+            if cost >= self.daily_cost:
+                return None, f"daily cost budget of ${self.daily_cost:.4f} reached (${cost:.4f} used in 24h)"
+            left = self.daily_cost - cost
+            b.max_cost_usd = left if b.max_cost_usd is None else min(b.max_cost_usd, left)
+        return b, ""
 
     def agent_for(self, job: dict) -> Agent:
         pol = self.policy.get(job["agent"])
@@ -2301,7 +2337,7 @@ class Scheduler:
         agent.system += " " + UNATTENDED_NOTE
         return agent
 
-    async def run_job(self, job: dict, payload: str | None = None) -> tuple[str, str]:
+    async def run_job(self, job: dict, payload: str | None = None, budget: Budget | None = None) -> tuple[str, str]:
         agent = self.agent_for(job)
         self.k.store.clear_messages(agent.name)  # every run starts fresh
         task = job["task"]
@@ -2315,7 +2351,7 @@ class Scheduler:
                          + tag_untrusted("webhook", payload))
                 agent.session_tainted = self.k.harden  # tainted from the first step
         try:
-            out = await asyncio.wait_for(self.k._run(agent, task, self.budget), self.timeout)
+            out = await asyncio.wait_for(self.k._run(agent, task, budget or self.budget), self.timeout)
             return ("stopped" if out.startswith("(stopped:") or out == "(max steps reached)" else "ok"), out
         except asyncio.TimeoutError:
             return "timeout", f"timed out after {self.timeout:g}s"
@@ -2359,10 +2395,14 @@ class Scheduler:
                 self.k.store.finish_hook_event(ev["id"], "dropped")  # job removed, disabled or changed
         for job, eid, payload in work:
             sched = sch.parse(job["schedule"])
-            if self.k.store.runs_since(job["name"], iso(self.now() - timedelta(days=1))) >= self.max_runs_per_day:
+            day_ago = iso(self.now() - timedelta(days=1))
+            budget, why = self.budget_left(day_ago)
+            if self.k.store.runs_since(job["name"], day_ago) >= self.max_runs_per_day:
                 status, out = "skipped", f"daily cap of {self.max_runs_per_day} runs reached"
+            elif budget is None:
+                status, out = "skipped", why
             else:
-                status, out = await self.run_job(job, payload)
+                status, out = await self.run_job(job, payload, budget)
             if eid is not None:
                 self.k.store.finish_hook_event(eid)
             finished = self.now()
@@ -2453,7 +2493,8 @@ def start_webhook_listener(db_path: str, port: int):
 async def daemon(home: str = ".", policy: dict | None = None, provider=None, budget: Budget | None = None,
                  tick_seconds: float = 10, once: bool = False, max_runs_per_day: int = 200,
                  timeout: float = 300, webhook_port: int | None = None,
-                 approve_timeout: float | None = None, a2a_specs: list[str] | None = None):
+                 approve_timeout: float | None = None, a2a_specs: list[str] | None = None,
+                 daily_tokens: int | None = None, daily_cost: float | None = None):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -2473,7 +2514,7 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
             await k.close()
             k.store.db.close()
             return 1
-    sched = Scheduler(k, policy, budget, max_runs_per_day, timeout)
+    sched = Scheduler(k, policy, budget, max_runs_per_day, timeout, daily_tokens=daily_tokens, daily_cost=daily_cost)
     print(f"[aios] job daemon on {base} ({len(k.store.list_jobs())} jobs"
           f"{', one pass' if once else ', Ctrl+C to stop'})", file=sys.stderr)
     hooks = None
@@ -3094,6 +3135,10 @@ def cli():
     dm.add_argument("--tick", type=float, default=10, help="seconds between checks (default 10)")
     dm.add_argument("--timeout", type=float, default=300, help="seconds one job may run (default 300)")
     dm.add_argument("--max-runs-per-day", type=int, default=200, help="per job, a runaway guard (default 200)")
+    dm.add_argument("--daily-max-tokens", type=int, metavar="N",
+                    help="tokens all jobs together may use in any 24 hours; later runs are skipped (default: no limit)")
+    dm.add_argument("--daily-max-cost", type=float, metavar="USD",
+                    help="the same in dollars (needs --price-in/--price-out)")
     dm.add_argument("--webhook-port", type=int, metavar="PORT",
                     help="accept POST /hook/<job> on 127.0.0.1:PORT for `on webhook` jobs (off by default)")
     jb = sub.add_parser("jobs", help="manage scheduled jobs")
@@ -3219,8 +3264,12 @@ def cli():
             ap.error("--webhook-port needs a long-running daemon (not --once) and a port 0-65535")
         if a.approvals == "console" and a.approve_timeout >= a.timeout:
             ap.error("--approve-timeout must be shorter than --timeout (the job would be stopped first)")
+        if (a.daily_max_tokens is not None and a.daily_max_tokens < 1) or (a.daily_max_cost is not None and a.daily_max_cost <= 0):
+            ap.error("--daily-max-tokens / --daily-max-cost must be positive")
+        if a.daily_max_cost is not None and not (a.price_in or a.price_out):
+            ap.error("--daily-max-cost needs --price-in / --price-out")
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
-                                  a.webhook_port, approve_timeout(a, ap), a.a2a))
+                                  a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         policy = None
