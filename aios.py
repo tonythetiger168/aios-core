@@ -71,7 +71,7 @@ FACT_PROMPT_MAX = 500  # chars of one fact shown in the system prompt
 FACT_PROMPT_LIMIT = 30  # more notes than this: show only the ones relevant to the task
 AUDIT_MAX = 2000  # max chars of arguments/result kept per audit entry
 MAX_DELEGATION_DEPTH = 2  # main -> helper -> helper's helper, no deeper
-DEFAULT_APPROVAL = ("write_file", "run_python")  # need human approval; MCP tools are added on connect
+DEFAULT_APPROVAL = ("write_file", "run_python", "fetch_url")  # need human approval; MCP tools are added on connect
 # Swarms (the `swarm` tool, `aios swarm`): many helpers at once. The CLI flags set these.
 MODEL_SLOTS = 16  # model calls in flight at once, across every agent of the process (rate limit)
 SWARM_PARALLEL = 8  # helpers running at once in one swarm (a swarm may ask for fewer)
@@ -1916,8 +1916,16 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
         out = ("\n".join(lines) or "(no matches)") + (("\n" + one(note)) if note else "")
         return _unverified(out) if any(r["source"] == "tainted" for r in results) else out
 
+    @k.tools.register("fetch_url", "Fetch a public web page (GET) and return it as text. Redirects are not "
+                      "followed: the answer names the new URL, fetch it with another call. Private and local "
+                      "network addresses are refused.",
+                      {"url": {"type": "string", "description": "http:// or https:// URL"}}, required=["url"])
+    async def fetch_url(url: str):
+        import aios_fetch
+        return await aios_fetch.fetch(url, allow_private=os.environ.get("AIOS_FETCH_ALLOW_PRIVATE") == "1")
+
     # outside data flows in through these: results are tagged <untrusted> and taint the run
-    k.tools.mark_untrusted("read_file", "list_files", "run_python")
+    k.tools.mark_untrusted("read_file", "list_files", "run_python", "fetch_url")
 
 
 DEFAULT_TOOLS = ("now", "read_file", "write_file", "list_files", "remember", "recall", "list_facts",
