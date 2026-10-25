@@ -46,7 +46,8 @@ class FakeProvider:
 
     async def complete(self, system, messages, tools, max_tokens=1024):
         # snapshot: the kernel keeps mutating history after the call
-        self.calls.append(copy.deepcopy({"system": system, "messages": messages, "tools": tools}))
+        self.calls.append(copy.deepcopy({"system": system, "messages": messages, "tools": tools,
+                                         "max_tokens": max_tokens}))
         return self.responses.pop(0)
 
 
@@ -423,6 +424,18 @@ class BudgetTests(unittest.TestCase):
         self.assertIn("cost budget", c.exceeded(1000, 2000))  # $0.011
         self.assertIsNone(aios.Budget().exceeded(10**9, 10**9))  # no limits by default
 
+    def test_output_room_leaves_space_for_the_next_prompt(self):
+        self.assertEqual(aios.Budget().output_room(10**9, 10**9, 10**9), aios.REPLY_TOKENS)
+        b = aios.Budget(max_total_tokens=1000)
+        self.assertEqual(b.output_room(0, 0, 0), 1000)
+        self.assertEqual(b.output_room(300, 100, 300), 300)  # 1000 - 400 used - a 300-token prompt
+        self.assertEqual(b.output_room(600, 100, 600), 0)
+        c = aios.Budget(max_cost_usd=0.01, price_in_per_mtok=1.0, price_out_per_mtok=10.0)
+        self.assertEqual(c.output_room(1000, 0, 1000), 800)  # $0.008 left / $10 per Mtok
+        only_in = aios.Budget(max_cost_usd=0.01, price_in_per_mtok=10.0)  # replies cost nothing
+        self.assertEqual(only_in.output_room(0, 0, 500), aios.REPLY_TOKENS)
+        self.assertEqual(only_in.output_room(500, 0, 500), 0)  # the prompt alone uses the rest
+
 
 class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
     def kernel(self, *resp, **kw):
@@ -446,6 +459,29 @@ class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["status"], "budget")
         self.assertIn("tokens_in=600 tokens_out=500", r["result"])
         self.assertEqual(len(k.provider.calls), 1)
+
+    async def test_each_reply_is_capped_to_what_the_budget_has_left(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50),
+                        Resp([text("done")], "end_turn", 450, 20),
+                        budget=aios.Budget(max_total_tokens=1000))
+        self.assertEqual(await k._run(aios.Agent("a", {"act"}), "go"), "done")
+        self.assertEqual([c["max_tokens"] for c in k.provider.calls], [1000, 150])  # 1000 - 450 - 400
+
+    async def test_no_call_when_the_next_prompt_alone_would_use_the_budget(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50), budget=aios.Budget(max_total_tokens=900))
+        out = await k._run(aios.Agent("a", {"act"}), "go")
+        self.assertIn("no room for another model call: 450 tokens used, the last prompt was 400", out)
+        self.assertEqual(len(k.provider.calls), 1)
+        self.assertEqual(self.ran, [1])  # the first step was within budget, so its tool ran
+        self.assertEqual(run_log(k)[0]["status"], "budget")
+
+    async def test_a_reply_cut_off_by_the_budget_says_so(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50),
+                        Resp([text("half an ans")], "max_tokens", 450, 150),
+                        budget=aios.Budget(max_total_tokens=1000))
+        out = await k._run(aios.Agent("a", {"act"}), "go")
+        self.assertTrue(out.startswith("half an ans\n(stopped: the reply was cut off at the budget)"), out)
+        self.assertEqual(run_log(k)[0]["status"], "budget")
 
     async def test_history_is_repaired_after_budget_stop(self):
         k = self.kernel(Resp([tool_use("act", {})], "tool_use", 2000, 0),
@@ -545,6 +581,8 @@ class OpenAICompatTests(unittest.IsolatedAsyncioTestCase):
     def test_plain_answer_and_bad_arguments(self):
         c = self.P.from_wire({"choices": [{"message": {"content": "done"}}]})
         self.assertEqual((c.stop_reason, c.input_tokens), ("end_turn", 0))
+        cut = self.P.from_wire({"choices": [{"message": {"content": "hal"}, "finish_reason": "length"}]})
+        self.assertEqual(cut.stop_reason, "max_tokens")
         bad = self.P.from_wire({"choices": [{"message": {"content": None, "tool_calls": [
             {"id": "1", "function": {"name": "t", "arguments": "{not json"}}]}}]})
         self.assertIn("_invalid_arguments", bad.content[0]["input"])  # becomes a tool error, no crash
@@ -709,7 +747,9 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         p = aios.AnthropicProvider("m", self.client(calls, [self.Msg(type="text", text="x")], "max_tokens"))
         c = await p.complete("S", [], [])
         self.assertNotIn("tools", calls[0])
-        self.assertEqual(c.stop_reason, "end_turn")
+        self.assertEqual(c.stop_reason, "max_tokens")  # a cut-off reply: the run knows it was cut
+        p = aios.AnthropicProvider("m", self.client(calls, [self.Msg(type="text", text="x")], "stop_sequence"))
+        self.assertEqual((await p.complete("S", [], [])).stop_reason, "end_turn")
 
 
 class HardeningBase(unittest.IsolatedAsyncioTestCase):

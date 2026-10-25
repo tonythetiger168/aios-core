@@ -354,15 +354,16 @@ class SchedulerTests(SchedulerCase):
             self.make(daily_cost=1.0)
         self.on_clock()
         priced = aios.Budget(max_total_tokens=50_000, price_in_per_mtok=1_000_000)  # $1 per input token
-        k, _, s = self.make(call("now", {}, tin=3), text("ok"), call("now", {}, tin=3), budget=priced, daily_cost=5.0)
+        k, _, s = self.make(text("ok", tin=1), call("now", {}, tin=4), budget=priced, daily_cost=5.0)
         self.job(k, schedule="every 1m")
-        self.assertEqual([r["status"] for r in await s.tick()], ["ok"])
+        self.assertEqual([r["status"] for r in await s.tick()], ["ok"])  # $1
         self.clock.t += timedelta(minutes=2)
-        self.assertEqual([r["status"] for r in await s.tick()], ["stopped"])  # $3 more against $2 left
+        # $4 more, and the next prompt would cost at least $4 again with nothing left: stopped before it
+        self.assertEqual([r["status"] for r in await s.tick()], ["stopped"])
         self.clock.t += timedelta(minutes=2)
         (r,) = await s.tick()
         self.assertEqual(r["status"], "skipped")
-        self.assertIn("daily cost budget of $5.0000 reached ($6.0000 used in 24h)", r["output"])
+        self.assertIn("daily cost budget of $5.0000 reached ($5.0000 used in 24h)", r["output"])
 
     async def test_a_timed_out_run_still_records_what_it_spent(self):
         async def slow():

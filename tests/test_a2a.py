@@ -32,7 +32,8 @@ class Scripted:
         self.script, self.calls = list(script), []
 
     async def complete(self, system, messages, tools, max_tokens=1024):
-        self.calls.append({"system": system, "messages": [dict(m) for m in messages], "tools": [t["name"] for t in tools]})
+        self.calls.append({"system": system, "messages": [dict(m) for m in messages], "tools": [t["name"] for t in tools],
+                           "max_tokens": max_tokens})
         return self.script.pop(0) if self.script else text("done")
 
 
@@ -671,14 +672,15 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
         self.srv = aios.make_a2a_server(self.remote, "helper", self.POLICY, aios.Budget(max_total_tokens=1000), TOKEN,
                                         port=0, daily_tokens=300)
         url = f"http://127.0.0.1:{self.srv.port}/"
-        big = aios.Completion([{"type": "text", "text": "big"}], "end_turn", 100, 150)
+        big = aios.Completion([{"type": "text", "text": "big"}], "end_turn", 100, 100)
         self.remote_prov.script = [big, big]
         # another agent's spending in the same aios.db does not count against this one
         self.remote.store.log_audit("helper2", aios.RUN_ENTRY, {}, "tokens_in=900 tokens_out=900 cost_usd=0", "ok")
         c = aios_a2a.Client(url, TOKEN, timeout=10)
-        self.assertEqual(await asyncio.to_thread(c.send, "one"), "big")  # 250 of 300 used
-        self.assertEqual(await asyncio.to_thread(c.send, "two"), "big")  # gets the 50 left, overshoots once
-        with self.assertRaisesRegex(RuntimeError, r"task failed: .*daily token budget of 300 reached \(500 used in 24h\)"):
+        self.assertEqual(await asyncio.to_thread(c.send, "one"), "big")  # 200 of 300 used
+        self.assertEqual(await asyncio.to_thread(c.send, "two"), "big")  # the 100 left cap the reply
+        self.assertEqual(self.remote_prov.calls[1]["max_tokens"], 100)
+        with self.assertRaisesRegex(RuntimeError, r"task failed: .*daily token budget of 300 reached \(400 used in 24h\)"):
             await asyncio.to_thread(c.ask, "three")
         self.assertEqual(len(self.remote_prov.calls), 2)  # the model was not called for the third
 
