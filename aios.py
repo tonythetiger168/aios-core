@@ -2159,7 +2159,7 @@ async def install_a2a_tools(k: Kernel, specs: list[str]) -> list[str]:
 
 async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=None, budget: Budget | None = None,
                     port: int = 8770, description: str = "", timeout: float = 300, token: str | None = None,
-                    daily_tokens: int | None = None, daily_cost: float | None = None):
+                    daily_tokens: int | None = None, daily_cost: float | None = None, push_to=()):
     """Serve one policy agent over A2A on 127.0.0.1 (see aios_a2a). Each request is a fresh, tainted
     run with that agent's permissions; nobody can approve risky calls."""
     import secrets
@@ -2172,7 +2172,8 @@ async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=No
     install_agent_tools(k, policy)
     shown = token is None
     token = token or secrets.token_urlsafe(32)
-    srv = make_a2a_server(k, agent_name, policy, budget, token, port, description, timeout, daily_tokens, daily_cost)
+    srv = make_a2a_server(k, agent_name, policy, budget, token, port, description, timeout, daily_tokens, daily_cost,
+                          push_to)
     print(f"[aios] A2A agent '{agent_name}' at http://127.0.0.1:{srv.port}/ (data in {base})"
           + (f"\n  token (callers send 'Authorization: Bearer <token>'): {token}" if shown else
              "\n  token from $AIOS_A2A_TOKEN") + "\n  Ctrl+C to stop.", file=sys.stderr)
@@ -2188,9 +2189,10 @@ async def a2a_serve(agent_name: str, policy: dict | None, home: str, provider=No
 
 def make_a2a_server(k: Kernel, agent_name: str, policy: dict | None, budget: Budget | None, token: str,
                     port: int = 8770, description: str = "", timeout: float = 300,
-                    daily_tokens: int | None = None, daily_cost: float | None = None):
+                    daily_tokens: int | None = None, daily_cost: float | None = None, push_to=()):
     """Start the A2A server for one policy agent on the running loop (see a2a_serve). daily_tokens /
-    daily_cost: what all requests together may use in any 24 hours (callers are strangers)."""
+    daily_cost: what all requests together may use in any 24 hours (callers are strangers). push_to:
+    URL patterns push notifications may be sent to (none: push is off)."""
     import aios_a2a
     pol = (policy or {}).get(agent_name)
     perms = set(pol["permissions"]) if pol and pol["permissions"] is not None else set(SERVE_DEFAULT_TOOLS)
@@ -2210,7 +2212,7 @@ def make_a2a_server(k: Kernel, agent_name: str, policy: dict | None, budget: Bud
         return await k._run(agent, text, b)
 
     return aios_a2a.Server(agent_name, description or f"The AIOS agent '{agent_name}'.", token, run, make_agent,
-                           asyncio.get_running_loop(), port, timeout).start()
+                           asyncio.get_running_loop(), port, timeout, push_to).start()
 
 
 # ---- Demo ----
@@ -3535,6 +3537,9 @@ def cli():
     aa.add_argument("--port", type=int, default=8770, help="port on 127.0.0.1 (default 8770)")
     aa.add_argument("--description", default="", help="what the agent does, shown in its agent card")
     aa.add_argument("--timeout", type=float, default=300, help="seconds one request may run (default 300)")
+    aa.add_argument("--push-to", action="append", default=[], metavar="URL_PATTERN",
+                    help="allow push notifications to URLs matching this glob, e.g. 'https://hooks.example.com/a2a/*' "
+                         "(repeatable; without it push is off)")
     add_daily_flags(aa, "all requests together", "later requests fail")
     add_model_flags(aa)
     co = sub.add_parser("console", help="local web console: audit log, jobs, memory, skills; read-only unless --approve")
@@ -3717,6 +3722,10 @@ def cli():
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         check_daily_flags(a, ap)
+        for pat in a.push_to:  # a fixed scheme and host: "https://hooks.example.com*" would match .evil.com too
+            if not re.fullmatch(r"https?://[^/*?\[\]@]+/.*", pat):
+                ap.error(f"--push-to {pat!r}: give http(s)://host[:port]/ then a path pattern, with no "
+                         "wildcard in the host, e.g. 'https://hooks.example.com/a2a/*'")
         policy = None
         if a.policy:
             try:
@@ -3726,7 +3735,7 @@ def cli():
         try:
             return asyncio.run(a2a_serve(a.agent, policy, a.home, provider, budget, a.port, a.description,
                                          a.timeout, os.environ.get("AIOS_A2A_TOKEN"),
-                                         a.daily_max_tokens, a.daily_max_cost))
+                                         a.daily_max_tokens, a.daily_max_cost, a.push_to))
         except OSError as e:
             ap.error(f"cannot listen on 127.0.0.1:{a.port}: {e}")
     if a.cmd == "skills":
