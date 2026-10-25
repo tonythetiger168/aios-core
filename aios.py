@@ -114,9 +114,9 @@ class OpenAICompatProvider:
     LM Studio, llama.cpp server, vLLM, OpenAI. Standard library only (no extra install)."""
 
     def __init__(self, model: str, base_url: str = "http://localhost:11434/v1",
-                 api_key: str | None = None, timeout: int = 300):
+                 api_key: str | None = None, timeout: int = 300, temperature: float | None = None):
         self.model, self.base_url = model, base_url.rstrip("/")
-        self.api_key, self.timeout = api_key, timeout
+        self.api_key, self.timeout, self.temperature = api_key, timeout, temperature
 
     # -- translation: neutral blocks <-> OpenAI wire format (pure functions, unit-tested) --
     @staticmethod
@@ -187,6 +187,8 @@ class OpenAICompatProvider:
                    "messages": self.to_wire_messages(system, messages)}
         if tools:
             payload["tools"] = self.to_wire_tools(tools)
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         return self.from_wire(await asyncio.to_thread(self._post, payload))
 
 
