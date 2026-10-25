@@ -216,6 +216,7 @@ python aios.py skills untrust meeting-notes
   ```
 
   `install` 先下載到暫存資料夾，比對壓縮檔的 SHA-256，以及技能名稱、版本和摘要是否與索引相符，再完全照 `trust` 的流程審查；只有你確認後才會取代 `<home>/skills/<名稱>` 和固定紀錄。已發布的名稱與版本不能用不同內容重新發布。壓縮檔只能包含一般檔案與單純的相對路徑，且受技能大小上限限制。遠端註冊中心必須用 `https://`（`http://` 只限 localhost）。索引本身沒有簽章：它幫你找到技能，也能抓出損壞或被調包的下載，但技能是誰發布的，只能由它的 `SKILL.sig` 與你允許的簽署者判斷，所以對不是你管理的註冊中心請加 `--require-signed`。
+- **公開註冊中心**：https://tonythetiger168.github.io/aios-core/ 由這個 repo 的 [`registry/`](registry/) 資料夾建置，沒有指定 `--registry`、也沒設 `AIOS_SKILL_REGISTRY` 時就用它，所以 `python aios.py skills search` 與 `python aios.py skills install meeting-notes` 不用設定就能用。想加入技能，請開 pull request 在那裡新增一個資料夾（見 [registry/README.md](registry/README.md)）；技能必須掃描乾淨，已發布的 `名稱@版本` 永遠不會改變（建置會從線上的註冊中心開始，內容若要改變就直接失敗），舊版本也一直可以安裝。在設定專案的簽章金鑰之前，這裡的技能都沒有簽章（設定了 `AIOS_REGISTRY_SIGNING_KEY` secret 後，workflow 會替每個技能簽章；把對應公鑰寫進 `registry/allowed_signers`，它就會放在索引旁），所以目前加 `--require-signed` 會拒絕它們：確認前請先看掃描結果和內容。
 - **限制**：固定摘要證明內容就是*你審查過的那份*；簽章證明是誰發布的，但只限你選擇允許的金鑰。金鑰要怎麼取得由你決定（沒有金鑰伺服器）；註冊中心收錄不代表背書。掃描乾淨只是警報，不是保證。你信任的技能仍可能誤導模型：請實際讀過它。
 
 ## 當作 MCP 伺服器使用
@@ -397,7 +398,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
-| **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`；尚未架設公開的註冊中心）· 可選的託管版本 | 有外部貢獻者提交技能 |
+| **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。

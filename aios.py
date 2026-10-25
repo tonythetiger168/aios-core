@@ -3428,7 +3428,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     import aios_skills as sk
     signers = signers or os.environ.get("AIOS_SKILL_SIGNERS") or str(Path(home).resolve() / "allowed_signers")
     require_signed = require_signed or os.environ.get("AIOS_SKILLS_REQUIRE_SIGNED") == "1"
-    registry = registry or os.environ.get("AIOS_SKILL_REGISTRY") or ""
+    registry = registry or os.environ.get("AIOS_SKILL_REGISTRY") or sk.PUBLIC_REGISTRY
 
     if action == "search":
         try:
@@ -3469,7 +3469,7 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
         print(f"removed trust for '{target}'" if ok else f"'{target}' was not trusted")
         return 0 if ok else 1
     if action == "publish":
-        kind = sk._location(registry)[0] if registry else ""
+        kind = sk._location(registry)[0]
         if kind != "dir":
             print("usage: aios skills publish <folder> --registry <registry folder> (publish to a folder, then host it)")
             return 2
@@ -3918,8 +3918,8 @@ def cli():
     k_.add_argument("target", nargs="?",
                     help="skill folder (scan/trust/sign/publish), skill name (untrust), name[@version] (install) "
                          "or search words")
-    k_.add_argument("--registry", help="registry folder or https:// URL (default: $AIOS_SKILL_REGISTRY); "
-                                       "install puts skills in <home>/skills/<name>")
+    k_.add_argument("--registry", help="registry folder or https:// URL (default: $AIOS_SKILL_REGISTRY, else the "
+                                       "public registry); install puts skills in <home>/skills/<name>")
     k_.add_argument("--key", help="sign: SSH private key (ed25519 recommended) to sign with")
     k_.add_argument("--signers", help="allowed-signers file (default: <home>/allowed_signers or $AIOS_SKILL_SIGNERS)")
     k_.add_argument("--require-signed", action="store_true",
