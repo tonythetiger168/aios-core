@@ -1432,6 +1432,23 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn("ran", r.stdout)
 
+    @unittest.skipIf(aios.IS_WINDOWS, "no rlimits on Windows")
+    async def test_a_limit_the_os_refuses_is_left_out_not_fatal(self):
+        real = aios.resource.setrlimit
+
+        def macos_like(lim, value):  # macOS refuses to lower RLIMIT_AS
+            if lim == aios.resource.RLIMIT_AS:
+                raise ValueError("current limit exceeds maximum limit")
+            real(lim, value)
+
+        with mock.patch.object(aios.sys, "platform", "darwin"), \
+                mock.patch.object(aios.resource, "setrlimit", macos_like):
+            box = aios.Sandbox()
+            self.assertNotIn("RLIMIT_AS", box.limits)
+            self.assertIn("RLIMIT_CPU", box.limits)
+            out = await box.run_python("print(6*7)")
+        self.assertTrue(out.startswith("exit=0"), out)
+
     async def test_environment_is_scrubbed(self):
         import os
         os.environ["AIOS_SECRET_TEST"] = "leak"

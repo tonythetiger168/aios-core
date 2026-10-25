@@ -1085,6 +1085,7 @@ class Sandbox:
                              and subprocess.run(["unshare", "-rn", "true"],
                                                 capture_output=True).returncode == 0)
         self.fs_isolated = landlock_abi() >= 1
+        self.limits = self._usable_limits()
         if not self.net_isolated and landlock_abi() >= 4:
             self.net_isolated = "tcp"  # Landlock blocks TCP bind/connect; UDP still works
         if IS_WINDOWS:
@@ -1096,18 +1097,44 @@ class Sandbox:
             if not self.fs_isolated:
                 print("[sandbox] WARNING: no Landlock (Linux 5.13+): code can read every file you can",
                       file=sys.stderr)
+            for name in self.RLIMITS:
+                if name not in self.limits:
+                    print(f"[sandbox] WARNING: this OS refuses {name} ({self.RLIMITS[name]}): code runs "
+                          "without that limit", file=sys.stderr)
+
+    RLIMITS = {"RLIMIT_CPU": "CPU time", "RLIMIT_AS": "memory", "RLIMIT_FSIZE": "file size",
+               "RLIMIT_CORE": "core dumps"}
+
+    def _values(self) -> dict:
+        return {"RLIMIT_CPU": self.cpu_s, "RLIMIT_AS": self.mem, "RLIMIT_FSIZE": 10 << 20, "RLIMIT_CORE": 0}
+
+    def _usable_limits(self) -> tuple:
+        """The rlimits this OS lets a child set. Linux takes them all; macOS refuses RLIMIT_AS, and a
+        refused limit inside preexec_fn would make every run_python call fail."""
+        if IS_WINDOWS:
+            return ()
+        if sys.platform.startswith("linux"):
+            return tuple(self.RLIMITS)
+        ok = []
+        for name, value in self._values().items():
+            def apply(lim=getattr(resource, name), v=value):
+                resource.setrlimit(lim, (v, v))
+            try:
+                subprocess.run(["/bin/sh", "-c", "exit 0"], preexec_fn=apply, check=True, timeout=10)
+                ok.append(name)
+            except (subprocess.SubprocessError, OSError):
+                pass
+        return tuple(ok)
 
     def _limits(self):
-        cpu, mem = self.cpu_s, self.mem
+        values = [(getattr(resource, n), v) for n, v in self._values().items() if n in self.limits]
         # RLIMIT_NPROC caps every process of the user, not just ours, so allow what runs now plus
         # max_procs: a fork bomb stops there. The kernel does not apply it to root.
         now = _user_tasks() if sys.platform.startswith("linux") else None
         nproc = now + self.max_procs if now else None
         def apply():
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (10 << 20, 10 << 20))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            for lim, v in values:
+                resource.setrlimit(lim, (v, v))
             if nproc:
                 hard = resource.getrlimit(resource.RLIMIT_NPROC)[1]
                 cap = nproc if hard == resource.RLIM_INFINITY else min(nproc, hard)

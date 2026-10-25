@@ -522,7 +522,7 @@ class SignatureTests(SkillCase):
         d = self.make()
         before = sk.load(d).sha256
         sig = sk.sign(d, self.alice)
-        self.assertEqual(sig, d / sk.SIG_FILE)
+        self.assertEqual(sig.resolve(), (d / sk.SIG_FILE).resolve())  # macOS: /var is /private/var
         self.assertTrue(sig.read_text().startswith("-----BEGIN SSH SIGNATURE-----"))
         skill = sk.load(d)
         self.assertEqual(skill.sha256, before)  # SKILL.sig is not part of what it signs
