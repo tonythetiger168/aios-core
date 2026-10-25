@@ -1071,10 +1071,41 @@ def _landlock_config(cwd: str) -> str:
     return json.dumps({"ro": ro, "rw": [cwd, "/dev/null", "/dev/zero", "/dev/urandom"]})
 
 
+@functools.lru_cache(maxsize=1)
+def seatbelt_ok() -> bool:
+    """macOS: sandbox-exec (Seatbelt) can confine a child. Deprecated by Apple but still shipped."""
+    if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+        return False
+    r = subprocess.run(["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def _sbpl(path) -> str:
+    return json.dumps(os.path.realpath(str(path)))  # SBPL strings use the same escapes as JSON
+
+
+def _seatbelt_profile(cwd: str) -> str:
+    """Everything else allowed, but no network, no writes outside the code's own folder and no reads
+    under the places that hold your data (homes, other volumes, temp folders), apart from Python
+    itself and the workspace."""
+    ro = {str(WORKSPACE), sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
+          os.path.dirname(os.path.realpath(sys.executable))}
+    return "\n".join([
+        "(version 1)", "(allow default)", "(deny network*)",
+        "(deny file-write*)",
+        f'(allow file-write* (subpath {_sbpl(cwd)}) (literal "/dev/null") (literal "/dev/zero"))',
+        '(deny file-read* (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders") '
+        '(subpath "/private/tmp") (subpath "/private/var/root") (subpath "/Library/Keychains"))',
+        "(allow file-read* " + " ".join(f"(subpath {_sbpl(p)})" for p in sorted(ro | {cwd})) + ")",
+    ])
+
+
 class Sandbox:
     """run_python as a local child process: rlimits + no network on Linux, timeout only on Windows.
     With Landlock (Linux 5.13+) it reads only Python, system libraries and the workspace, and writes
-    only its own throwaway folder; without it, whatever files the user can read."""
+    only its own throwaway folder; on macOS sandbox-exec keeps it out of home folders, temp folders
+    and the network. Otherwise it reads whatever files the user can read."""
     name = "process"
 
     def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000, max_procs=64):
@@ -1084,7 +1115,9 @@ class Sandbox:
         self.net_isolated = (not IS_WINDOWS and bool(shutil.which("unshare"))
                              and subprocess.run(["unshare", "-rn", "true"],
                                                 capture_output=True).returncode == 0)
-        self.fs_isolated = landlock_abi() >= 1
+        self.fs_isolated = "landlock" if landlock_abi() >= 1 else "seatbelt" if seatbelt_ok() else False
+        if self.fs_isolated == "seatbelt":
+            self.net_isolated = "all"  # the profile denies every network operation
         self.limits = self._usable_limits()
         if not self.net_isolated and landlock_abi() >= 4:
             self.net_isolated = "tcp"  # Landlock blocks TCP bind/connect; UDP still works
@@ -1095,8 +1128,8 @@ class Sandbox:
             if not self.net_isolated:
                 print("[sandbox] WARNING: network isolation unavailable on this host", file=sys.stderr)
             if not self.fs_isolated:
-                print("[sandbox] WARNING: no Landlock (Linux 5.13+): code can read every file you can",
-                      file=sys.stderr)
+                print("[sandbox] WARNING: no file confinement (Landlock on Linux 5.13+, sandbox-exec on "
+                      "macOS): code can read every file you can", file=sys.stderr)
             for name in self.RLIMITS:
                 if name not in self.limits:
                     print(f"[sandbox] WARNING: this OS refuses {name} ({self.RLIMITS[name]}): code runs "
@@ -1153,8 +1186,10 @@ class Sandbox:
         with tempfile.TemporaryDirectory(dir=WORKSPACE) as d:  # throwaway cwd
             Path(d, "main.py").write_text(code, encoding="utf-8")
             cmd = [sys.executable, "-I", "main.py"]  # -I: ignore env vars and user site
-            if self.fs_isolated:
+            if self.fs_isolated == "landlock":
                 cmd = [sys.executable, "-I", "-c", LANDLOCK_BOOT, _landlock_config(d), "main.py"]
+            elif self.fs_isolated == "seatbelt":
+                cmd = ["sandbox-exec", "-p", _seatbelt_profile(d)] + cmd
             if self.net_isolated is True:
                 cmd = ["unshare", "-rn"] + cmd
             if IS_WINDOWS:
@@ -1734,10 +1769,11 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
             isolation = ("Fresh Firecracker microVM per call (own kernel, KVM); no network device, "
                          "no host files, read-only root, runs as nobody. ")
         else:
-            network = {True: "network namespace enabled", "tcp": "no TCP connections"}.get(
-                box.net_isolated, "network NOT isolated")
-            files = ("reads only Python, system libraries and the workspace, writes only its own folder"
-                     if box.fs_isolated else "can read files accessible to this user")
+            network = {True: "network namespace enabled", "tcp": "no TCP connections",
+                       "all": "no network"}.get(box.net_isolated, "network NOT isolated")
+            files = {"landlock": "reads only Python, system libraries and the workspace, writes only its own folder",
+                     "seatbelt": "cannot read home or temp folders except the workspace, writes only its own folder"
+                     }.get(box.fs_isolated, "can read files accessible to this user")
             isolation = f"Local process; {files}; {network}. "
         @k.tools.register("run_python", "Run Python code. " + isolation +
                           f"{box.timeout}s timeout. Print results to stdout.",
