@@ -143,7 +143,7 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
 
-    async def run_daemon(self, specs, confine=frozenset()):
+    async def run_daemon(self, specs, confine=frozenset(), offline=frozenset()):
         from test_schedule import Scripted, iso, text
         from datetime import datetime, timedelta
         st = aios.Store(str(self.home / "aios.db"))
@@ -154,7 +154,7 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
         provider, err = Scripted(text("done")), io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = await aios.daemon(str(self.home), aios.load_policy(str(policy)), provider=provider, once=True,
-                                   mcp_specs=specs, confine_mcp=confine)
+                                   mcp_specs=specs, confine_mcp=confine, offline_mcp=offline)
         return rc, err.getvalue(), provider
 
     async def test_jobs_get_the_tools_the_policy_grants_and_an_unconfined_server_is_flagged(self):
@@ -170,6 +170,14 @@ class DaemonWithAServerTests(unittest.IsolatedAsyncioTestCase):
                                                   {"demo"})
         self.assertIn("demo__add", provider.calls[0]["tools"])
         self.assertIn("MCP demo (confined)", err)
+        self.assertNotIn("WARNING: MCP server", err)
+
+    @unittest.skipUnless(aios.offline_level(), "needs a network namespace, Landlock ABI 4 or sandbox-exec")
+    async def test_an_offline_server_works_and_is_not_flagged(self):
+        rc, err, provider = await self.run_daemon([self.DEMO], offline={"demo"})
+        self.assertIn("demo__add", provider.calls[0]["tools"])
+        self.assertIn("job j: ok", err)
+        self.assertIn("MCP demo (offline", err)
         self.assertNotIn("WARNING: MCP server", err)
 
     async def test_a_server_that_does_not_start_stops_the_daemon_before_any_job(self):
@@ -197,6 +205,18 @@ class McpFlagTests(unittest.TestCase):
     def test_bad_specs_and_unknown_confine_names_are_refused(self):
         self.assertIn("NAME=COMMAND", self.parse("--mcp", "python server.py"))
         self.assertIn("names no --mcp server: other", self.parse("--mcp", "demo=python s.py", "--confine-mcp", "other"))
+        self.assertIn("--offline-mcp names no --mcp server: x", self.parse("--mcp", "demo=python s.py",
+                                                                           "--offline-mcp", "x"))
+        with mock.patch.object(aios, "offline_level", return_value=""):
+            self.assertIn("cannot cut a server off", self.parse("--mcp", "demo=python s.py", "--offline-mcp", "demo"))
+
+    def test_offline_servers_are_confined_too(self):
+        with mock.patch.object(sys, "argv", ["aios", "daemon", "--mcp", "demo=python s.py", "--offline-mcp", "demo"]), \
+                mock.patch.object(aios, "offline_level", return_value="all"), \
+                mock.patch.object(aios, "daemon", mock.Mock()) as d, mock.patch.object(aios.asyncio, "run"), \
+                mock.patch.object(aios, "build_model", return_value=(None, None)):
+            aios.cli()
+        self.assertEqual(d.call_args.args[-2:], ({"demo"}, {"demo"}))
 
 
 if __name__ == "__main__":

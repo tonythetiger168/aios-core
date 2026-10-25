@@ -1466,11 +1466,57 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.stdout.splitlines(), ["PermissionError", "PermissionError", "2", "import", "net"],
                          r.stderr)
 
+    @unittest.skipUnless(aios.offline_level(), "needs a network namespace, Landlock ABI 4 or sandbox-exec")
+    def test_an_offline_mcp_server_has_no_network_and_still_no_files(self):
+        import socket
+        import subprocess
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as prog:
+            Path(outside, "secret.txt").write_text("key", encoding="utf-8")
+            server = Path(prog, "server.py")
+            server.write_text("\n".join([
+                "import os, socket, sys",
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(Path(outside, 'secret.txt'))!r}).read()))",
+                "print(try_(lambda: open(os.path.join(sys.argv[1], 'state.txt'), 'w').write('ok')))",
+                f"print(try_(lambda: socket.create_connection(('127.0.0.1', {srv.getsockname()[1]}), 3) and 'tcp'))",
+                "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
+                f"print(try_(lambda: u.sendto(b'x', ('127.0.0.1', {udp.getsockname()[1]})) and 'udp'))",
+            ]), encoding="utf-8")
+            modes = [False]  # as this machine is; and Landlock alone when it also has network namespaces
+            if aios.landlock_abi() >= 4 and aios.netns_ok():
+                modes.append(True)
+            for landlock_only in modes:
+                with self.subTest(landlock_only=landlock_only), \
+                        mock.patch.object(aios, "netns_ok", return_value=False) if landlock_only \
+                        else contextlib.nullcontext():
+                    argv = aios.confine_command(sys.executable, [str(server), state], state, network=False)
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                    out = r.stdout.splitlines()
+                    self.assertEqual(out[:2], ["PermissionError", "2"], r.stderr)
+                    self.assertNotEqual(out[2], "tcp", r.stderr)
+                    # with Landlock alone UDP still gets out, and doctor and the startup line say so
+                    self.assertEqual(out[3] == "udp", aios.offline_level() == "tcp", r.stderr)
+        srv.close()
+        udp.close()
+
     def test_confining_an_mcp_server_refuses_where_it_cannot(self):
         with mock.patch.object(aios, "landlock_abi", return_value=0), \
                 mock.patch.object(aios, "seatbelt_ok", return_value=False):
             with self.assertRaises(RuntimeError):
                 aios.confine_command(sys.executable, [], tempfile.gettempdir())
+        with mock.patch.object(aios, "offline_level", return_value=""), \
+                self.assertRaisesRegex(RuntimeError, "off the network"):
+            aios.confine_command(sys.executable, [], tempfile.gettempdir(), network=False)
 
     def test_landlock_failure_is_fatal_not_ignored(self):
         if not aios.landlock_abi():

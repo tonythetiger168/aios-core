@@ -22,7 +22,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
   - `process`（Linux／macOS 預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時自動選用；否則 `run_python` 保持停用。
   - `microvm`（實驗性，需 Linux 與 KVM）：每次呼叫啟動一台全新的 [Firecracker](https://firecracker-microvm.github.io/) microVM，有自己的核心、沒有網路裝置、除了程式碼之外不帶入你電腦上的任何東西、根目錄唯讀、非特權使用者。只在明確指定時使用，`auto` 永遠不會選它；KVM、Firecracker 或映像檔缺少時 AIOS 會拒絕啟動。AIOS 以 root 執行時，設定 `AIOS_MICROVM_JAILER=1` 還會用 Firecracker 的 jailer 把 VMM 本身也關起來（chroot、非特權 uid、有記憶體上限的 cgroup）。設定方式與威脅模型見 [docs/microvm-sandbox.md](docs/microvm-sandbox.md)。
-- **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。
+- **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`aios doctor` 會顯示你的機器是哪一種。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
@@ -95,7 +95,7 @@ python aios.py service windows --home C:\aios-data -- ...                       
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。如果要給所有任務一個硬上限，`--daily-max-tokens N` 和 `--daily-max-cost USD`（需要 `--price-in/--price-out`）會限制所有任務在任意 24 小時內合計的用量。碰到上限前的最後一次執行只拿得到剩下的額度，之後的執行會被跳過，直到時間窗往後移。因逾時被中止的執行，已用掉的量照樣計入。
 - 守護程式停止期間錯過的任務，恢復後只會執行**一次**，不會每個錯過的時段各補一次。任務一次執行一個。結果用 `aios jobs history` 查看，每次工具呼叫都在 `aios audit` 裡。
 
-**在定時任務裡用 MCP 伺服器。** 守護程式也接受和 `chat` 一樣的 `--mcp` 與 `--confine-mcp`：
+**在定時任務裡用 MCP 伺服器。** 守護程式也接受和 `chat` 一樣的 `--mcp`、`--confine-mcp` 與 `--offline-mcp`：
 
 ```bash
 python aios.py daemon --mcp "demo=python demo_mcp_server.py" --confine-mcp demo --policy policy.toml ...
@@ -325,7 +325,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace。在 Linux 5.13+ 上，Landlock 讓它讀不到你的家目錄與其他檔案（仍可讀工作區、Python、系統函式庫與 `/usr` 底下的內容）；在 macOS 上，`sandbox-exec` 讓它不能使用網路、不能寫入自己資料夾以外的地方，也讀不到 `/Users`、其他磁碟區與暫存資料夾（工作區與 Python 本身除外）；在較舊的 Linux 核心上，它仍可讀取該使用者讀得到的所有檔案。macOS 也不接受記憶體限制（`RLIMIT_AS`），所以在 macOS 上只有 CPU、檔案大小與時間限制；AIOS 啟動時會印出警告。在 Linux 上，它最多只能比你的使用者現有的數量多開 64 個行程或執行緒，fork 炸彈會在那裡停下；AIOS 以 root 執行時核心不套用這個限制。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：沒有 Docker 時 `run_python` 停用（只有逾時的隔離並不安全）。請用 `--sandbox docker`，或設定 `AIOS_ALLOW_WEAK_SANDBOX=1` 自行承擔風險啟用較弱的沙箱。
-- 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權；不需要你檔案的伺服器請加上 `--confine-mcp`。受限的伺服器仍有網路，所以仍可把工具呼叫收到的內容送出去；需要你的檔案（或像 `npx` 那樣在家目錄放快取）的伺服器在受限模式下無法運作。
+- 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權；不需要你檔案的伺服器請加上 `--confine-mcp`。受限的伺服器仍有網路，所以仍可把工具呼叫收到的內容送出去；不需要網路的伺服器可改用 `--offline-mcp` 堵住這點（要有網路 namespace 或 `sandbox-exec` 才完全堵住：只有 Landlock 時，UDP（例如 DNS 查詢）仍送得出去）；需要你的檔案（或像 `npx` 那樣在家目錄放快取）的伺服器在受限模式下無法運作。
 - 預算在每次模型呼叫之後才檢查，所以單次呼叫可能略微超出上限。費用上限需要你自己提供單價（價格會變，因此不內建預設值）。預算是每次執行的上限；定時任務另外可以用守護程式的 `--daily-max-tokens`／`--daily-max-cost` 設定所有任務合計的 24 小時上限，`a2a-serve` 也可用同樣的參數限制所有請求合計的用量。聊天沒有每日上限（`serve` 不呼叫模型）。
 - 本機模型在工具使用與抵禦提示詞注入上，都比前沿模型弱很多，請保持人工審批開啟。
 
