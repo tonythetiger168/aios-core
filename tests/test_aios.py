@@ -1354,6 +1354,32 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         out = await aios.Sandbox(max_out=100).run_python("print('x'*5000)")
         self.assertIn("(truncated)", out)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_NPROC accounting is read from /proc")
+    def test_user_tasks_counts_our_own_threads(self):
+        import threading
+        before = aios._user_tasks()
+        self.assertGreaterEqual(before, 1)
+        stop = threading.Event()
+        ts = [threading.Thread(target=stop.wait) for _ in range(5)]
+        for t in ts:
+            t.start()
+        try:
+            self.assertGreaterEqual(aios._user_tasks(), before + 5)
+        finally:
+            stop.set()
+            for t in ts:
+                t.join()
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.getuid() != 0,
+                         "the kernel ignores RLIMIT_NPROC for root")
+    async def test_a_fork_bomb_stops_at_max_procs(self):
+        code = ("import os, time\nn = 0\ntry:\n    for _ in range(500):\n        if os.fork() == 0:\n"
+                "            time.sleep(2); os._exit(0)\n        n += 1\nexcept OSError:\n    pass\n"
+                "print('forked', n)")
+        out = await aios.Sandbox(max_procs=20, timeout=20).run_python(code)
+        n = int(out.split("forked")[1])
+        self.assertLess(n, 25, out)  # a few slack for processes the user started meanwhile
+
     async def test_environment_is_scrubbed(self):
         import os
         os.environ["AIOS_SECRET_TEST"] = "leak"
