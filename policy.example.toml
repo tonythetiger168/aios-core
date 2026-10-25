@@ -53,19 +53,21 @@ max_calls = 5           # per run
 [agents.lead]
 permissions = ["now", "read_file", "list_files", "agent__notes"]
 
-# Argument rules: limit the VALUES a tool may be called with. Useful for MCP tools, which have no
-# workspace path. Start with: python aios.py chat --agent researcher --policy policy.example.toml \
-#                                --mcp "web=<command for your fetch MCP server>"
+# Argument rules: limit the VALUES a tool may be called with, here the built-in fetch_url (the same
+# works for MCP tools, which have no workspace path, e.g. "web__fetch").
+# Start with: python aios.py chat --agent researcher --policy policy.example.toml
 [agents.researcher]
-permissions = ["now", "web__fetch"]
+permissions = ["now", "fetch_url"]
 
-[agents.researcher.scopes."web__fetch"]
+[agents.researcher.scopes.fetch_url]
 max_calls = 10
 # No [y/N] prompt for these URLs (clean runs only, like auto_paths). Write host/* rather than
 # host*: '*' matches anything, so "https://docs.python.org*" would also match docs.python.org.evil.com
 auto_args = { url = ["https://docs.python.org/*"] }
 
-[agents.researcher.scopes."web__fetch".args.url]
+# fetch_url refuses local and private addresses and does not follow redirects by itself; these
+# rules matter most for MCP fetch tools, which may do neither
+[agents.researcher.scopes.fetch_url.args.url]
 allow = ["https://*"]                                       # case-sensitive; an allowed argument must be given
 deny = ["*localhost*", "*127.0.0.1*", "*169.254.169.254*"]  # ignores case
 max_len = 2000
