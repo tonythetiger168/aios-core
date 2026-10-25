@@ -62,6 +62,7 @@ python aios.py chat --skill examples/skills/meeting-notes        # load a skill 
 python aios.py chat --embed-model nomic-embed-text               # also search notes by meaning (needs `ollama pull nomic-embed-text`)
 python aios.py chat --auto-approve          # skip the [y/N] prompts for clean runs (unsafe)
 python aios.py demo                         # scripted demo (risky tools are refused)
+python aios.py doctor                       # what this machine gives AIOS: sandbox isolation, extras, audit log health
 ```
 
 State is stored in `./aios.db` and `./workspace/` (both git-ignored).

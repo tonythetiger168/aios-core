@@ -3306,6 +3306,87 @@ def status_cmd(home: str, now=None) -> int:
         store.db.close()
 
 
+def doctor_cmd(home: str) -> int:
+    """What this machine gives AIOS: the isolation each sandbox gets here, which one `auto` picks,
+    optional packages, model keys (set or not, never their values) and the state of aios.db.
+    Exit 1 only for a real problem (a broken audit chain); missing extras are notes."""
+    import contextlib
+    import io
+    import platform
+    import aios_watchdog as wd
+    problems = 0
+
+    def row(mark: str, name: str, detail: str):  # ok = good, -- = missing or weaker, !! = problem
+        print(f"  {mark:<2} {name:<18} {detail}")
+
+    print(f"AIOS on {platform.system()} {platform.release()}, Python {platform.python_version()}")
+    print("sandboxes (run_python):")
+    quiet = io.StringIO()
+    with contextlib.redirect_stderr(quiet):
+        box = None if IS_WINDOWS else Sandbox()
+    if IS_WINDOWS:
+        row("--", "process", "timeout only: off unless AIOS_ALLOW_WEAK_SANDBOX=1")
+    else:
+        row("ok", "process", "a local subprocess with these limits:")
+        files = {"landlock": f"Landlock ABI {landlock_abi()}: no access to your home and other files",
+                 "seatbelt": "sandbox-exec: no reads under /Users or temp folders, writes only its own folder"
+                 }.get(box.fs_isolated)
+        row("ok" if files else "--", "  files", files or "not confined: code can read every file you can "
+            "(Landlock needs Linux 5.13+)")
+        net = {True: "own network namespace: no network", "all": "no network",
+               "tcp": "no TCP (Landlock); UDP still works"}.get(box.net_isolated)
+        row("ok" if net else "--", "  network", net or "not isolated")
+        row("ok" if "RLIMIT_AS" in box.limits else "--", "  memory",
+            f"{box.mem // 2**20} MB limit" if "RLIMIT_AS" in box.limits else "this OS refuses a memory limit")
+        if sys.platform.startswith("linux"):
+            root = hasattr(os, "geteuid") and os.geteuid() == 0
+            row("--" if root else "ok", "  processes", "not capped: AIOS runs as root" if root
+                else f"at most {box.max_procs} beyond what you already run")
+    why = DockerSandbox.unavailable(docker_image())
+    row("--" if why else "ok", "docker", why or f"image {docker_image()}, limits enforced by the daemon")
+    why = MicroVMSandbox.unavailable()
+    row("--" if why else "ok", "microvm", why or "Firecracker with KVM" +
+        (" (jailer)" if MicroVMSandbox.jailer_wanted() else ""))
+    with contextlib.redirect_stderr(quiet):
+        try:
+            picked = make_sandbox()
+        except (RuntimeError, ValueError) as e:
+            picked, why = None, str(e)
+        else:
+            why = ""
+    choice = SANDBOX_CHOICE or os.environ.get("AIOS_SANDBOX") or "auto"
+    row("!!" if why else "ok" if picked else "--", f"{choice} picks",
+        why or (picked.name if picked else "nothing: run_python is off"))
+    problems += bool(why)
+
+    print("extras:")
+    try:
+        import importlib.metadata as md
+        row("ok", "mcp SDK", md.version("mcp"))
+    except Exception:
+        row("--", "mcp SDK", "not installed: pip install mcp (for --mcp and serve)")
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        row("ok" if os.environ.get(var) else "--", var, "set" if os.environ.get(var) else "not set")
+
+    db = Path(home).resolve() / "aios.db"
+    print(f"data ({db}):")
+    if not db.exists():
+        row("--", "aios.db", "not created yet")
+        return 1 if problems else 0
+    store = Store(str(db))
+    try:
+        v = store.verify_audit()
+        row("ok" if v["ok"] else "!!", "audit log", f"hash chain intact ({v['checked']} entries)" if v["ok"]
+            else f"BROKEN: {v['problem']} (see aios audit --verify)")
+        problems += not v["ok"]
+        hb = wd.liveness(store.db)
+        row("ok" if hb["state"] == "alive" else "--", "daemon",
+            f"{hb['state']}" + (f", last seen {hb['ts']}" if hb["ts"] else ""))
+    finally:
+        store.db.close()
+    return 1 if problems else 0
+
+
 def alerts_cmd(home: str, show_all: bool = False, ack: str | None = None, run_check: bool = False,
                n: int = 50) -> int:
     import aios_watchdog as wd
@@ -3480,6 +3561,8 @@ def cli():
                         usage="aios service {systemd,launchd,windows} [--home HOME] [-- DAEMON FLAGS...]")
     sx.add_argument("kind", choices=["systemd", "launchd", "windows"])
     sx.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
+    dr = sub.add_parser("doctor", help="what this machine gives AIOS: sandbox isolation, extras, aios.db health")
+    dr.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     st = sub.add_parser("status", help="is the daemon alive; open alerts; approvals waiting (exit 1 = look)")
     st.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     al = sub.add_parser("alerts", help="watchdog alerts raised from the audit log and job runs")
@@ -3552,6 +3635,8 @@ def cli():
                                                a.timeout)))
     if a.cmd == "audit":
         raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head))
+    if a.cmd == "doctor":
+        raise SystemExit(doctor_cmd(a.home))
     if a.cmd == "status":
         raise SystemExit(status_cmd(a.home))
     if a.cmd == "alerts":

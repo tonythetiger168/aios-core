@@ -62,6 +62,7 @@ python aios.py chat --skill examples/skills/meeting-notes        # 載入你已�
 python aios.py chat --embed-model nomic-embed-text               # 同時依語意搜尋記憶（需先 `ollama pull nomic-embed-text`）
 python aios.py chat --auto-approve          # 乾淨的執行略過 [y/N] 詢問（不安全）
 python aios.py demo                         # 腳本化示範（高風險工具會被拒絕）
+python aios.py doctor                       # 這台機器能給 AIOS 什麼：沙箱隔離程度、選用套件、審計日誌是否完好
 ```
 
 狀態存放在 `./aios.db` 與 `./workspace/`（兩者都已列入 .gitignore）。
