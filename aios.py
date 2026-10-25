@@ -1007,9 +1007,74 @@ def _user_tasks() -> int | None:
     return n or None
 
 
+# First code in a process-sandbox child (Linux): confines it with Landlock, which survives exec,
+# then execs the real run. Files: read-only for argv[1]["ro"], full access for argv[1]["rw"], nothing
+# else. Also no TCP bind/connect (Landlock ABI 4+) and no signals or abstract unix sockets to
+# processes outside (ABI 6+). Without Landlock in the kernel it runs the code unconfined; the
+# parent knows that from landlock_abi() and says so. A failure to apply it is fatal, not ignored.
+LANDLOCK_BOOT = """\
+import ctypes, json, os, sys
+cfg = json.loads(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+def fail(what):
+    sys.exit(f"aios sandbox: {what} failed: {os.strerror(ctypes.get_errno())}")
+abi = libc.syscall(444, None, ctypes.c_size_t(0), ctypes.c_uint32(1))
+if abi >= 1:
+    fs = (1 << 13) - 1 | (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0)
+    attr = (ctypes.c_uint64 * 3)(fs, 3 if abi >= 4 else 0, 3 if abi >= 6 else 0)
+    rs = libc.syscall(444, attr, ctypes.c_size_t(8 if abi < 4 else 16 if abi < 6 else 24), ctypes.c_uint32(0))
+    if rs < 0:
+        fail("landlock_create_ruleset")
+    class Beneath(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = [("allowed", ctypes.c_uint64), ("fd", ctypes.c_int32)]
+    on_files = 1 | 2 | 4 | (1 << 14 if abi >= 3 else 0)  # execute, write, read, truncate
+    for path, allowed in [(p, 1 | 4 | 8) for p in cfg["ro"]] + [(p, fs) for p in cfg["rw"]]:
+        try:
+            fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        except OSError:
+            continue
+        rule = Beneath(allowed if os.path.isdir(path) else allowed & on_files, fd)
+        if libc.syscall(445, ctypes.c_int(rs), ctypes.c_int(1), ctypes.byref(rule), ctypes.c_uint32(0)) < 0:
+            fail("landlock_add_rule " + path)
+        os.close(fd)
+    if libc.prctl(38, 1, 0, 0, 0):  # PR_SET_NO_NEW_PRIVS, required to restrict ourselves
+        fail("prctl")
+    if libc.syscall(446, ctypes.c_int(rs), ctypes.c_uint32(0)) < 0:
+        fail("landlock_restrict_self")
+    os.close(rs)
+os.execv(sys.executable, [sys.executable, "-I"] + sys.argv[2:])
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def landlock_abi() -> int:
+    """The kernel's Landlock ABI version, 0 when it has none (or this is not Linux)."""
+    if not sys.platform.startswith("linux"):
+        return 0
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    return max(0, libc.syscall(444, None, ctypes.c_size_t(0), ctypes.c_uint32(1)))
+
+
+# what a confined child may read besides the workspace: Python itself and the system libraries
+LANDLOCK_SYSTEM = ("/usr", "/lib", "/lib64", "/lib32", "/bin", "/etc/ld.so.cache", "/etc/ld.so.conf",
+                   "/etc/ld.so.conf.d", "/etc/localtime", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf")
+
+
+def _landlock_config(cwd: str) -> str:
+    ro = list(LANDLOCK_SYSTEM) + [str(WORKSPACE)]
+    ro += {sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
+           os.path.dirname(os.path.realpath(sys.executable))}
+    return json.dumps({"ro": ro, "rw": [cwd, "/dev/null", "/dev/zero", "/dev/urandom"]})
+
+
 class Sandbox:
     """run_python as a local child process: rlimits + no network on Linux, timeout only on Windows.
-    The code can still read whatever files the user can read."""
+    With Landlock (Linux 5.13+) it reads only Python, system libraries and the workspace, and writes
+    only its own throwaway folder; without it, whatever files the user can read."""
     name = "process"
 
     def __init__(self, timeout=10, cpu_s=5, mem_mb=256, max_out=10_000, max_procs=64):
@@ -1019,11 +1084,18 @@ class Sandbox:
         self.net_isolated = (not IS_WINDOWS and bool(shutil.which("unshare"))
                              and subprocess.run(["unshare", "-rn", "true"],
                                                 capture_output=True).returncode == 0)
+        self.fs_isolated = landlock_abi() >= 1
+        if not self.net_isolated and landlock_abi() >= 4:
+            self.net_isolated = "tcp"  # Landlock blocks TCP bind/connect; UDP still works
         if IS_WINDOWS:
             print("[sandbox] WARNING: Windows = timeout only (no memory/network limits). "
                   "Use WSL2 or Docker for real isolation.", file=sys.stderr)
-        elif not self.net_isolated:
-            print("[sandbox] WARNING: network isolation unavailable on this host", file=sys.stderr)
+        else:
+            if not self.net_isolated:
+                print("[sandbox] WARNING: network isolation unavailable on this host", file=sys.stderr)
+            if not self.fs_isolated:
+                print("[sandbox] WARNING: no Landlock (Linux 5.13+): code can read every file you can",
+                      file=sys.stderr)
 
     def _limits(self):
         cpu, mem = self.cpu_s, self.mem
@@ -1054,13 +1126,15 @@ class Sandbox:
         with tempfile.TemporaryDirectory(dir=WORKSPACE) as d:  # throwaway cwd
             Path(d, "main.py").write_text(code, encoding="utf-8")
             cmd = [sys.executable, "-I", "main.py"]  # -I: ignore env vars and user site
-            if self.net_isolated:
+            if self.fs_isolated:
+                cmd = [sys.executable, "-I", "-c", LANDLOCK_BOOT, _landlock_config(d), "main.py"]
+            if self.net_isolated is True:
                 cmd = ["unshare", "-rn"] + cmd
             if IS_WINDOWS:
                 env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}  # Python needs this
                 extra = {}
             else:
-                env = {"PATH": "/usr/bin:/bin"}
+                env = {"PATH": "/usr/bin:/bin", "TMPDIR": d}  # tempfile goes to the folder it may write
                 extra = {"preexec_fn": self._limits(), "start_new_session": True}
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=d, env=env,
@@ -1633,8 +1707,11 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
             isolation = ("Fresh Firecracker microVM per call (own kernel, KVM); no network device, "
                          "no host files, read-only root, runs as nobody. ")
         else:
-            network = "network namespace enabled" if box.net_isolated else "network NOT isolated"
-            isolation = f"Local process; can read files accessible to this user; {network}. "
+            network = {True: "network namespace enabled", "tcp": "no TCP connections"}.get(
+                box.net_isolated, "network NOT isolated")
+            files = ("reads only Python, system libraries and the workspace, writes only its own folder"
+                     if box.fs_isolated else "can read files accessible to this user")
+            isolation = f"Local process; {files}; {network}. "
         @k.tools.register("run_python", "Run Python code. " + isolation +
                           f"{box.timeout}s timeout. Print results to stdout.",
                           {"code": {"type": "string"}}, required=["code"])
