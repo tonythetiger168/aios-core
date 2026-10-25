@@ -201,8 +201,11 @@ jobs:
             sha256sum "$AIOS_MICROVM_DIR"/firecracker "$AIOS_MICROVM_DIR"/vmlinux "$AIOS_MICROVM_DIR"/rootfs.ext4
             docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
             python -m unittest tests.test_microvm -v 2>&1
+            echo "--- booting every call (AIOS_MICROVM_SNAPSHOT=0)"
+            AIOS_MICROVM_SNAPSHOT=0 python -m unittest tests.test_microvm -v 2>&1
             echo "--- jailed (as root, AIOS_MICROVM_JAILER=1)"
             sudo -E env "PATH=$PATH" AIOS_MICROVM_JAILER=1 python -m unittest tests.test_microvm -v 2>&1
+            ls -la "$AIOS_MICROVM_DIR/snapshots"/*
           } 2>&1 | tee microvm-evidence.txt
       - uses: actions/upload-artifact@v4
         if: always()
