@@ -94,6 +94,15 @@ python aios.py service windows --home C:\aios-data -- ...                       
 - 每個任務是獨立的代理（`job-<name>`：獨立的歷史與記憶），每次執行都從乾淨的歷史開始。執行一律有上限（預設 5 萬 token、8 步、300 秒），每個任務每天最多執行 200 次（`--max-runs-per-day`），所以打錯成 `every 1m` 也不會悄悄燒光預算。如果要給所有任務一個硬上限，`--daily-max-tokens N` 和 `--daily-max-cost USD`（需要 `--price-in/--price-out`）會限制所有任務在任意 24 小時內合計的用量。碰到上限前的最後一次執行只拿得到剩下的額度，之後的執行會被跳過，直到時間窗往後移。因逾時被中止的執行，已用掉的量照樣計入。
 - 守護程式停止期間錯過的任務，恢復後只會執行**一次**，不會每個錯過的時段各補一次。任務一次執行一個。結果用 `aios jobs history` 查看，每次工具呼叫都在 `aios audit` 裡。
 
+**在定時任務裡用 MCP 伺服器。** 守護程式也接受和 `chat` 一樣的 `--mcp` 與 `--confine-mcp`：
+
+```bash
+python aios.py daemon --mcp "demo=python demo_mcp_server.py" --confine-mcp demo --policy policy.toml ...
+```
+
+- 只有 policy 授權時（`permissions = ["demo__*"]`），任務的 agent 才拿得到該伺服器的工具；而且每個 MCP 工具執行前仍需 scope 或有人核准（`--approvals console`）。
+- 守護程式執行時沒人看著，所以啟動時會對每個沒關進沙箱的伺服器發出警告。伺服器啟動失敗時，守護程式會說明原因並在執行任何任務前結束。
+
 **在瀏覽器審批。** 守護程式（或 `serve`）可以改為詢問你，而不是直接拒絕：
 
 ```bash

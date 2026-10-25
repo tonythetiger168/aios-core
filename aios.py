@@ -2258,6 +2258,35 @@ def load_policy(path: str) -> dict:
     return out
 
 
+def add_mcp_flags(p):
+    p.add_argument("--mcp", action="append", default=[], metavar="NAME=CMD ARGS",
+                   help='attach an MCP server, e.g. --mcp "demo=python demo_mcp_server.py"')
+    p.add_argument("--confine-mcp", action="append", default=[], metavar="NAME",
+                   help="run that --mcp server without access to your files (network stays; Landlock on "
+                        "Linux 5.13+, sandbox-exec on macOS)")
+
+
+def check_mcp_flags(a, ap):
+    names = [s.partition("=")[0] for s in a.mcp]
+    if any(not n or "=" not in s for n, s in zip(names, a.mcp)):
+        ap.error('--mcp takes NAME=COMMAND ARGS, e.g. --mcp "demo=python demo_mcp_server.py"')
+    unknown = set(a.confine_mcp) - set(names)
+    if unknown:
+        ap.error(f"--confine-mcp names no --mcp server: {', '.join(sorted(unknown))}")
+
+
+async def attach_mcp(k: Kernel, specs, confine=frozenset()) -> list[str]:
+    """Connect each "name=command arg1 arg2" server; returns the server names."""
+    names = []
+    for spec in specs:
+        name, _, cmdline = spec.partition("=")
+        cmd, *args = shlex.split(cmdline)
+        print(f"MCP {name}{' (confined)' if name in confine else ''}:",
+              await k.connect_mcp(name, cmd, args, confine=name in confine), file=sys.stderr)
+        names.append(name)
+    return names
+
+
 async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False,
                provider=None, budget: Budget | None = None, policy: dict | None = None,
                skills: list[str] | None = None, embedder=None, a2a_specs: list[str] | None = None,
@@ -2297,11 +2326,7 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
     pol = (policy or {}).get(agent_name)
     explicit = bool(pol and pol["permissions"] is not None)
     perms = set(pol["permissions"]) if explicit else set(DEFAULT_TOOLS)
-    for spec in mcp_specs:  # "name=command arg1 arg2"
-        name, _, cmdline = spec.partition("=")
-        cmd, *args = shlex.split(cmdline)
-        print(f"MCP {name}{' (confined)' if name in confine_mcp else ''}:",
-              await k.connect_mcp(name, cmd, args, confine=name in confine_mcp))
+    for name in await attach_mcp(k, mcp_specs, confine_mcp):
         if explicit:
             print(f"[aios] policy lists explicit permissions: add '{name}__*' there to let the agent use these tools")
         else:
@@ -2717,7 +2742,8 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                  tick_seconds: float = 10, once: bool = False, max_runs_per_day: int = 200,
                  timeout: float = 300, webhook_port: int | None = None,
                  approve_timeout: float | None = None, a2a_specs: list[str] | None = None,
-                 daily_tokens: int | None = None, daily_cost: float | None = None):
+                 daily_tokens: int | None = None, daily_cost: float | None = None,
+                 mcp_specs: list[str] | None = None, confine_mcp=frozenset()):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -2734,6 +2760,17 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
             await install_a2a_tools(k, a2a_specs)
         except (ValueError, RuntimeError) as e:
             print(f"[aios] --a2a: {e}", file=sys.stderr)
+            await k.close()
+            k.store.db.close()
+            return 1
+    if mcp_specs:  # granted through the policy ('<name>__*'); MCP tools always need a scope or a person
+        try:
+            for name in await attach_mcp(k, mcp_specs, confine_mcp):
+                if name not in confine_mcp:
+                    print(f"[aios] WARNING: MCP server '{name}' runs with all your rights while nobody "
+                          f"watches; --confine-mcp {name} keeps it away from your files", file=sys.stderr)
+        except Exception as e:  # a server that does not start: say so instead of running jobs without it
+            print(f"[aios] --mcp: {type(e).__name__}: {e}", file=sys.stderr)
             await k.close()
             k.store.db.close()
             return 1
@@ -3299,11 +3336,7 @@ def cli():
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("chat", help="interactive agent session")
     c.add_argument("--agent", default="main", help="agent name (own memory per name)")
-    c.add_argument("--mcp", action="append", default=[], metavar="NAME=CMD ARGS",
-                   help='attach an MCP server, e.g. --mcp "demo=python demo_mcp_server.py"')
-    c.add_argument("--confine-mcp", action="append", default=[], metavar="NAME",
-                   help="run that --mcp server without access to your files (network stays; Landlock on "
-                        "Linux 5.13+, sandbox-exec on macOS)")
+    add_mcp_flags(c)
     c.add_argument("--auto-approve", action="store_true",
                    help="run risky tools (write_file, run_python, MCP) without asking. Unsafe.")
     add_model_flags(c)
@@ -3365,6 +3398,7 @@ def cli():
                     help="tokens all jobs together may use in any 24 hours; later runs are skipped (default: no limit)")
     dm.add_argument("--daily-max-cost", type=float, metavar="USD",
                     help="the same in dollars (needs --price-in/--price-out)")
+    add_mcp_flags(dm)
     dm.add_argument("--webhook-port", type=int, metavar="PORT",
                     help="accept POST /hook/<job> on 127.0.0.1:PORT for `on webhook` jobs (off by default)")
     jb = sub.add_parser("jobs", help="manage scheduled jobs")
@@ -3494,8 +3528,10 @@ def cli():
             ap.error("--daily-max-tokens / --daily-max-cost must be positive")
         if a.daily_max_cost is not None and not (a.price_in or a.price_out):
             ap.error("--daily-max-cost needs --price-in / --price-out")
+        check_mcp_flags(a, ap)
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
-                                  a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost))
+                                  a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
+                                  a.mcp, set(a.confine_mcp)))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         policy = None
@@ -3534,9 +3570,7 @@ def cli():
     if a.embed_model:
         import aios_memory
         embedder = aios_memory.Embedder(a.embed_model, a.embed_url, os.environ.get("OPENAI_API_KEY"))
-    unknown = set(a.confine_mcp) - {s.partition("=")[0] for s in a.mcp}
-    if unknown:
-        raise SystemExit(f"--confine-mcp names no --mcp server: {', '.join(sorted(unknown))}")
+    check_mcp_flags(a, ap)
     asyncio.run(chat(a.agent, a.mcp, a.auto_approve, provider, budget, policy, a.skill, embedder, a.a2a,
                      set(a.confine_mcp)))
 

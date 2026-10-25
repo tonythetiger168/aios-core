@@ -94,6 +94,15 @@ Flags after `--` go to `aios daemon` unchanged (`--once` is refused: a service k
 - Each job is its own agent (`job-<name>`: own history and memory) and starts every run with a clean history. Runs always have a cap (default 50,000 tokens, 8 steps, 300 s), and a job runs at most 200 times a day (`--max-runs-per-day`), so a typo like `every 1m` cannot burn your budget unnoticed. For a hard ceiling across all jobs, `--daily-max-tokens N` and `--daily-max-cost USD` (needs `--price-in/--price-out`) limit what jobs together spend in any 24 hours. The last run before the limit gets only what is left, and later runs are skipped until the window moves on. A run cut off by its timeout still counts what it spent.
 - A job missed while the daemon was off runs **once** when it comes back, not once per missed slot. Jobs run one at a time. Results: `aios jobs history`; every tool call is in `aios audit`.
 
+**MCP servers in jobs.** The daemon takes the same `--mcp` and `--confine-mcp` flags as `chat`:
+
+```bash
+python aios.py daemon --mcp "demo=python demo_mcp_server.py" --confine-mcp demo --policy policy.toml ...
+```
+
+- A job's agent gets a server's tools only when the policy grants them (`permissions = ["demo__*"]`), and every MCP tool still needs a scope or a person (`--approvals console`) before it runs.
+- Nobody watches a daemon, so it warns at start for every server that is not confined. If a server does not start, the daemon says why and exits before running any job.
+
 **Approve from the browser.** Instead of refusing, the daemon (or `serve`) can ask you:
 
 ```bash
