@@ -1380,8 +1380,9 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         n = int(out.split("forked")[1])
         self.assertLess(n, 25, out)  # a few slack for processes the user started meanwhile
 
-    @unittest.skipUnless(aios.landlock_abi() >= 1, "needs Landlock (Linux 5.13+)")
-    async def test_landlock_confines_files_to_python_and_the_workspace(self):
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(),
+                         "needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
+    async def test_files_are_confined_to_python_and_the_workspace(self):
         with tempfile.TemporaryDirectory() as outside:  # not under the workspace
             secret = Path(outside, "secret.txt")
             secret.write_text("key", encoding="utf-8")
@@ -1405,8 +1406,9 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, ["exit=0", "PermissionError", "PermissionError", "ws", "PermissionError",
                                "2", "True", "0"])
 
-    @unittest.skipUnless(aios.landlock_abi() >= 4 or (aios.landlock_abi() >= 1 and aios.Sandbox().net_isolated),
-                         "needs a network namespace or Landlock ABI 4")
+    @unittest.skipUnless(aios.landlock_abi() >= 4 or aios.seatbelt_ok() or
+                         (aios.landlock_abi() >= 1 and aios.Sandbox().net_isolated),
+                         "needs a network namespace, Landlock ABI 4 or sandbox-exec")
     async def test_no_tcp_connection_to_the_host(self):
         import socket
         srv = socket.socket()
@@ -1420,6 +1422,15 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         finally:
             srv.close()
         self.assertIn("refused", out)
+
+    def test_seatbelt_profile_denies_network_and_writes_outside_its_folder(self):
+        prof = aios._seatbelt_profile("/w/run1")
+        self.assertIn("(deny network*)", prof)
+        self.assertIn(f'(allow file-write* (subpath {aios._sbpl("/w/run1")})', prof)
+        self.assertIn('(deny file-read* (subpath "/Users")', prof)
+        # the allows come after the denies: in Seatbelt the last matching rule wins
+        self.assertLess(prof.index("(deny file-read*"), prof.index("(allow file-read*"))
+        self.assertIn(json.dumps(os.path.realpath(str(aios.WORKSPACE))), prof)
 
     def test_landlock_failure_is_fatal_not_ignored(self):
         if not aios.landlock_abi():
@@ -1657,8 +1668,10 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                  "network NOT isolated"),
                 (types.SimpleNamespace(name="process", net_isolated=True, fs_isolated=False, timeout=10),
                  "network namespace enabled"),
-                (types.SimpleNamespace(name="process", net_isolated="tcp", fs_isolated=True, timeout=10),
-                 "no TCP connections")):
+                (types.SimpleNamespace(name="process", net_isolated="tcp", fs_isolated="landlock", timeout=10),
+                 "no TCP connections"),
+                (types.SimpleNamespace(name="process", net_isolated="all", fs_isolated="seatbelt", timeout=10),
+                 "no network")):
             with self.subTest(backend=box.name, want=want), \
                     mock.patch.object(aios, "make_sandbox", return_value=box):
                 k = make_kernel()
@@ -1668,7 +1681,8 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                                 if t['name'] == 'run_python')
                     self.assertIn(want, desc)
                     if box.name == 'process':
-                        self.assertIn('reads only Python' if box.fs_isolated else 'can read files', desc)
+                        self.assertIn({"landlock": "reads only Python", "seatbelt": "cannot read home"}.get(
+                            box.fs_isolated, "can read files"), desc)
                 finally:
                     k.store.db.close()
 
