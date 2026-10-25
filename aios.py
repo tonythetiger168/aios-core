@@ -2525,7 +2525,7 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
                provider=None, budget: Budget | None = None, policy: dict | None = None,
                skills: list[str] | None = None, embedder=None, a2a_specs: list[str] | None = None,
                confine_mcp: set[str] = frozenset(), offline_mcp: set[str] = frozenset(),
-               egress_mcp: dict | None = None):
+               egress_mcp: dict | None = None, daily_tokens: int | None = None, daily_cost: float | None = None):
     WORKSPACE.mkdir(exist_ok=True)
     if auto_approve:
         print("[aios] WARNING: --auto-approve: risky tools run without asking.")
@@ -2633,8 +2633,14 @@ async def chat(agent_name: str, mcp_specs: list[str], auto_approve: bool = False
                 agent.history, agent.loaded = [], True
                 print("history cleared (long-term facts kept; the run is no longer tainted)")
             else:
+                # this agent's runs in any 24 hours, earlier sessions included (they are in aios.db)
+                day_ago = (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")
+                b, why = daily_budget(k.store, k.budget, daily_tokens, daily_cost, day_ago, like_exact(agent.name))
+                if b is None:
+                    print(f"[aios] {why}: not calling the model; try again later")
+                    continue
                 try:
-                    print(await k._run(agent, line))
+                    print(await k._run(agent, line, b))
                 except Exception as e:
                     print(f"error: {type(e).__name__}: {e}")
     finally:
@@ -3686,6 +3692,7 @@ def cli():
     c = sub.add_parser("chat", help="interactive agent session")
     c.add_argument("--agent", default="main", help="agent name (own memory per name)")
     add_mcp_flags(c)
+    add_daily_flags(c, "this agent's chats together", "later messages are refused")
     c.add_argument("--auto-approve", action="store_true",
                    help="run risky tools (write_file, run_python, MCP) without asking. Unsafe.")
     add_model_flags(c)
@@ -3928,8 +3935,9 @@ def cli():
         import aios_memory
         embedder = aios_memory.Embedder(a.embed_model, a.embed_url, os.environ.get("OPENAI_API_KEY"))
     check_mcp_flags(a, ap)
+    check_daily_flags(a, ap)
     asyncio.run(chat(a.agent, a.mcp, a.auto_approve, provider, budget, policy, a.skill, embedder, a.a2a,
-                     set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress))
+                     set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress, a.daily_max_tokens, a.daily_max_cost))
 
 
 if __name__ == "__main__":

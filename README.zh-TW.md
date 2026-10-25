@@ -61,6 +61,7 @@ python aios.py chat --agent work            # 每個名稱有獨立的歷史與�
 python aios.py chat --mcp "demo=python demo_mcp_server.py"   # 接上 MCP 伺服器
 python aios.py chat --provider openai --model llama3.1   # 用 Ollama 的本機模型
 python aios.py chat --max-tokens 20000 --max-steps 6     # 每次執行的硬性上限
+python aios.py chat --daily-max-tokens 500000            # 以及這個 agent 所有聊天在任何 24 小時內的合計上限
 python aios.py chat --policy policy.example.toml --agent notes   # 每個代理的權限與路徑範圍
 python aios.py chat --policy policy.example.toml --agent lead    # 把寫作交給 'notes' 的代理
 python aios.py chat --sandbox docker          # run_python 改在用完即丟的容器裡執行（需先 `docker pull python:3.12-slim`）
@@ -333,7 +334,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
 - **Windows**：AppContainer 的邊界和 Linux 不同：凡是 Windows 允許所有 App 讀取的東西（Windows、Program Files，以及其他授權給「ALL APPLICATION PACKAGES」的位置）它都讀得到；job 的記憶體上限是以單一行程計。CI 會在 GitHub 的 Windows 機器上實測。無法建立 AppContainer 的機器上，`run_python` 仍保持停用，除非你用 `--sandbox docker` 或設定 `AIOS_ALLOW_WEAK_SANDBOX=1`（只有逾時限制）。
 - 請把 MCP 伺服器同時當作不可信的程式碼與不可信的資料來源，並逐 agent 明確授權；不需要你檔案的伺服器請加上 `--confine-mcp`。受限的伺服器仍有網路，所以仍可把工具呼叫收到的內容送出去；不需要網路的伺服器可改用 `--offline-mcp` 堵住這點（要有網路 namespace 或 `sandbox-exec` 才完全堵住：只有 Landlock 時，UDP（例如 DNS 查詢）仍送得出去），`--mcp-egress` 則把它縮小到你列出的主機（只限 HTTPS）；需要你的檔案（或像 `npx` 那樣在家目錄放快取）的伺服器在受限模式下無法運作。
-- 每次呼叫模型之前，AIOS 會把回覆長度限制在預算剩下的量（並假設下一次的提示至少和上一次一樣長）；剩下不到 64 個 token 時就直接停下、不再呼叫，回覆會註明原因。執行仍可能超出的部分，只有提示比上一次多出來的量（工具結果），而第一次呼叫的提示長度事先無法得知。費用上限需要你自己提供單價（價格會變，因此不內建預設值）。預算是每次執行的上限；定時任務另外可以用守護程式的 `--daily-max-tokens`／`--daily-max-cost` 設定所有任務合計的 24 小時上限，`a2a-serve` 也可用同樣的參數限制所有請求合計的用量。聊天沒有每日上限（`serve` 不呼叫模型）。
+- 每次呼叫模型之前，AIOS 會把回覆長度限制在預算剩下的量（並假設下一次的提示至少和上一次一樣長）；剩下不到 64 個 token 時就直接停下、不再呼叫，回覆會註明原因。執行仍可能超出的部分，只有提示比上一次多出來的量（工具結果），而第一次呼叫的提示長度事先無法得知。費用上限需要你自己提供單價（價格會變，因此不內建預設值）。預算是每次執行的上限；定時任務另外可以用守護程式的 `--daily-max-tokens`／`--daily-max-cost` 設定所有任務合計的 24 小時上限，`a2a-serve` 也可用同樣的參數限制所有請求合計的用量，`chat` 則限制該 agent 所有聊天合計的用量（包括先前的工作階段）。`serve` 不呼叫模型。
 - 本機模型在工具使用與抵禦提示詞注入上，都比前沿模型弱很多，請保持人工審批開啟。
 
 ### 注入測試結果

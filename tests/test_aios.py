@@ -1276,6 +1276,48 @@ class MemoryProvenanceTests(HardeningBase):
         self.assertIn("(no facts yet)", text_out)
 
 
+class ChatDailyLimitTests(unittest.TestCase):
+    def chat(self, d, *lines, **kw):
+        import builtins
+        import contextlib
+        import io
+        it, out, old_cwd = iter([*lines, "/quit"]), io.StringIO(), os.getcwd()
+        provider = FakeProvider(*[Resp([text("hi")], "end_turn", 200, 50) for _ in lines])
+        os.chdir(d)
+        try:
+            with mock.patch.object(builtins, "input", lambda prompt="": next(it)), contextlib.redirect_stdout(out):
+                asyncio.run(aios.chat("t", [], provider=provider, budget=aios.Budget(), **kw))
+        finally:
+            os.chdir(old_cwd)
+        return out.getvalue(), provider
+
+    def test_the_daily_limit_covers_every_session_of_the_agent(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, p = self.chat(d, "one", "two", daily_tokens=300)
+            self.assertEqual(len(p.calls), 1)  # 250 used: too little left for another call
+            self.assertIn("daily token budget of 300 reached (250 used in 24h): not calling the model", out)
+            out, p = self.chat(d, "three", daily_tokens=300)  # a new session still counts the old one
+            self.assertEqual(p.calls, [])
+            self.assertIn("reached (250 used in 24h)", out)
+            out, p = self.chat(d, "four", daily_tokens=1000)
+            self.assertEqual(len(p.calls), 1)
+            self.assertEqual(p.calls[0]["max_tokens"], 750)  # what is left today caps the reply
+
+    def test_flags_are_checked(self):
+        import contextlib
+        import io
+        for argv, why in ((["--daily-max-tokens", "0"], "must be positive"),
+                          (["--daily-max-cost", "1"], "needs --price-in")):
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", ["aios", "chat", *argv]), contextlib.redirect_stderr(err), \
+                    mock.patch.object(aios, "chat") as c, mock.patch.object(aios, "build_model",
+                                                                           return_value=(None, None)), \
+                    self.assertRaises(SystemExit):
+                aios.cli()
+            c.assert_not_called()
+            self.assertIn(why, err.getvalue())
+
+
 @unittest.skipUnless(sys.version_info >= (3, 11), "tomllib needs Python 3.11+")
 class PolicyFileTests(unittest.TestCase):
     def write(self, body):
