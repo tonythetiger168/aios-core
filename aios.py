@@ -260,6 +260,8 @@ class Store:
             self.db.execute("ALTER TABLE facts ADD COLUMN ts TEXT")
         if "signer" not in {r[1] for r in self.db.execute("PRAGMA table_info(skills)")}:
             self.db.execute("ALTER TABLE skills ADD COLUMN signer TEXT DEFAULT ''")  # verified publisher
+        if "hash" not in {r[1] for r in self.db.execute("PRAGMA table_info(audit)")}:
+            self.db.execute("ALTER TABLE audit ADD COLUMN hash TEXT")  # entries before this stay unchained
         if "watch" not in {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}:
             self.db.execute("ALTER TABLE jobs ADD COLUMN watch TEXT")  # change-triggered jobs' state
         self.db.commit()
@@ -466,15 +468,34 @@ class Store:
         self.db.commit()
         return n > 0
 
-    # Audit log is append-only: there is deliberately no update/delete method.
+    # Audit log is append-only: there is deliberately no update/delete method. Each entry also
+    # carries a hash chained to the one before it, so an edit, deletion or insertion in the middle is
+    # detectable (`aios audit --verify`). Anyone who can write aios.db can still rebuild the chain:
+    # keep a printed head somewhere else to catch that too.
     def log_audit(self, agent: str, tool: str, args: dict, result: str, status: str):
         """status: 'ok' | 'error' | 'denied'"""
+        import aios_watchdog as wd
         clip = lambda t: t if len(t) <= AUDIT_MAX else t[:AUDIT_MAX] + "...(truncated)"
-        self.db.execute(
-            "INSERT INTO audit(ts, agent, tool, args, result, status) VALUES(?,?,?,?,?,?)",
-            (datetime.now().isoformat(timespec="seconds"), agent, tool,
-             clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status))
+        row = (datetime.now().isoformat(timespec="seconds"), agent, tool,
+               clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status)
         self.db.commit()
+        # IMMEDIATE: other processes on this database (daemon, serve, console approvals) cannot
+        # append between reading the last hash and writing the next one.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            last = self.db.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+            prev = (last[0] if last else None) or ""
+            self.db.execute("INSERT INTO audit(ts, agent, tool, args, result, status, hash) VALUES(?,?,?,?,?,?,?)",
+                            (*row, wd.audit_hash(prev, *row)))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def verify_audit(self, head: str | None = None) -> dict:
+        """Recompute the hash chain (see aios_watchdog.verify_audit)."""
+        import aios_watchdog as wd
+        return wd.verify_audit(self.db, head)
 
     def audit_tail(self, agent: str | None = None, n: int = 20) -> list[dict]:
         q, params = "SELECT id, ts, agent, tool, args, result, status FROM audit", []
@@ -2815,18 +2836,32 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     return 0
 
 
-def audit_cmd(agent: str | None, n: int, home: str):
+def audit_cmd(agent: str | None, n: int, home: str, verify: bool = False, head: str | None = None) -> int:
     db = Path(home).resolve() / "aios.db"
     if not db.exists():
         print(f"no audit log: {db} does not exist")
-        return
+        return 1 if verify else 0
     store = Store(str(db))
+    if verify:
+        v = store.verify_audit(head)
+        store.db.close()
+        print(f"checked {v['checked']} chained entries"
+              + (f" ({v['unchained']} older entries predate chaining and are not covered)" if v["unchained"] else ""))
+        if not v["ok"]:
+            print(f"TAMPERED: {v['problem']}")
+            return 1
+        if head is not None:
+            print("the saved head is in the chain: nothing up to it was changed")
+        print(f"OK. head: {v['head'] or '(empty log)'}")
+        print("Save the head somewhere aios.db cannot reach; pass it with --head later to also catch a rebuilt chain.")
+        return 0
     rows = store.audit_tail(agent, n)
     for e in rows:
         print(f"{e['ts']}  {e['agent']:<10} {e['status']:<9} {e['tool']}  {e['args']}")
     if not rows:
         print("(audit log is empty)")
     store.db.close()
+    return 0
 
 
 def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None, days: int = 30,
@@ -3028,6 +3063,9 @@ def cli():
     au.add_argument("--agent", help="only this agent (default: all)")
     au.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
     au.add_argument("--home", default=".", help="folder holding aios.db")
+    au.add_argument("--verify", action="store_true",
+                    help="check the hash chain for edited, removed or inserted entries (exit 1 if tampered)")
+    au.add_argument("--head", help="with --verify: a head printed earlier, which must still be in the chain")
     c.add_argument("--embed-model", help="enable vector memory search with this embedding model "
                    "(OpenAI-compatible /embeddings, e.g. nomic-embed-text on Ollama)")
     c.add_argument("--embed-url", default="http://localhost:11434/v1",
@@ -3147,7 +3185,7 @@ def cli():
                                                a.reduce, a.reduce_task, approve_timeout(a, ap), a.a2a,
                                                a.timeout)))
     if a.cmd == "audit":
-        return audit_cmd(a.agent, a.n, a.home)
+        raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head))
     if a.cmd == "status":
         raise SystemExit(status_cmd(a.home))
     if a.cmd == "alerts":

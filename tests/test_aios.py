@@ -7,6 +7,7 @@ import contextlib
 import copy
 import io
 import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import aios  # noqa: E402
+import aios_watchdog  # noqa: E402
 
 
 # ---- scripted fake provider (no network, no API key) ----
@@ -130,7 +132,100 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([e["tool"] for e in s.audit_tail("a1")], ["now", "run_python"])
         self.assertEqual(s.audit_tail("a1", n=1)[0]["status"], "denied")
         public = [n for n in dir(aios.Store) if "audit" in n]
-        self.assertEqual(sorted(public), ["audit_tail", "log_audit"])  # no update/delete API
+        self.assertEqual(sorted(public), ["audit_tail", "log_audit", "verify_audit"])  # no update/delete API
+
+    def chained(self, n=4):
+        s = aios.Store(":memory:")
+        self.addCleanup(s.db.close)
+        for i in range(n):
+            s.log_audit("a", f"t{i}", {"i": i}, f"r{i}", "ok")
+        return s
+
+    def test_audit_hash_chain_verifies(self):
+        s = self.chained()
+        v = s.verify_audit()
+        self.assertEqual((v["ok"], v["checked"], v["unchained"]), (True, 4, 0))
+        self.assertEqual(v["head"], s.db.execute("SELECT hash FROM audit ORDER BY id DESC").fetchone()[0])
+        self.assertTrue(aios.Store(":memory:").verify_audit()["ok"])  # an empty log is fine
+
+    def test_audit_tampering_is_detected(self):
+        edits = {
+            "edited": "UPDATE audit SET result='nothing to see' WHERE id=2",
+            "removed": "DELETE FROM audit WHERE id=2",
+            "inserted": "INSERT INTO audit(id, ts, agent, tool, args, result, status, hash) "
+                        "SELECT 25, ts, agent, 'fake', args, result, status, hash FROM audit WHERE id=2",
+            "reordered": "UPDATE audit SET id=id+100 WHERE id=1",
+            "tail removed": "DELETE FROM audit WHERE id=4",
+            "hash cleared": "UPDATE audit SET hash=NULL WHERE id=3",
+        }
+        for what, sql in edits.items():
+            with self.subTest(what):
+                s = self.chained()
+                s.db.execute(sql)
+                v = s.verify_audit()
+                self.assertFalse(v["ok"], v)
+                self.assertTrue(v["problem"])
+
+    def test_a_rebuilt_chain_is_caught_by_a_saved_head(self):
+        s = self.chained()
+        head = s.verify_audit()["head"]
+        self.assertTrue(s.verify_audit(head)["head_found"])
+        s.log_audit("a", "later", {}, "", "ok")
+        self.assertTrue(s.verify_audit(head)["ok"])  # later entries do not matter
+        # an attacker who can write aios.db edits an entry and recomputes every hash after it
+        s.db.execute("UPDATE audit SET result='edited' WHERE id=2")
+        prev = ""
+        for rid, *row in s.db.execute("SELECT id, ts, agent, tool, args, result, status FROM audit ORDER BY id").fetchall():
+            prev = aios_watchdog.audit_hash(prev, *row)
+            s.db.execute("UPDATE audit SET hash=? WHERE id=?", (prev, rid))
+        self.assertTrue(s.verify_audit()["ok"])  # the chain alone cannot tell
+        v = s.verify_audit(head)
+        self.assertFalse(v["ok"])
+        self.assertIn("saved head", v["problem"])
+
+    def test_entries_from_before_chaining_are_reported_not_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "aios.db")
+            old = sqlite3.connect(db)  # an older AIOS: audit table without a hash column
+            old.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT, "
+                        "tool TEXT, args TEXT, result TEXT, status TEXT)")
+            old.execute("INSERT INTO audit(ts, agent, tool, args, result, status) VALUES('t','a','x','{}','','ok')")
+            old.commit()
+            old.close()
+            s = aios.Store(db)
+            s.log_audit("a", "new", {}, "", "ok")
+            v = s.verify_audit()
+            self.assertEqual((v["ok"], v["checked"], v["unchained"]), (True, 1, 1))
+            s.db.close()
+
+    def test_two_writers_on_one_database_keep_one_chain(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "aios.db")
+            a, b = aios.Store(db), aios.Store(db)
+            for i in range(20):
+                (a if i % 2 else b).log_audit("x", f"t{i}", {}, "", "ok")
+            v = a.verify_audit()
+            self.assertEqual((v["ok"], v["checked"]), (True, 20))
+            a.db.close()
+            b.db.close()
+
+    def test_audit_verify_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = aios.Store(str(Path(d) / "aios.db"))
+            s.log_audit("a", "t", {}, "r", "ok")
+            head = s.verify_audit()["head"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True), 0)
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True, head=head), 0)
+            self.assertIn(f"OK. head: {head}", out.getvalue())
+            s.db.execute("UPDATE audit SET result='x'")
+            s.db.commit()
+            s.db.close()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True), 1)
+            self.assertIn("TAMPERED", out.getvalue())
 
     def test_audit_truncates_large_payloads(self):
         s = aios.Store(":memory:")

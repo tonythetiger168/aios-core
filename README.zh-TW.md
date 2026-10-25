@@ -38,7 +38,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
-- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。
+- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
 - **CLI**：互動式對話，支援 `/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/reset`、`/quit`。
 
@@ -141,6 +141,7 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
+| `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘） |
 
 - 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。告警只負責回報，絕不停止、阻擋或更改任何東西。
 - 「down」代表超過 3 次 tick 加上一次任務逾時（至少 2 分鐘）沒有心跳，所以長時間的任務不會被誤判成守護程式掛掉。把 `aios status` 放進 cron 或監控檢查，守護程式掛掉時就會收到通知。
@@ -308,7 +309,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - 記憶檢索只涵蓋已儲存的記憶（不含對話歷史）。向量檢索會把每條記憶的文字送到你設定的嵌入伺服器：私人記憶請用本機的。CI 會用真正的 Ollama 伺服器搭配 `nomic-embed-text` 實測：查詢和筆記沒有共同字詞也找得到，無關的查詢則什麼都不回傳。因為真實模型會把任何兩段文字都評為有點相似，只有分數明顯高於「查詢與幾句無關句子」的分數時，才算語意相符。其他模型與 OpenAI 端點尚未測試。關鍵字檢索不需要任何設定。
 - 技能信任的是**你審查過的內容**，不是作者；選用的簽章只記錄是誰發布的。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
 - `serve` 無法透過 stdio 詢問（它是協議通道）。請用 `--approvals console`、用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
-- 審計日誌只負責記錄，並非防竄改：能寫入 `aios.db` 的人仍可修改它。
+- 審計日誌能發現竄改，但無法防止竄改。每筆紀錄的雜湊都涵蓋前一筆，所以 `aios audit --verify`（以及看門狗）查得出手動修改、刪除、插入的紀錄，也查得出最新幾筆被截掉。不過能寫入 `aios.db` 的人仍可把整條鏈重算一遍。要連這種情況也抓到，請把 `--verify` 印出的 head 存到 `aios.db` 碰不到的地方，之後用 `--verify --head <雜湊>` 比對。啟用雜湊鏈之前寫入的紀錄會被計數，但不在保護範圍內。
 - 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶，在 `--approve` 模式下也能回答審批請求。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
 - **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace，但程式碼仍可讀取該使用者讀得到的檔案，行程數量也沒有上限。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
