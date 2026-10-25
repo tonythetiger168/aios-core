@@ -587,6 +587,9 @@ class OpenAICompatTests(unittest.IsolatedAsyncioTestCase):
 
         await Fake("m").complete("S", [{"role": "user", "content": "x"}], [])
         self.assertNotIn("tools", sent[0])
+        self.assertNotIn("temperature", sent[0])  # the server's default unless asked
+        await Fake("m", temperature=0.2).complete("S", [{"role": "user", "content": "x"}], [])
+        self.assertEqual(sent[1]["temperature"], 0.2)
 
     def test_unreachable_server_gives_a_clear_error(self):
         import urllib.error

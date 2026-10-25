@@ -93,12 +93,16 @@ jobs:
           docker pull -q python:3.12-slim
           AIOS_TEST_DOCKER=1 python -m unittest tests.test_aios.RealDockerSandboxTests -v
 
-  embeddings:
-    # Vector memory search against a real Ollama server and embedding model (not the stand-in).
+  ollama:
+    # Real models on a real Ollama server: vector memory search with an embedding model (not the
+    # stand-in), and the prompt-injection suite measured against a small local chat model.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       AIOS_TEST_EMBED_URL: http://127.0.0.1:11434/v1
       AIOS_TEST_EMBED_MODEL: nomic-embed-text
+      AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
+      AIOS_TEST_CHAT_MODEL: qwen2.5:1.5b
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -118,6 +122,7 @@ jobs:
           fi
           echo
           ollama pull "$AIOS_TEST_EMBED_MODEL"
+          ollama pull "$AIOS_TEST_CHAT_MODEL"
           ollama list
       - name: Record how the model scores notes against queries
         run: |
@@ -139,6 +144,8 @@ jobs:
           asyncio.run(main())
           PY
       - run: python -m unittest tests.test_memory -v
+      - name: Prompt-injection suite against a real model
+        run: python -m unittest tests.test_injection -v
 
   microvm:
     # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
