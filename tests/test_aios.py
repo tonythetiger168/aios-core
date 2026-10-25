@@ -1380,6 +1380,58 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
         n = int(out.split("forked")[1])
         self.assertLess(n, 25, out)  # a few slack for processes the user started meanwhile
 
+    @unittest.skipUnless(aios.landlock_abi() >= 1, "needs Landlock (Linux 5.13+)")
+    async def test_landlock_confines_files_to_python_and_the_workspace(self):
+        with tempfile.TemporaryDirectory() as outside:  # not under the workspace
+            secret = Path(outside, "secret.txt")
+            secret.write_text("key", encoding="utf-8")
+            (aios.WORKSPACE / "data.txt").write_text("ws", encoding="utf-8")
+            code = "\n".join([
+                "import json, os, sqlite3, subprocess, tempfile",  # stdlib, C extensions, exec
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(secret)!r}).read()))",
+                f"print(try_(lambda: os.listdir({outside!r})))",
+                "print(try_(lambda: open('../data.txt').read()))",  # the workspace: read-only
+                "print(try_(lambda: open('../new.txt', 'w')))",
+                "print(try_(lambda: open('mine.txt', 'w').write('ok')))",  # its own folder
+                "print(try_(lambda: tempfile.mkstemp()[0] > 0))",
+                "print(subprocess.run(['true']).returncode)",
+            ])
+            out = (await aios.Sandbox().run_python(code)).splitlines()
+        self.assertEqual(out, ["exit=0", "PermissionError", "PermissionError", "ws", "PermissionError",
+                               "2", "True", "0"])
+
+    @unittest.skipUnless(aios.landlock_abi() >= 4 or (aios.landlock_abi() >= 1 and aios.Sandbox().net_isolated),
+                         "needs a network namespace or Landlock ABI 4")
+    async def test_no_tcp_connection_to_the_host(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        try:
+            port = srv.getsockname()[1]
+            out = await aios.Sandbox().run_python(
+                f"import socket\ntry:\n    socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
+                "    print('connected')\nexcept OSError as e:\n    print('refused', type(e).__name__)")
+        finally:
+            srv.close()
+        self.assertIn("refused", out)
+
+    def test_landlock_failure_is_fatal_not_ignored(self):
+        if not aios.landlock_abi():
+            self.skipTest("needs Landlock")
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            bad = '{"ro": [], "rw": []}'  # Python cannot even read its own stdlib: the exec must fail
+            r = subprocess.run([sys.executable, "-I", "-c", aios.LANDLOCK_BOOT, bad, "-c", "print('ran')"],
+                               cwd=d, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("ran", r.stdout)
+
     async def test_environment_is_scrubbed(self):
         import os
         os.environ["AIOS_SECRET_TEST"] = "leak"
@@ -1584,10 +1636,12 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         for box, want in (
                 (aios.DockerSandbox(), "not a microVM"),
                 (aios.MicroVMSandbox(), "Firecracker microVM"),
-                (types.SimpleNamespace(name="process", net_isolated=False, timeout=10),
+                (types.SimpleNamespace(name="process", net_isolated=False, fs_isolated=False, timeout=10),
                  "network NOT isolated"),
-                (types.SimpleNamespace(name="process", net_isolated=True, timeout=10),
-                 "network namespace enabled")):
+                (types.SimpleNamespace(name="process", net_isolated=True, fs_isolated=False, timeout=10),
+                 "network namespace enabled"),
+                (types.SimpleNamespace(name="process", net_isolated="tcp", fs_isolated=True, timeout=10),
+                 "no TCP connections")):
             with self.subTest(backend=box.name, want=want), \
                     mock.patch.object(aios, "make_sandbox", return_value=box):
                 k = make_kernel()
@@ -1597,7 +1651,7 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                                 if t['name'] == 'run_python')
                     self.assertIn(want, desc)
                     if box.name == 'process':
-                        self.assertIn('can read files', desc)
+                        self.assertIn('reads only Python' if box.fs_isolated else 'can read files', desc)
                 finally:
                     k.store.db.close()
 
