@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -105,6 +106,27 @@ class ClientOfARealServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await k.close()
             k.store.db.close()
+
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(), "needs Landlock or sandbox-exec")
+    async def test_a_confined_server_still_works_and_its_state_folder_goes_away(self):
+        k = aios.Kernel(store=aios.Store(":memory:"))
+        made = []
+        real = aios.tempfile.mkdtemp
+
+        def spy(*a, **kw):
+            made.append(real(*a, **kw))
+            return made[-1]
+
+        try:
+            with mock.patch.object(aios.tempfile, "mkdtemp", spy):
+                await k.connect_mcp("demo", sys.executable, [str(ROOT / "demo_mcp_server.py")], confine=True)
+            agent = aios.Agent("t", {"demo__*"})
+            self.assertEqual(str(await k.tools.call("demo__add", agent, a=2, b=40)), "42")
+            self.assertTrue(Path(made[0]).is_dir())
+        finally:
+            await k.close()
+            k.store.db.close()
+        self.assertFalse(Path(made[0]).exists())
 
 
 if __name__ == "__main__":
