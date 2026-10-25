@@ -106,7 +106,14 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
-          timeout 60 sh -c 'until curl -fsS http://127.0.0.1:11434/api/version; do sleep 1; done'; echo
+          # install.sh starts a systemd service, but on some runners it never comes up: start one here then
+          up() { timeout "$1" sh -c 'until curl -fsS http://127.0.0.1:11434/api/version; do sleep 1; done'; }
+          if ! up 20; then
+            sudo systemctl status ollama --no-pager || true
+            (setsid ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &)
+            up 60 || { cat "$RUNNER_TEMP/ollama.log"; exit 1; }
+          fi
+          echo
           ollama pull "$AIOS_TEST_EMBED_MODEL"
           ollama list
       - name: Record how the model scores notes against queries
