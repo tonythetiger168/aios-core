@@ -44,7 +44,13 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 
 ## 快速開始
 
-需要 Python 3.10 以上與 [Anthropic API key](https://platform.claude.com/settings/keys)。
+需要 Python 3.11 以上與 [Anthropic API key](https://platform.claude.com/settings/keys)（或下方的本機模型）。可以在原始碼目錄裡用 `python aios.py` 執行，也可以安裝成 `aios` 指令（只用標準函式庫；extras 會另外裝 Anthropic SDK 與 MCP SDK）：
+
+```bash
+pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # 之後：aios chat、aios doctor……
+```
+
+在原始碼目錄裡：
 
 ```bash
 pip install anthropic            # 選用：pip install mcp
