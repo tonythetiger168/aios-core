@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aios  # noqa: E402
 import aios_egress  # noqa: E402
 
-NO_PROXY_ENV = {k: "" for k in aios_egress.PROXY_VARS}
+NO_PROXY_ENV = {k: "" for k in (*aios_egress.PROXY_VARS, "NO_PROXY", "no_proxy")}
 
 
 async def echo_server():
@@ -100,8 +100,8 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         upstream = aios_egress.EgressProxy([("127.0.0.1", self.echo_port)], lambda *e: upstream_events.append(e), "")
         up_port = await upstream.start_tcp()
         try:
-            with mock.patch.dict(os.environ, {"https_proxy": f"http://127.0.0.1:{up_port}", "HTTPS_PROXY": "",
-                                              "no_proxy": "", "NO_PROXY": ""}):
+            # one key only: Windows environment names ignore case, so HTTPS_PROXY="" would clear it
+            with mock.patch.dict(os.environ, {"https_proxy": f"http://127.0.0.1:{up_port}"}):
                 code, r, w = await connect_via(self.port, f"127.0.0.1:{self.echo_port}")
                 self.assertEqual(code, 200, self.events)
                 w.write(b"pong")
