@@ -133,7 +133,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([e["tool"] for e in s.audit_tail("a1")], ["now", "run_python"])
         self.assertEqual(s.audit_tail("a1", n=1)[0]["status"], "denied")
         public = [n for n in dir(aios.Store) if "audit" in n]
-        self.assertEqual(sorted(public), ["audit_tail", "log_audit", "verify_audit"])  # no update/delete API
+        self.assertEqual(sorted(public), ["append_audit", "audit_row", "audit_tail", "log_audit",
+                                          "verify_audit"])  # no update/delete API
 
     def chained(self, n=4):
         s = aios.Store(":memory:")

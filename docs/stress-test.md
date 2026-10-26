@@ -19,6 +19,7 @@ thread is the bottleneck).
 ```
 python scripts/stress-swarm.py                            # 1, 2, 4, ... 131072
 python scripts/stress-swarm.py --factor 10 --max 10000    # 1, 10, 100, 1000, 10000
+python scripts/stress-swarm.py --workers 3                # the same ramp on 3 CPU cores
 python scripts/stress-swarm.py --model-kind openai --base-url http://localhost:8000/v1 --model Qwen/Qwen2.5-3B-Instruct
 RUNPOD_API_KEY=... python scripts/runpod-stress.py        # one rented GPU, see below
 ```
@@ -55,6 +56,43 @@ model's 1 s, so **adding agents makes the batch faster almost linearly** (10 age
 one wait longer (10,000: 3.4 s, 131,072: 57 s) while throughput stays flat. Memory is ~8 KB per
 agent (111 MB at 10,000, 1.1 GB at 131,072).
 
+### Many cores (`--workers`)
+
+One Python process runs every agent on one core (the GIL), so the ceiling above is one core's.
+`aios swarm --workers N` (and `stress-swarm.py --workers N`) runs the helpers in N processes, one
+event loop each. The parent reads the tasks, hands each worker only as many as it has free slots
+(`--parallel` and `--model-slots` are split between the workers), writes every worker's audit rows
+to the one hash chain in batches, and keeps one shared token/cost ledger in shared memory.
+`--workers 0` = one per CPU core but one (the parent needs one too). Measured in one session on the
+same 4-vCPU container (Python 3.11, fake model answering in 1 s):
+
+| agents | 1 process: wall s | agents/s | 3 workers: wall s | agents/s | speed-up |
+|---|---|---|---|---|---|
+| 1,024 | 1.15 | 891 | 1.39 | 735 | 0.8x (starting 3 processes takes ~0.2 s) |
+| 4,096 | 1.57 | 2,612 | 1.51 | 2,718 | 1.0x |
+| 16,384 | 3.20 | 5,117 | 2.01 | 8,168 | 1.6x |
+| 65,536 | 14.22 | 4,608 | 5.76 | 11,372 | 2.5x |
+| 131,072 | 31.47 | 4,165 | 11.18 | 11,727 | 2.8x |
+
+0 failures at every level. Memory is spread too: at 131,072 agents the single process peaks at
+1.1 GB, the parent with 3 workers at 81 MB plus ~170 MB per worker. Through HTTP (`http-mock`,
+10,000 agents) 3 workers double the ceiling, 729 -> 1,455 calls/s (each worker has its own thread
+pool; the fake server, itself one process, is then the limit). 4 workers on 4 cores were slower
+than 3: the parent needs a core of its own. Cloud vCPUs are noisy: this session's single process
+reached ~4,200-5,100 agents/s, the run above ~2,300, so compare columns of one run, not runs.
+
+Why not threads: under the GIL, threads take turns on one core. Free-threaded Python (3.13t, 3.14t)
+lifts that, but asyncio, sqlite3 and the kernel's own state are not designed for one kernel shared
+by several threads, and most installs are not free-threaded, so processes are the portable choice
+(Linux, macOS and Windows alike; workers are spawned, never forked).
+
+What changes with `--workers`: each worker rebuilds the kernel from the same command line (policy,
+model, sandbox, approvals, A2A agents), so permissions, scopes, taint and approvals are exactly as
+in one process. Audit rows are written by the parent a few milliseconds after the call (always before
+its result is reported); a parent killed outright can lose that last instant. A worker that dies
+takes only the tasks it held: they are reported as `error`, the others go on. `--reduce` runs in
+the parent. The `swarm` tool inside an agent stays in one process (one lead, at most 1,000 tasks).
+
 ### Through HTTP (`http-mock`), before and after the thread-pool fix
 
 `OpenAICompatProvider` uses blocking `urllib` in a thread. It used Python's shared default pool,
@@ -84,8 +122,7 @@ number of agents *in flight* is easy; the number *finishing per second* is what 
 - **Short tasks**: time to finish all 10,000 is roughly 10,000 x tokens per task / GPU tokens per
   second. A 3B model on one 24 GB card decodes a few thousand tokens/s batched, so 10,000 short
   answers take minutes, not seconds.
-- Above ~450 model calls/s, run several AIOS processes (e.g. split the task file) against the same
-  server.
+- Above ~450 model calls/s, use `aios swarm --workers N`: N processes against the same server.
 
 ## Real GPU on RunPod (`scripts/runpod-stress.py`)
 

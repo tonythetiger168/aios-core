@@ -515,10 +515,17 @@ class Store:
     # keep a printed head somewhere else to catch that too.
     def log_audit(self, agent: str, tool: str, args: dict, result: str, status: str):
         """status: 'ok' | 'error' | 'denied'"""
-        import aios_watchdog as wd
+        self.append_audit([self.audit_row(agent, tool, args, result, status)])
+
+    @staticmethod
+    def audit_row(agent: str, tool: str, args: dict, result: str, status: str) -> tuple:
         clip = lambda t: t if len(t) <= AUDIT_MAX else t[:AUDIT_MAX] + "...(truncated)"
-        row = (datetime.now().isoformat(timespec="seconds"), agent, tool,
-               clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status)
+        return (datetime.now().isoformat(timespec="seconds"), agent, tool,
+                clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status)
+
+    def append_audit(self, rows: list[tuple]):
+        """Append audit_row()s in one transaction, each chained to the one before."""
+        import aios_watchdog as wd
         self.db.commit()
         # IMMEDIATE: other processes on this database (daemon, serve, console approvals) cannot
         # append between reading the last hash and writing the next one.
@@ -526,8 +533,10 @@ class Store:
         try:
             last = self.db.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
             prev = (last[0] if last else None) or ""
-            self.db.execute("INSERT INTO audit(ts, agent, tool, args, result, status, hash) VALUES(?,?,?,?,?,?,?)",
-                            (*row, wd.audit_hash(prev, *row)))
+            for row in rows:
+                prev = wd.audit_hash(prev, *row)
+                self.db.execute("INSERT INTO audit(ts, agent, tool, args, result, status, hash) "
+                                "VALUES(?,?,?,?,?,?,?)", (*row, prev))
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -2295,23 +2304,33 @@ def swarm_helper(k: Kernel, name: str) -> str | None:
 
 
 async def run_swarm(k: Kernel, caller: Agent, jobs, *, parallel: int | None = None, reduce=None,
-                    on_result=None, keep: bool = False, timeout: float | None = None) -> dict:
+                    on_result=None, keep: bool = False, timeout: float | None = None,
+                    workers: int = 1, worker_setup=None, sid: str | None = None) -> dict:
     """Run many helper calls at once. jobs: iterable of (tool, task, label); tool None = a bad job
     whose task is the reason. Each job is exactly the call `caller` would make itself: its permission
     and scope (max_calls counts every job), approval, its taint, audited under its name. All helpers
     spend from one shared Ledger (nested in the caller's, if the caller is itself a swarm helper).
     reduce: (tool, instruction): that helper combines the ok answers, in rounds of bounded size; it
-    runs tainted, since the answers may carry text the helpers read."""
+    runs tainted, since the answers may carry text the helpers read.
+    workers > 1: the jobs run in that many processes (one core each), sharing `parallel` and one
+    ledger; worker_setup is a picklable `async (n, workers) -> (kernel, caller)` that builds the same
+    kernel and caller inside each of them (see swarm_worker). The reduce runs here, in this process."""
     import dataclasses
     import aios_swarm as sw
     parallel = max(1, min(parallel or SWARM_PARALLEL, SWARM_PARALLEL))
+    workers = max(1, min(workers, parallel))
     b = caller.run_budget or k.budget
-    ledger = sw.Ledger(SWARM_MAX_TOKENS, SWARM_MAX_COST, b.price_in_per_mtok, b.price_out_per_mtok,
-                       parent=caller.ledger)
+    if workers > 1:
+        if caller.ledger is not None or worker_setup is None:
+            raise ValueError("a swarm in worker processes needs a worker_setup and cannot be nested")
+        ledger = sw.SharedLedger(SWARM_MAX_TOKENS, SWARM_MAX_COST, b.price_in_per_mtok, b.price_out_per_mtok)
+    else:
+        ledger = sw.Ledger(SWARM_MAX_TOKENS, SWARM_MAX_COST, b.price_in_per_mtok, b.price_out_per_mtok,
+                           parent=caller.ledger)
     tainted = k._is_tainted(caller)
     proxy = dataclasses.replace(caller, ledger=ledger)  # same history, chain, budget and call counts
     timeout = timeout or SWARM_TIMEOUT
-    sid, counts, kept = secrets.token_hex(4), {}, []
+    sid, counts, kept = sid or secrets.token_hex(4), {}, []
 
     async def call(who: Agent, tool: str, task: str, taint: bool):
         out, err, status = await k._execute(who, tool, {"task": task}, taint, caller.run_counts)
@@ -2329,7 +2348,14 @@ async def run_swarm(k: Kernel, caller: Agent, jobs, *, parallel: int | None = No
         if on_result:
             await on_result(i, job, status, text)
 
-    await sw.fan_out(jobs, work, parallel, done, stop=ledger.exceeded, timeout=timeout)
+    if workers > 1:
+        settings = {"SWARM_PARALLEL": SWARM_PARALLEL, "SWARM_MAX_TOKENS": SWARM_MAX_TOKENS,
+                    "SWARM_MAX_COST": SWARM_MAX_COST, "MODEL_SLOTS": MODEL_SLOTS}
+        procs = [(swarm_worker, (worker_setup, workers, sw.share(parallel, n, workers), timeout, sid, ledger,
+                                 settings), sw.share(parallel, n, workers)) for n in range(workers)]
+        await sw.fan_out_procs(jobs, procs, done, stop=ledger.exceeded, on_audit=k.store.append_audit)
+    else:
+        await sw.fan_out(jobs, work, parallel, done, stop=ledger.exceeded, timeout=timeout)
     kept.sort()
     combined = None
     if reduce:
@@ -2362,6 +2388,50 @@ async def run_swarm(k: Kernel, caller: Agent, jobs, *, parallel: int | None = No
     return {"summary": sw.summary_line(counts, sum(counts.get(s, 0) for s in counts if " " not in s),
                                        parallel, ledger),
             "counts": counts, "results": kept, "combined": combined, "ledger": ledger}
+
+
+def swarm_worker(task_q, result_q, n: int, setup, workers: int, parallel: int, timeout: float, sid: str,
+                 ledger, settings: dict):
+    """One worker process of run_swarm(workers=N): takes the parent's swarm limits, builds its own
+    kernel with `setup` (same policy, model, approvals and aios.db), then runs the jobs the parent
+    sends, `parallel` at a time, spending from the shared ledger. Model slots are split between the
+    workers. Audit rows go to the parent, which appends them to the one hash chain in batches,
+    a few ms after the call (before its result is reported)."""
+    import aios_swarm as sw
+    sw.worker_started()
+    globals().update(settings)
+    global MODEL_SLOTS
+    MODEL_SLOTS = sw.share(MODEL_SLOTS, n, workers)
+
+    async def main():
+        try:
+            k, caller = await setup(n, workers)
+            caller.ledger = ledger  # this worker's ledger nests in the shared one
+        except BaseException as e:
+            result_q.put((sw.FAILED, n, f"{type(e).__name__}: {e}"))
+            return
+        result_q.put((sw.READY, n, None))
+        try:
+            async def jobs():
+                async for i, (tool, task, _) in sw.queue_items(task_q):
+                    yield tool, task, i
+
+            async with sw.ResultSender(result_q, n) as out:
+                async def send(_, job, status, text):
+                    out.send(job[2], status, text)
+
+                # the parent appends every worker's audit rows to the chain, in one writer
+                k.store.log_audit = lambda *row: out.audit(Store.audit_row(*row))
+                try:
+                    await run_swarm(k, caller, jobs(), parallel=parallel, on_result=send, timeout=timeout,
+                                    sid=sid)
+                finally:
+                    await k.close()
+        finally:
+            k.store.db.close()
+            result_q.put((sw.DONE, n, None))
+
+    asyncio.run(main())
 
 
 def install_swarm_tool(k: Kernel):
@@ -3257,13 +3327,9 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
         k.store.db.close()
 
 
-async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | None, out_path: str | None,
-                    home: str = ".", provider=None, budget: Budget | None = None, reduce_agent: str | None = None,
-                    reduce_task: str = "", approve_timeout: float | None = None,
-                    a2a_specs: list[str] | None = None, timeout: float | None = None) -> int:
-    """`aios swarm`: fan a task file out to policy agents, results streamed as JSON lines. The file is
-    read lazily (only when a helper is free), so it can be any length. The tasks are the operator's
-    own, so helpers run untainted (their auto_paths apply), audited under the name 'swarm'."""
+async def swarm_kernel(policy: dict | None, home: str, provider, budget: Budget | None,
+                       approve_timeout: float | None) -> Kernel:
+    """The kernel `aios swarm` runs helpers in (also in each --workers process)."""
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -3273,6 +3339,44 @@ async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | N
                approver=ConsoleApprover(store, approve_timeout) if approve_timeout else None)
     install_builtin_tools(k)
     install_agent_tools(k, policy)
+    return k
+
+
+def swarm_caller(k: Kernel) -> Agent:
+    caller = Agent("swarm", {"agent__*", "a2a__*"}, loaded=True, ephemeral=True)
+    caller.run_budget = k.budget
+    return caller
+
+
+def auto_workers() -> int:
+    """--workers 0: one process per CPU core but one, which the parent needs (audit, results)."""
+    return max(1, (os.cpu_count() or 1) - 1)
+
+
+async def cli_swarm_setup(argv: list[str], n: int, workers: int):
+    """worker_setup of `aios swarm --workers N`: the same kernel, rebuilt in a worker process from
+    the command line (already checked by the parent)."""
+    global SANDBOX_CHOICE
+    a = parser().parse_args(argv)
+    SANDBOX_CHOICE = a.sandbox
+    ap = argparse.ArgumentParser()
+    provider, budget = build_model(a, ap, default_tokens=50_000)
+    k = await swarm_kernel(load_policy(a.policy), a.home, provider, budget, approve_timeout(a, ap))
+    if a.a2a:
+        await install_a2a_tools(k, a.a2a)
+    return k, swarm_caller(k)
+
+
+async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | None, out_path: str | None,
+                    home: str = ".", provider=None, budget: Budget | None = None, reduce_agent: str | None = None,
+                    reduce_task: str = "", approve_timeout: float | None = None,
+                    a2a_specs: list[str] | None = None, timeout: float | None = None,
+                    workers: int = 1, worker_argv: list[str] | None = None) -> int:
+    """`aios swarm`: fan a task file out to policy agents, results streamed as JSON lines. The file is
+    read lazily (only when a helper is free), so it can be any length. The tasks are the operator's
+    own, so helpers run untainted (their auto_paths apply), audited under the name 'swarm'.
+    workers > 1: helpers run in that many processes, each rebuilt from worker_argv (the command line)."""
+    k = await swarm_kernel(policy, home, provider, budget, approve_timeout)
     out = None
     try:
         if a2a_specs:
@@ -3283,8 +3387,7 @@ async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | N
                 print(f"[aios] --reduce: no agent {reduce_agent!r} in the policy (or --a2a)", file=sys.stderr)
                 return 2
             reduce = (rtool, reduce_task)
-        caller = Agent("swarm", {"agent__*", "a2a__*"}, loaded=True, ephemeral=True)
-        caller.run_budget = k.budget
+        caller = swarm_caller(k)
         src = sys.stdin if tasks_path == "-" else open(tasks_path, encoding="utf-8")
 
         def jobs():
@@ -3318,8 +3421,9 @@ async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | N
                                   "answer": text}, ensure_ascii=False) + "\n")
             out.flush()
 
+        setup = functools.partial(cli_swarm_setup, worker_argv) if workers > 1 else None
         res = await run_swarm(k, caller, jobs(), reduce=reduce, on_result=write, keep=bool(reduce),
-                              timeout=timeout)
+                              timeout=timeout, workers=workers, worker_setup=setup)
         if res["combined"]:
             status, text = res["combined"]
             out.write(json.dumps({"combined": text, "status": status}, ensure_ascii=False) + "\n")
@@ -3876,7 +3980,7 @@ def approve_timeout(a, ap) -> float | None:
     return a.approve_timeout
 
 
-def cli():
+def parser() -> argparse.ArgumentParser:
     import aios_schedule
     ap = argparse.ArgumentParser(prog="aios", description="Minimal AIOS")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3988,6 +4092,10 @@ def cli():
                     help="what the --reduce agent should do with the answers")
     sw.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     sw.add_argument("--timeout", type=float, default=SWARM_TIMEOUT, help=f"seconds per task (default {SWARM_TIMEOUT:g})")
+    sw.add_argument("--workers", type=int, default=1,
+                    help="processes to run helpers in, one CPU core each (0 = one per core but one; "
+                         "default 1). "
+                         "--parallel and --model-slots are shared between them")
     add_model_flags(sw)
     for p in (c, dm, aa, sw):
         add_swarm_flags(p)
@@ -4007,6 +4115,11 @@ def cli():
                             f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
                             "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
+    return ap
+
+
+def cli():
+    ap = parser()
     argv, daemon_args = sys.argv[1:], []
     if argv[:1] == ["service"] and "--" in argv:  # what follows -- is passed to `aios daemon` untouched
         argv, daemon_args = argv[:argv.index("--")], argv[argv.index("--") + 1:]
@@ -4036,9 +4149,11 @@ def cli():
             ap.error("--timeout must be positive")
         if a.approvals == "console" and a.approve_timeout >= a.timeout:
             ap.error("--approve-timeout must be shorter than --timeout (the task would be stopped first)")
+        if a.workers < 0:
+            ap.error("--workers must be 0 (one per CPU core) or more")
         raise SystemExit(asyncio.run(swarm_cmd(policy, a.tasks, a.agent, a.out, a.home, provider, budget,
                                                a.reduce, a.reduce_task, approve_timeout(a, ap), a.a2a,
-                                               a.timeout)))
+                                               a.timeout, a.workers or auto_workers(), argv)))
     if a.cmd == "audit":
         raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head))
     if a.cmd == "doctor":
