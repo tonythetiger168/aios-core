@@ -17,6 +17,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
+- **對話壓縮**：聊天超過 30 則訊息（或約 120,000 字元）時，較舊的回合會由模型寫成摘要並取代原文；最新約 10 則訊息保持原樣，下一次壓縮會以上一份摘要為基礎繼續累積。以前舊訊息只會直接掉出上下文。摘要呼叫計入這次執行的預算；預算不夠或呼叫失敗時就跳過（舊訊息照舊掉出上下文）；每次壓縮都以 `(compact)` 記在審計日誌。讀過不可信內容的回合所寫成的摘要會標記為受污染，聊天會一直保持受污染（不自動核准），直到 `/reset` 連同歷史一起清掉。`/summary` 顯示摘要，`chat --compact-at N` 調整門檻，`--compact-at 0` 關閉。定時任務、子代理與 A2A 對話不壓縮（它們每次從空白開始或從不保存）。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
 - **圖片與 PDF（多模態輸入）**：在對話中用 `/attach <檔案>` 把圖片或 PDF 附在下一則訊息（`/attach` 列出、`/detach` 移除），或讓 agent 用 `view_file` 查看工作區裡的檔案。MCP 工具回傳的圖片（例如瀏覽器伺服器的螢幕截圖）會以圖片交給模型，不再被丟掉。支援 PNG、JPEG、GIF、WebP（上限 5 MB）與 PDF（上限 20 MB）；檔案類型依檔案內容判斷，不看副檔名。每個 agent 的歷史只保留最新 4 個圖片／PDF（較舊的換成一行說明），長對話不會在每一步都重送所有圖片。使用 `--provider openai` 時，圖片以 `image_url` 傳送（需要支援視覺的模型），PDF 則換成一行說明。附加的檔案和 agent 讀到的檔案一樣算不可信內容：圖片或 PDF 裡也可能寫著指令。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
@@ -38,12 +39,13 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
+- **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
-- **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/reset`、`/quit`。
+- **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
 
 ## 快速開始
 
@@ -65,6 +67,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # 接上 MCP 伺服
 python aios.py chat --provider openai --model llama3.1   # 用 Ollama 的本機模型
 python aios.py chat --max-tokens 20000 --max-steps 6     # 每次執行的硬性上限
 python aios.py chat --daily-max-tokens 500000            # 以及這個 agent 所有聊天在任何 24 小時內的合計上限
+python aios.py chat --compact-at 20                      # 提早把舊回合寫成摘要（預設 30 則訊息；0 = 關閉）
 python aios.py chat --policy policy.example.toml --agent notes   # 每個代理的權限與路徑範圍
 python aios.py chat --policy policy.example.toml --agent lead    # 把寫作交給 'notes' 的代理
 python aios.py chat --sandbox docker          # run_python 改在用完即丟的容器裡執行（需先 `docker pull python:3.12-slim`）
@@ -125,6 +128,17 @@ python aios.py console --approve                                       # 在「A
 - 每個沒有被範圍預先允許的高風險呼叫，都會變成一筆請求，列出代理、工具與完整參數；若該次執行讀過不可信內容，會加上警告。你按 Approve 或 Deny。逾時（預設 240 秒，須短於任務的 `--timeout`）沒回答就視為拒絕；執行結束時請求也會關閉，事後無法再批准。
 - 只有用 `--approve` 啟動的控制台能回答；沒加時頁面是唯讀的。它唯一能寫入的就是這個回答。送出需要控制台的 cookie、每次啟動產生的表單 token，以及同源的 `Origin` 標頭，所以其他網頁無法替你按下按鈕。
 - 一次只處理一筆請求：請求未回答時，任務會等待。
+
+**用手機審批（Telegram）。** 同樣的請求也可以在 Telegram 回答，控制台開不開都可以：
+
+```bash
+export AIOS_TELEGRAM_TOKEN=123456:ABC...        # 用 @BotFather 建立機器人；token 絕不要寫在命令列上
+python aios.py telegram --chat-id 987654321      # 你的 user id（先傳訊息給機器人，再看 .../bot<TOKEN>/getUpdates）
+```
+
+- 每筆請求會以一則訊息送來，列出代理、工具、參數（截到一則訊息放得下）與不可信內容警告，並附上 ✅ Approve／❌ Deny 按鈕。按下去的效果和控制台完全相同：只有仍在等待中的請求會改變。之後訊息會顯示結果，請求逾時或已在控制台回答時也一樣。
+- 只有在該聊天室、由允許的使用者按下才算數（`--allow-user ID`，可重複；預設為 chat id，在私人聊天中就是你）。任何人找到這個機器人都能傳訊息給它，但他們按的按鈕會被拒絕並記錄。訊息是純文字，參數無法改變格式或藏起請求的某部分。
+- 你審批的內容會經過 Telegram 的伺服器：參數屬於機密的代理請勿使用。token 可以代替你回答，請像密碼一樣保管。`AIOS_TELEGRAM_API` 可改用自架的 Bot API 伺服器。只用標準函式庫，不需要額外套件。
 
 **檔案變動觸發。** `--schedule "on change inbox/*"` 會在符合樣式的檔案（相對於工作區，包含子資料夾）被新增、修改或刪除時執行任務：
 

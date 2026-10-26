@@ -17,6 +17,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Kernel**: async task queue with a worker pool; each agent is a "process" with its own permissions, history and memory.
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
+- **Conversation compaction**: once a chat has more than 30 messages (or about 120,000 characters), the older turns are summarised by the model and replaced by that summary; the newest ~10 messages stay word for word, and the next compaction builds on the last summary. Before, older messages just dropped out of context. The summary call counts against the run's budget and is skipped (old messages drop out as before) when the budget has too little room or the call fails; each compaction is in the audit log as `(compact)`. A summary of turns that read untrusted content is stored as tainted and keeps the chat tainted (no auto-approval) until `/reset`, which clears it with the history. `/summary` shows it, `chat --compact-at N` changes the threshold, `--compact-at 0` turns it off. Jobs, helpers and A2A conversations are not compacted (they start fresh or are never saved).
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8. Every write is checkpointed: `aios undo` puts back what a run changed (see [Undoing a run](#undoing-a-run)).
 - **Images and PDFs (multimodal input)**: attach a picture or PDF to your next chat message with `/attach <file>` (`/attach` lists, `/detach` drops), or let the agent look at one in the workspace with `view_file`. Images that MCP tools return (screenshots from a browser server, for example) reach the model as images instead of being dropped. PNG, JPEG, GIF and WebP up to 5 MB, PDFs up to 20 MB; the type is read from the file's bytes, not its name. Only the newest 4 images/PDFs stay in an agent's history (older ones become a short note), so a long chat does not resend every picture on every step. With `--provider openai`, images are sent as `image_url` parts (needs a vision model) and PDFs are replaced by a note. An attached file counts as untrusted content like a file the agent read: a picture or a PDF can carry written instructions.
 - **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
@@ -38,12 +39,13 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign|publish|search|install`, optional publisher signatures, a static skill registry, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
+- **Approvals from your phone**: `python aios.py telegram` sends approval requests from the daemon, `serve` and `swarm` (`--approvals console`) to a Telegram chat with Approve/Deny buttons (see Scheduled jobs).
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
 - **Prompt-injection test suite**: `python tests/test_injection.py --report` prints which attacks get through under each defense (below).
 - **Audit log** (SQLite, append-only API): every tool call is recorded with agent, tool, arguments, result and status (`ok` / `error` / `denied`). View it with `/audit`. Entries are hash-chained, so `python aios.py audit --verify` finds an entry that was edited, removed or inserted, and the daemon's watchdog checks the chain every tick. The daemon can also copy every entry to a log collector (`--audit-sink URL`) and save the chain head to a file elsewhere (`--anchor FILE`), so even a rebuilt chain is caught (see Copies outside aios.db).
 - **Tests**: `python -m unittest discover -s tests -v` (standard library only, no API key needed); CI runs on Linux and Windows.
-- **CLI**: interactive chat with `/attach <file>`, `/detach`, `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/reset`, `/quit`.
+- **CLI**: interactive chat with `/attach <file>`, `/detach`, `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/summary`, `/reset`, `/quit`.
 
 ## Quick start
 
@@ -65,6 +67,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # attach an MCP ser
 python aios.py chat --provider openai --model llama3.1   # local model via Ollama (http://localhost:11434/v1)
 python aios.py chat --max-tokens 20000 --max-steps 6     # hard limits per run
 python aios.py chat --daily-max-tokens 500000            # and for all of this agent's chats in any 24 hours
+python aios.py chat --compact-at 20                      # summarise older turns sooner (default 30 messages; 0 = off)
 python aios.py chat --policy policy.example.toml --agent notes   # per-agent permissions and path scopes
 python aios.py chat --policy policy.example.toml --agent lead    # an agent that hands writing to 'notes'
 python aios.py chat --sandbox docker          # run_python in a throwaway container (after `docker pull python:3.12-slim`)
@@ -125,6 +128,17 @@ python aios.py console --approve                                       # answer 
 - Each risky call that no scope pre-allows becomes a request showing the agent, the tool and the full arguments, with a warning when the run has read untrusted content. You press Approve or Deny. No answer before the timeout (default 240 s, kept below the job's `--timeout`) means no, and a request closes when its run ends, so it cannot be approved later.
 - Only a console started with `--approve` can answer; without it the page is read-only. The only write it can make is that one answer. A submission needs the console's cookie, a form token made at each start, and a same-origin `Origin` header, so another web page cannot press the button for you.
 - One request at a time: a job waits while it is open.
+
+**Approve from your phone (Telegram).** The same requests can also be answered in Telegram, with or without the console running:
+
+```bash
+export AIOS_TELEGRAM_TOKEN=123456:ABC...        # create a bot with @BotFather; never put the token on the command line
+python aios.py telegram --chat-id 987654321      # your user id (message the bot, then see .../bot<TOKEN>/getUpdates)
+```
+
+- Each request arrives as a message with the agent, the tool, the arguments (clipped to fit one message) and the untrusted-content warning, with ✅ Approve / ❌ Deny buttons. A press answers it exactly as the console would: only a request that is still open changes. The message then shows the outcome, also when the request expired or was answered in the console.
+- Only presses in that chat by an allowed user count (`--allow-user ID`, repeatable; by default the chat id, which in a private chat is you). Anyone who finds the bot can message it; their presses are refused and logged. Messages are plain text, so arguments cannot reformat or hide parts of the request.
+- What you approve passes through Telegram's servers: do not use it for agents whose arguments are confidential. The token can answer for you, so keep it like a password. `AIOS_TELEGRAM_API` points it to a self-hosted Bot API server. Standard library only, no extra package.
 
 **File-change triggers.** `--schedule "on change inbox/*"` runs the job when files matching the pattern (relative to the workspace, subfolders included) are added, edited or removed:
 
