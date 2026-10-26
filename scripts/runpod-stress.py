@@ -49,18 +49,31 @@ sleep infinity
 """
 
 
+# RunPod sits behind Cloudflare, which answers 403 to urllib's default "Python-urllib/3.x" agent
+UA = {"User-Agent": "aios-runpod-stress/1.0 (+https://github.com/tonythetiger168/aios-core)"}
+
+
+class ApiError(RuntimeError):
+    pass
+
+
 def call(method, path, key, body=None):
     req = urllib.request.Request(API + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        raw = r.read()
+                                 headers={**UA, "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise ApiError(f"RunPod {method} {path}: HTTP {e.code}: {detail or e.reason}") from None
     return json.loads(raw) if raw else {}
 
 
 def fetch(pod, name):
     try:
-        with urllib.request.urlopen(f"https://{pod}-8080.proxy.runpod.net/{name}", timeout=30) as r:
+        req = urllib.request.Request(f"https://{pod}-8080.proxy.runpod.net/{name}", headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError):
         return None
@@ -81,6 +94,10 @@ def main():
     key = os.environ.get("RUNPOD_API_KEY")
     if not key:
         sys.exit("set RUNPOD_API_KEY (runpod.io > Settings > API Keys)")
+    try:  # free check first: a bad key or a blocked client fails here, before anything is rented
+        call("GET", "/pods", key)
+    except (ApiError, urllib.error.URLError) as e:
+        sys.exit(f"{e}\n401/403: check the key is a Read/Write (or All) API key and the account has credit")
     gpus = a.gpu or list(GPUS)
     worst = max(GPUS.get(g, 1.0) for g in gpus) * a.max_minutes / 60 + 0.05  # + disk
     print(f"1x {' / '.join(gpus)} ({a.cloud}), at most {a.max_minutes} min: worst case about US${worst:.2f}")
@@ -88,11 +105,22 @@ def main():
         return
     env = {"MODEL": a.model, "START": str(a.start), "FACTOR": str(a.factor), "MAX_AGENTS": str(a.max),
            "MAX_MINUTES": str(a.max_minutes), "REPO": REPO, "RUNPOD_API_KEY": key}
-    pod = call("POST", "/pods", key, {
+    try:
+        pod = create(key, a, gpus, env)
+    except ApiError as e:
+        sys.exit(f"{e}\nnothing was rented")
+    print(f"pod {pod} created; results at https://{pod}-8080.proxy.runpod.net/")
+    watch(pod, key, a)
+
+
+def create(key, a, gpus, env):
+    return call("POST", "/pods", key, {
         "name": "aios-stress", "imageName": IMAGE, "gpuTypeIds": gpus, "gpuCount": 1, "cloudType": a.cloud,
         "containerDiskInGb": 40, "volumeInGb": 0, "ports": ["8080/http"], "env": env,
         "dockerEntrypoint": ["bash", "-c"], "dockerStartCmd": [POD_SCRIPT]})["id"]
-    print(f"pod {pod} created; results at https://{pod}-8080.proxy.runpod.net/")
+
+
+def watch(pod, key, a):
     t0, last = time.time(), ""
     try:
         while time.time() - t0 < a.max_minutes * 60:
@@ -118,7 +146,7 @@ def main():
         try:
             call("DELETE", f"/pods/{pod}", key)
             print(f"pod {pod} deleted after {int(time.time() - t0)}s")
-        except (urllib.error.URLError, OSError) as e:
+        except (ApiError, urllib.error.URLError, OSError) as e:
             print(f"!! could not delete pod {pod} ({e}): delete it at runpod.io/console/pods", file=sys.stderr)
 
 
