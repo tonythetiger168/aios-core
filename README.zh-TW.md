@@ -37,6 +37,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
+- **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
@@ -123,6 +124,17 @@ python aios.py console --approve                                       # 在「A
 - 每個沒有被範圍預先允許的高風險呼叫，都會變成一筆請求，列出代理、工具與完整參數；若該次執行讀過不可信內容，會加上警告。你按 Approve 或 Deny。逾時（預設 240 秒，須短於任務的 `--timeout`）沒回答就視為拒絕；執行結束時請求也會關閉，事後無法再批准。
 - 只有用 `--approve` 啟動的控制台能回答；沒加時頁面是唯讀的。它唯一能寫入的就是這個回答。送出需要控制台的 cookie、每次啟動產生的表單 token，以及同源的 `Origin` 標頭，所以其他網頁無法替你按下按鈕。
 - 一次只處理一筆請求：請求未回答時，任務會等待。
+
+**用手機審批（Telegram）。** 同樣的請求也可以在 Telegram 回答，控制台開不開都可以：
+
+```bash
+export AIOS_TELEGRAM_TOKEN=123456:ABC...        # 用 @BotFather 建立機器人；token 絕不要寫在命令列上
+python aios.py telegram --chat-id 987654321      # 你的 user id（先傳訊息給機器人，再看 .../bot<TOKEN>/getUpdates）
+```
+
+- 每筆請求會以一則訊息送來，列出代理、工具、參數（截到一則訊息放得下）與不可信內容警告，並附上 ✅ Approve／❌ Deny 按鈕。按下去的效果和控制台完全相同：只有仍在等待中的請求會改變。之後訊息會顯示結果，請求逾時或已在控制台回答時也一樣。
+- 只有在該聊天室、由允許的使用者按下才算數（`--allow-user ID`，可重複；預設為 chat id，在私人聊天中就是你）。任何人找到這個機器人都能傳訊息給它，但他們按的按鈕會被拒絕並記錄。訊息是純文字，參數無法改變格式或藏起請求的某部分。
+- 你審批的內容會經過 Telegram 的伺服器：參數屬於機密的代理請勿使用。token 可以代替你回答，請像密碼一樣保管。`AIOS_TELEGRAM_API` 可改用自架的 Bot API 伺服器。只用標準函式庫，不需要額外套件。
 
 **檔案變動觸發。** `--schedule "on change inbox/*"` 會在符合樣式的檔案（相對於工作區，包含子資料夾）被新增、修改或刪除時執行任務：
 
