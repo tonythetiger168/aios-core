@@ -212,10 +212,13 @@ class Budget:
     max_cost_usd: float | None = None  # needs the prices below (they change, so no defaults)
     price_in_per_mtok: float = 0.0
     price_out_per_mtok: float = 0.0
+    max_repeats: int | None = 3  # loop guard: identical tool calls (same tool, same arguments) per run
 
     def __post_init__(self):
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        if self.max_repeats is not None and self.max_repeats < 1:
+            raise ValueError("max_repeats must be >= 1 (None = no loop guard)")
         if self.max_cost_usd is not None and not (self.price_in_per_mtok or self.price_out_per_mtok):
             raise ValueError("max_cost_usd needs price_in_per_mtok / price_out_per_mtok")
 
@@ -564,6 +567,11 @@ def tag_untrusted(source: str, text: str) -> str:
 
 def _call_path(args: dict):
     return args.get("path", args.get("folder", ""))
+
+
+def _call_key(name: str, args) -> str:
+    """Identity of a tool call for the loop guard: the tool and its exact arguments."""
+    return json.dumps([name, args], sort_keys=True, ensure_ascii=False, default=str)
 
 
 def _norm_path(raw) -> str | None:
@@ -981,6 +989,8 @@ class Kernel:
 
         t_in = t_out = steps = last_in = 0
         counts = agent.run_counts = {}  # per-run call counters for max_calls (swarm jobs count too)
+        repeats: dict[str, int] = {}  # loop guard: calls per (tool, arguments) this run
+        loop_strikes = 0  # model calls in a row that asked only for calls the loop guard refused
         stop, answer = "max_steps", "(max steps reached)"
         try:
             while steps < budget.max_steps:
@@ -1015,13 +1025,27 @@ class Kernel:
                     stop, answer = "budget", f"(stopped: {over})"
                     break
 
+                calls = [b for b in comp.content if b.get("type") == "tool_use"]
+                keys = [_call_key(b["name"], b["input"]) for b in calls]
+                looping = [budget.max_repeats is not None and repeats.get(key, 0) >= budget.max_repeats
+                           for key in keys]
+                loop_strikes = loop_strikes + 1 if calls and all(looping) else 0
+                if loop_strikes >= 2:  # told once and still repeating: stop paying for it
+                    stop, answer = "loop", (f"(stopped: loop guard: the model kept asking for {calls[0]['name']} "
+                                            "with the same arguments)")
+                    break
+
                 tainted = self._is_tainted(agent)
                 results = []
-                for b in comp.content:
-                    if b.get("type") != "tool_use":
-                        continue
+                for b, key, again in zip(calls, keys, looping):
                     name, args = b["name"], b["input"]
-                    out, err, status = await self._execute(agent, name, args, tainted, counts)
+                    if again:
+                        out, err, status = (f"loop guard: {name} was already called {repeats[key]} times this run "
+                                            "with exactly these arguments, so it was not run again. Use the "
+                                            "earlier result, try something different, or give your answer."), True, "loop"
+                    else:
+                        repeats[key] = repeats.get(key, 0) + 1
+                        out, err, status = await self._execute(agent, name, args, tainted, counts)
                     self.store.log_audit(agent.name, name, args, out, status)
                     content = str(out)
                     if self.harden and status != "denied" and self.tools.is_untrusted(name):
@@ -3829,6 +3853,9 @@ def add_model_flags(p):
     p.add_argument("--max-cost", type=float, help="stop a run after this many USD (needs --price-in/out)")
     p.add_argument("--price-in", type=float, default=0.0, help="USD per million input tokens")
     p.add_argument("--price-out", type=float, default=0.0, help="USD per million output tokens")
+    p.add_argument("--max-repeats", type=int, default=3,
+                   help="loop guard: identical tool calls (same tool and arguments) allowed per run; "
+                        "more are refused, and a run that keeps asking stops (default 3, 0 = off)")
 
 
 def add_swarm_flags(p):
@@ -3857,7 +3884,7 @@ def build_model(a, ap, default_tokens: int | None = None):
     """(provider, budget) from the flags added by add_model_flags."""
     try:
         budget = Budget(a.max_steps, a.max_tokens if a.max_tokens is not None else default_tokens,
-                        a.max_cost, a.price_in, a.price_out)
+                        a.max_cost, a.price_in, a.price_out, a.max_repeats or None)
     except ValueError as e:
         ap.error(str(e))
     if a.provider == "openai":

@@ -518,6 +518,47 @@ class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, "(max steps reached)")
         self.assertEqual(run_log(k)[0]["status"], "max_steps")
 
+    def pick_kernel(self, *resp, **kw):
+        k = self.kernel(*resp, **kw)
+
+        @k.tools.register("pick", "pick", {"x": {"type": "integer"}})
+        async def pick(x):
+            self.ran.append(x)
+            return "picked"
+
+        return k
+
+    async def test_loop_guard_refuses_a_repeated_call_then_stops_the_run(self):
+        k = self.pick_kernel(*[Resp([tool_use("pick", {"x": 1}, id=f"t{i}")], "tool_use") for i in range(8)])
+        out = await k._run(aios.Agent("a", {"pick"}), "go", aios.Budget(max_steps=10, max_repeats=2))
+        self.assertEqual(len(self.ran), 2)  # the third identical call is refused, the fourth stops the run
+        self.assertIn("loop guard", out)
+        self.assertEqual(run_log(k)[0]["status"], "loop")
+        refused = [r for r in k.store.audit_tail(n=50) if r["status"] == "loop" and r["tool"] == "pick"]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("loop guard", k.store.load_messages("a")[-2]["content"][0]["content"])
+
+    async def test_loop_guard_recovers_when_the_model_changes_course(self):
+        k = self.pick_kernel(Resp([tool_use("pick", {"x": 1}, id="t1")], "tool_use"),
+                        Resp([tool_use("pick", {"x": 1}, id="t2")], "tool_use"),  # refused
+                        Resp([tool_use("pick", {"x": 2}, id="t3")], "tool_use"),  # different arguments: runs
+                        Resp([text("done")], "end_turn"))
+        out = await k._run(aios.Agent("a", {"pick"}), "go", aios.Budget(max_repeats=1))
+        self.assertEqual(out, "done")
+        self.assertEqual(len(self.ran), 2)
+        self.assertEqual(run_log(k)[0]["status"], "ok")
+
+    async def test_loop_guard_off(self):
+        k = self.kernel(*[Resp([tool_use("act", {}, id=f"t{i}")], "tool_use") for i in range(6)])
+        await k._run(aios.Agent("a", {"act"}), "go", aios.Budget(max_steps=6, max_repeats=None))
+        self.assertEqual(len(self.ran), 6)
+
+    def test_loop_guard_key_ignores_argument_order(self):
+        self.assertEqual(aios._call_key("t", {"a": 1, "b": 2}), aios._call_key("t", {"b": 2, "a": 1}))
+        self.assertNotEqual(aios._call_key("t", {"a": 1}), aios._call_key("u", {"a": 1}))
+        with self.assertRaises(ValueError):
+            aios.Budget(max_repeats=0)
+
     async def test_provider_error_is_logged_and_raised(self):
         class Boom:
             async def complete(self, *a, **k):
