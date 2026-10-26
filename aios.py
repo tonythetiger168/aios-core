@@ -3335,7 +3335,8 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                  approve_timeout: float | None = None, a2a_specs: list[str] | None = None,
                  daily_tokens: int | None = None, daily_cost: float | None = None,
                  mcp_specs: list[str] | None = None, confine_mcp=frozenset(), offline_mcp=frozenset(),
-                 egress_mcp: dict | None = None):
+                 egress_mcp: dict | None = None, audit_sink: str | None = None,
+                 anchor_path: str | None = None, anchor_every: float = 3600):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -3376,8 +3377,22 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
               "with 'Authorization: Bearer <secret>'", file=sys.stderr)
     if approve_timeout:
         print("[aios] risky calls wait for a person in `aios console --approve`", file=sys.stderr)
+    import aios_auditout
     import aios_watchdog as wd
+    sink = None
+    if audit_sink and not once:  # --once sends what it can at the end instead
+        sink = aios_auditout.Sink(str(base / "aios.db"), audit_sink).start()
+        print(f"[aios] audit entries are copied to {audit_sink}", file=sys.stderr)
+
+    def anchor_now():  # chain head to a file aios.db cannot reach; a failed check is an alert
+        r = aios_auditout.anchor(k.store.db, anchor_path)
+        if r["problem"]:
+            al = wd.alert(k.store.db, "audit-tampered", "anchors", f"{r['problem']}. Not anchored; run "
+                          f"`aios audit --verify --anchors {anchor_path}`.")
+            if al:
+                print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
     beat_info = f"pid={os.getpid()} tick={tick_seconds:g} timeout={timeout:g}"
+    next_anchor = time.monotonic()
     try:
         while True:
             wd.beat(k.store.db, "daemon", beat_info)  # supervisor: the daemon is alive
@@ -3386,12 +3401,24 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
             wd.beat(k.store.db, "daemon", beat_info)
             for al in wd.check(k.store.db):  # watchdog: rules over the audit log, no model involved
                 print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
+            if anchor_path and not once and time.monotonic() >= next_anchor:
+                anchor_now()
+                next_anchor = time.monotonic() + anchor_every
             if once:
                 break
             await asyncio.sleep(tick_seconds)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        if sink:
+            sink.stop()
+        elif audit_sink:
+            r = aios_auditout.Sink(str(base / "aios.db"), audit_sink).drain(
+                k.store.db, time.monotonic() + aios_auditout.TIMEOUT * 3)
+            if r and r["error"]:
+                print(f"[aios] audit sink: {r['error']} ({r['left']} entries wait for the next run)", file=sys.stderr)
+        if anchor_path:
+            anchor_now()
         if hooks:
             hooks.shutdown()
             hooks.server_close()
@@ -3729,12 +3756,35 @@ def skills_cmd(action: str, target: str | None, home: str, force: bool = False, 
     return 0
 
 
-def audit_cmd(agent: str | None, n: int, home: str, verify: bool = False, head: str | None = None) -> int:
+def audit_cmd(agent: str | None, n: int, home: str, verify: bool = False, head: str | None = None,
+              anchors: str | None = None, anchor_to: str | None = None) -> int:
+    import aios_auditout
     db = Path(home).resolve() / "aios.db"
     if not db.exists():
         print(f"no audit log: {db} does not exist")
-        return 1 if verify else 0
+        return 1 if verify or anchor_to else 0
     store = Store(str(db))
+    if anchor_to:
+        r = aios_auditout.anchor(store.db, anchor_to)
+        store.db.close()
+        if r["problem"]:
+            print(f"TAMPERED: {r['problem']}. Nothing anchored.")
+            return 1
+        print(f"anchored entry {r['id']} ({r['head']}) in {anchor_to}" if r["written"] else
+              "nothing new to anchor" if r["head"] else "(audit log is empty)")
+        return 0
+    if verify and anchors:
+        a = aios_auditout.verify_anchors(store.db, anchors)
+        if a["ok"] and head is not None:
+            a["chain"] = store.verify_audit(head)
+            a["ok"], a["problem"] = a["chain"]["ok"], a["chain"]["problem"]
+        store.db.close()
+        if not a["ok"]:
+            print(f"TAMPERED: {a['problem']}")
+            return 1
+        print(f"checked {a['chain']['checked']} chained entries against {a['anchors']} anchors in {anchors}: intact")
+        print(f"OK. head: {a['chain']['head'] or '(empty log)'}")
+        return 0
     if verify:
         v = store.verify_audit(head)
         store.db.close()
@@ -3865,6 +3915,11 @@ def status_cmd(home: str, now=None) -> int:
         pending = store.db.execute("SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires>?",
                                    (datetime.now().isoformat(timespec="seconds"),)).fetchone()[0]
         print(f"open alerts: {len(alerts)}   waiting for approval: {pending}")
+        import aios_auditout
+        for s in aios_auditout.status(store.db):
+            print(f"audit sink {s['url']}: {s['behind']} entries not sent yet"
+                  + (f", failing since {s['error_since']}: {s['error']}" if s["error"] else
+                     f", last sent {s['ok_ts']}" if s["ok_ts"] else ""))
         for al in alerts[:10]:
             print(f"  #{al['id']} {al['ts']} [{al['severity']}] {al['rule']}: {al['detail']}")
         return 0 if hb["state"] != "down" and not alerts and not pending else 1
@@ -4059,6 +4114,7 @@ def approve_timeout(a, ap) -> float | None:
 
 
 def cli():
+    import aios_auditout
     import aios_schedule
     ap = argparse.ArgumentParser(prog="aios", description="Minimal AIOS")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -4099,6 +4155,10 @@ def cli():
     au.add_argument("--verify", action="store_true",
                     help="check the hash chain for edited, removed or inserted entries (exit 1 if tampered)")
     au.add_argument("--head", help="with --verify: a head printed earlier, which must still be in the chain")
+    au.add_argument("--anchors", metavar="FILE", help="with --verify: also check every anchor in this file "
+                    "(written by --anchor or the daemon's --anchor)")
+    au.add_argument("--anchor", metavar="FILE", help="append the current chain head to FILE (after checking the "
+                    "chain and FILE's earlier anchors); keep FILE where aios.db cannot reach")
     c.add_argument("--embed-model", help="enable vector memory search with this embedding model "
                    "(OpenAI-compatible /embeddings, e.g. nomic-embed-text on Ollama)")
     c.add_argument("--embed-url", default="http://localhost:11434/v1",
@@ -4131,6 +4191,13 @@ def cli():
     add_mcp_flags(dm)
     dm.add_argument("--webhook-port", type=int, metavar="PORT",
                     help="accept POST /hook/<job> on 127.0.0.1:PORT for `on webhook` jobs (off by default)")
+    dm.add_argument("--audit-sink", metavar="URL", help="POST every new audit entry, of any AIOS process on this "
+                    "aios.db, to URL as JSON batches (https, or http to this machine; Bearer token from "
+                    "AIOS_AUDIT_SINK_TOKEN). Nothing is dropped while it is down")
+    dm.add_argument("--anchor", metavar="FILE", help="append the audit chain head to FILE every --anchor-every "
+                    "seconds and at stop; keep FILE on another disk or machine")
+    dm.add_argument("--anchor-every", type=float, default=3600, metavar="SECONDS",
+                    help="seconds between anchors (default 3600)")
     jb = sub.add_parser("jobs", help="manage scheduled jobs")
     jb.add_argument("action", choices=["add", "list", "remove", "enable", "disable", "run", "history", "secret"])
     jb.add_argument("args", nargs="*", help='add: <name> "<task>"   others: <name>')
@@ -4229,7 +4296,9 @@ def cli():
                                                a.reduce, a.reduce_task, approve_timeout(a, ap), a.a2a,
                                                a.timeout)))
     if a.cmd == "audit":
-        raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head))
+        if a.anchors and not a.verify:
+            ap.error("--anchors goes with --verify (to write an anchor, use --anchor FILE)")
+        raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head, a.anchors, a.anchor))
     if a.cmd == "doctor":
         raise SystemExit(doctor_cmd(a.home))
     if a.cmd == "status":
@@ -4269,9 +4338,14 @@ def cli():
             ap.error("--approve-timeout must be shorter than --timeout (the job would be stopped first)")
         check_daily_flags(a, ap)
         check_mcp_flags(a, ap)
+        if a.audit_sink and (why := aios_auditout.check_url(a.audit_sink)):
+            ap.error(f"--audit-sink {a.audit_sink}: {why}")
+        if a.anchor_every <= 0:
+            ap.error("--anchor-every must be positive")
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
                                   a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
-                                  a.mcp, set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress))
+                                  a.mcp, set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress,
+                                  audit_sink=a.audit_sink, anchor_path=a.anchor, anchor_every=a.anchor_every))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         check_daily_flags(a, ap)
