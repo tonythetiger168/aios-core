@@ -702,6 +702,7 @@ class Agent:
     run_budget: object = None  # the Budget of the run in progress (delegated sub-tasks reuse it)
     ledger: object = None  # aios_swarm.Ledger shared by all helpers of a swarm (tokens/cost summed)
     run_counts: dict = field(default_factory=dict)  # max_calls counters of the run in progress
+    run_id: str = ""  # groups the run's file writes for `aios undo` (aios_checkpoint)
 
     def __post_init__(self):
         for key, sc in self.scopes.items():
@@ -989,6 +990,8 @@ class Kernel:
 
         t_in = t_out = steps = last_in = 0
         counts = agent.run_counts = {}  # per-run call counters for max_calls (swarm jobs count too)
+        import aios_checkpoint
+        agent.run_id = aios_checkpoint.new_run_id()
         repeats: dict[str, int] = {}  # loop guard: calls per (tool, arguments) this run
         loop_strikes = 0  # model calls in a row that asked only for calls the loop guard refused
         stop, answer = "max_steps", "(max steps reached)"
@@ -2205,14 +2208,19 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
                       "(parent folders are created).",
                       {"path": {"type": "string", "description": "relative path"},
                        "content": {"type": "string"}},
-                      required=["path", "content"])
-    async def write_file(path: str, content: str):
+                      required=["path", "content"], ctx=True)
+    async def write_file(path: str, content: str, agent: Agent):
+        import aios_checkpoint
         if len(content) > FILE_MAX_CHARS:
             raise ValueError(f"content too large (max {FILE_MAX_CHARS} chars)")
         p = resolve(path)
+        data = content.replace("\n", os.linesep).encode("utf-8")  # what write_text would write
+        if not agent.run_id:  # tools called outside a kernel run (`aios serve`): one group per session
+            agent.run_id = aios_checkpoint.new_run_id()
+        aios_checkpoint.record(k.store.db, agent.name, agent.run_id, WORKSPACE, p, data)  # for `aios undo`
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
-        p.write_text(content, encoding="utf-8")
+        p.write_bytes(data)
         return f"{'overwrote' if existed else 'created'} {p.relative_to(WORKSPACE).as_posix()}"
 
     @k.tools.register("list_files", "List files in the agent workspace, optionally under a subfolder.",
@@ -3639,6 +3647,43 @@ def audit_cmd(agent: str | None, n: int, home: str, verify: bool = False, head: 
     return 0
 
 
+def undo_cmd(home: str, run: str | None = None, agent: str | None = None, list_only: bool = False,
+             force: bool = False, dry_run: bool = False) -> int:
+    """`aios undo`: put back the workspace files a run changed (see aios_checkpoint)."""
+    import aios_checkpoint as cp
+    base = Path(home).resolve()
+    db = base / "aios.db"
+    if not db.exists():
+        print("(nothing to undo)")
+        return 0
+    store = Store(str(db))
+    try:
+        if list_only:
+            rows = cp.runs(store.db, agent)
+            for r in rows:
+                files = ", ".join(r["paths"][:5]) + (f" (+{len(r['paths']) - 5} more)" if len(r["paths"]) > 5 else "")
+                print(f"{r['run']:<22} {r['agent']:<14} {r['last']:<19} {'undone ' if r['undone'] else ''}{files}")
+            print("Undo one: aios undo --run <id>" if rows else "(no runs changed workspace files)")
+            return 0
+        run = run or cp.latest(store.db, agent)
+        if not run:
+            print("(nothing to undo)")
+            return 0
+        report = cp.undo(store.db, base / "workspace", run, force=force, dry_run=dry_run)
+        if not report:
+            print(f"run {run}: nothing left to undo")
+            return 1
+        for path, what in report:
+            print(f"{'(dry run) ' if dry_run else ''}{path}: {what}")
+        skipped = sum(what.startswith("skipped") for _, what in report)
+        if not dry_run:
+            store.log_audit("(user)", "undo", {"run": run, "force": force},
+                            "; ".join(f"{p}: {w}" for p, w in report), "error" if skipped else "ok")
+        return 1 if skipped else 0
+    finally:
+        store.db.close()
+
+
 def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None, days: int = 30,
                dry_run: bool = False, now=None) -> int:
     import aios_keeper as mk
@@ -3990,6 +4035,13 @@ def cli():
     me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
     me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
     me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    ud = sub.add_parser("undo", help="put back the workspace files an agent's run wrote (latest run by default)")
+    ud.add_argument("--list", action="store_true", help="show recent runs that changed files, newest first")
+    ud.add_argument("--run", help="undo this run (an id from --list) instead of the latest")
+    ud.add_argument("--agent", help="only this agent's runs")
+    ud.add_argument("--force", action="store_true", help="also put back files changed after the run")
+    ud.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
+    ud.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     sx = sub.add_parser("service", help="print a systemd / launchd / Task Scheduler definition that keeps the daemon running",
                         usage="aios service {systemd,launchd,windows} [--home HOME] [-- DAEMON FLAGS...]")
     sx.add_argument("kind", choices=["systemd", "launchd", "windows"])
@@ -4081,6 +4133,8 @@ def cli():
         if a.days < 1:
             ap.error("--days must be at least 1")
         raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
+    if a.cmd == "undo":
+        raise SystemExit(undo_cmd(a.home, a.run, a.agent, a.list, a.force, a.dry_run))
     if a.cmd == "service":
         import aios_service
         try:
