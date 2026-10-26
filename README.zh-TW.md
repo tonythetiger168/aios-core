@@ -17,7 +17,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
-- **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
+- **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時優先選用，否則改用 AppContainer。
@@ -195,6 +195,22 @@ python aios.py memory archived              # 不會遺失：memory restore <代
 
 - tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
 - restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
+
+## 還原一次執行
+
+`write_file` 建立或覆寫檔案之前，AIOS 會把原本的內容存進 `aios.db`。`aios undo` 可以把工作區還原成某次執行之前的樣子：
+
+```bash
+python aios.py undo --list                  # 最近改過檔案的執行，最新的在前
+python aios.py undo --dry-run               # 還原最近一次執行會做什麼
+python aios.py undo                         # 還原最近一次執行（--agent NAME：該代理最近一次）
+python aios.py undo --run 20261026-101500-ab12   # 指定 --list 列出的某次執行
+```
+
+- 被覆寫的檔案會恢復成執行前的內容，該次執行新建的檔案會被刪除。同一次執行對同一個檔案寫了好幾次，也會一次還原。
+- 執行之後又被改過的檔案（你自己改的，或之後的執行改的）會被跳過，`undo` 以 1 結束，所以較新的成果不會被悄悄丟掉。請先還原較晚的執行，或加上 `--force`。
+- 每次還原都會寫進審計日誌。版本保留 30 天；原本超過 1 MB 的檔案不會保存（還原時會說明）。
+- 不涵蓋：`run_python`（它只能寫自己的暫存資料夾）與 MCP 工具（它們寫到伺服器能寫的任何地方）。
 
 ## 技能（Skills）
 
@@ -432,7 +448,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | 階段 | 時間 | 目標 | 完成標準 |
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
-| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
+| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |

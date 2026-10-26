@@ -17,7 +17,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Kernel**: async task queue with a worker pool; each agent is a "process" with its own permissions, history and memory.
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
-- **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8.
+- **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8. Every write is checkpointed: `aios undo` puts back what a run changed (see [Undoing a run](#undoing-a-run)).
 - **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (the default): separate process, CPU/memory/file-size limits, a cap on new processes (Linux, not as root), no network (Linux with unprivileged user namespaces; else at least no TCP via Landlock), and on Linux 5.13+ [Landlock](https://docs.kernel.org/userspace-api/landlock.html) file confinement: it reads only Python, system libraries and the workspace, and writes only its own throwaway folder. On macOS, `sandbox-exec` gives it no network and keeps it out of home and temp folders. On Windows it runs in an [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) inside a job object: no network at all (loopback included), no access to your user folder (it reads Windows, Program Files, Python and the workspace, and writes only its own folder), and limits on memory per process, CPU time and processes, with everything it started killed at the end. AIOS grants its container (`aios.sandbox`, SID shown by `aios doctor`) read access to Python's folder once; undo with `icacls <folder> /remove *<SID>`.
   - `docker`: a throwaway container per call with no network, **nothing from your machine mounted**, a read-only root, an unprivileged user, all capabilities dropped and memory/CPU/process caps. Designed for Linux containers, including Docker Desktop on macOS/Windows; actual enforcement depends on the daemon and platform, and AIOS refuses a daemon that reports it cannot enforce the limits (for example rootless Docker without cgroup delegation, which would silently ignore them; see [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)). Real-Docker CI covers Ubuntu, rootful and rootless. The image is never pulled for you: run `docker pull python:3.12-slim` once. Pin it with `AIOS_DOCKER_IMAGE=python@sha256:<digest>` so a changed tag cannot swap what runs (the startup message prints the line to use; see [pinning](docs/docker-sandbox-validation.md#image-pinning-and-trust)). On Windows `auto` prefers it when it is ready, and uses the AppContainer otherwise.
@@ -195,6 +195,22 @@ python aios.py memory archived              # nothing is lost: memory restore <a
 
 - Tidy moves old unverified notes to an archive instead of deleting them, and never touches your notes or the model's. It also drops cached vectors whose note changed or is gone (they are rebuilt on demand), and lists notes with the same text under several keys without changing them.
 - Restore puts the note back as unverified, and refuses if a newer note with that key exists. No model is involved: deciding what an agent keeps believing is what an injected note would like to influence.
+
+## Undoing a run
+
+Before `write_file` creates or overwrites a file, AIOS saves what was there in `aios.db`. `aios undo` puts the workspace back the way it was before a run:
+
+```bash
+python aios.py undo --list                  # recent runs that changed files, newest first
+python aios.py undo --dry-run               # what undoing the latest run would do
+python aios.py undo                         # undo the latest run (--agent NAME: that agent's latest)
+python aios.py undo --run 20261026-101500-ab12   # a specific run from --list
+```
+
+- Overwritten files get their pre-run content back; files the run created are removed. Several writes to one file in a run are undone in one go.
+- A file changed again after the run (by you or a later run) is skipped, and `undo` exits 1, so newer work is never thrown away silently. Undo the later run first, or pass `--force`.
+- Each undo is written to the audit log. Versions are kept 30 days; a previous file over 1 MB is not kept (undo says so).
+- Not covered: `run_python` (it can only write its own temporary folder) and MCP tools, which write wherever their server can.
 
 ## Skills
 
@@ -432,7 +448,7 @@ Months are relative estimates (month 1 = project start) and will move.
 | Phase | When | Goal | Exit criterion |
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
-| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) · ✅ loop guard (`--max-repeats`) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
+| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) · ✅ loop guard (`--max-repeats`) · ✅ workspace undo (`aios undo`) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
 | **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`) · ✅ public registry on GitHub Pages, built from `registry/` · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
