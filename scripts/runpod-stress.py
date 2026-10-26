@@ -47,7 +47,7 @@ vllm serve "$MODEL" --port 8000 --max-model-len 4096 --max-num-seqs 256 --disabl
     > /results/vllm.log 2>&1 &
 until curl -sf localhost:8000/v1/models >/dev/null; do sleep 5; done
 echo "vllm ready"; nvidia-smi --query-gpu=name,memory.total --format=csv > /results/gpu.csv
-git clone --depth 1 "$REPO" /aios
+git init -q /aios && git -C /aios fetch -q --depth 1 "$REPO" "$REF" && git -C /aios checkout -q FETCH_HEAD
 python3 /aios/scripts/stress-swarm.py --model-kind openai --base-url http://localhost:8000/v1 \
     --model "$MODEL" --start "$START" --factor "$FACTOR" --max "$MAX_AGENTS" --timeout 600 \
     --out /results/ramp.jsonl > /results/ramp.md 2> /results/stress.log
@@ -88,6 +88,7 @@ def fetch(pod, name):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ref", default="main", help="branch, tag or commit of aios-core the pod tests")
     ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct", help="Hugging Face model vLLM serves")
     ap.add_argument("--gpu", action="append", help="GPU type id, in order of preference (default: every card "
                     "in GPUS under --max-price)")
@@ -125,7 +126,7 @@ def main():
     if not a.yes and input("rent it? [y/N] ").strip().lower() != "y":
         return
     env = {"MODEL": a.model, "START": str(a.start), "FACTOR": str(a.factor), "MAX_AGENTS": str(a.max),
-           "MAX_MINUTES": str(a.max_minutes), "REPO": REPO, "RUNPOD_API_KEY": key}
+           "MAX_MINUTES": str(a.max_minutes), "REPO": REPO, "REF": a.ref, "RUNPOD_API_KEY": key}
     pod = None
     for cloud, cards in plan:
         try:
