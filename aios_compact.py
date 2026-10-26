@@ -11,6 +11,8 @@ so it is stored as tainted and keeps every later run tainted (no auto-approval) 
 """
 import json
 
+import aios_media
+
 COMPACT_AT = 30  # messages in history before older ones are summarised (below HISTORY_LIMIT, so none drop)
 COMPACT_CHARS = 120_000  # ... or this many characters of history (~30k tokens), whichever comes first
 COMPACT_KEEP = 10  # newest messages kept word for word (at least the last full turn)
@@ -28,8 +30,24 @@ SYSTEM = (
     "summary only.")
 
 
+def _no_data(c):
+    """Content with images/PDFs replaced by a short description: their base64 is not text to fold."""
+    if not isinstance(c, list):
+        return c
+    return [{"type": "text", "text": aios_media.describe(b)} if aios_media.is_media(b)
+            else {**b, "content": _no_data(b["content"])} if isinstance(b, dict) and isinstance(b.get("content"), list)
+            else b for b in c]
+
+
 def size(history: list[dict]) -> int:
-    return sum(len(json.dumps(m["content"], ensure_ascii=False)) for m in history)
+    return sum(len(json.dumps(_no_data(m["content"]), ensure_ascii=False)) for m in history)
+
+
+def _plain_user(m: dict) -> bool:
+    """A user turn (text, maybe with attachments), not a message carrying tool results."""
+    c = m["content"]
+    return m["role"] == "user" and (isinstance(c, str) or not any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in c))
 
 
 def due(history: list[dict], at: int | None, max_chars: int | None = COMPACT_CHARS) -> bool:
@@ -41,7 +59,7 @@ def due(history: list[dict], at: int | None, max_chars: int | None = COMPACT_CHA
 def split_point(history: list[dict], keep: int = COMPACT_KEEP) -> int:
     """Index where the kept tail starts: a plain user turn (never an orphaned tool_result), about
     `keep` messages from the end. 0 = nothing can be folded."""
-    starts = [i for i, m in enumerate(history) if m["role"] == "user" and isinstance(m["content"], str)]
+    starts = [i for i, m in enumerate(history) if _plain_user(m)]
     before = [i for i in starts if 0 < i <= len(history) - keep]
     if before:
         return before[-1]
@@ -66,12 +84,14 @@ def render(msgs: list[dict]) -> str:
             t = b.get("type")
             if t == "text":
                 lines.append(f"{who}: {b.get('text', '')}")
+            elif aios_media.is_media(b):
+                lines.append(f"{who} attached {aios_media.describe(b)}")
             elif t == "tool_use":
                 args = json.dumps(b.get("input", {}), ensure_ascii=False)
                 lines.append(f"Agent called {b.get('name')}({_clip(args, BLOCK_CHARS)})")
             elif t == "tool_result":
                 tag = "error" if b.get("is_error") else "result"
-                lines.append(f"Tool {tag}: {_clip(str(b.get('content', '')), BLOCK_CHARS)}")
+                lines.append(f"Tool {tag}: {_clip(aios_media.summary(b.get('content', '')), BLOCK_CHARS)}")
     text = "\n".join(lines)
     return text if len(text) <= INPUT_CHARS else "[older part cut]\n" + text[-INPUT_CHARS:]
 

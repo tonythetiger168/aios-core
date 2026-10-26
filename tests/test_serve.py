@@ -48,7 +48,7 @@ class WorkspaceCase(unittest.IsolatedAsyncioTestCase):
 class GatewayTests(WorkspaceCase):
     async def test_default_offer_is_read_only(self):
         names = {t["name"] for t in self.gateway().tools()}
-        self.assertEqual(names, {"now", "read_file", "list_files", "recall", "list_facts"})
+        self.assertEqual(names, {"now", "read_file", "view_file", "list_files", "recall", "list_facts"})
 
     async def test_read_is_tagged_audited_and_taints_the_session(self):
         gw = self.gateway()
@@ -168,6 +168,15 @@ def fake_mcp(script=None):
     class TextContent(Tool):
         pass
 
+    class ImageContent(Tool):
+        pass
+
+    class EmbeddedResource(Tool):
+        pass
+
+    class BlobResourceContents(Tool):
+        pass
+
     class Server:
         def __init__(self, name, instructions=None):
             seen["name"], seen["instructions"] = name, instructions
@@ -201,6 +210,8 @@ def fake_mcp(script=None):
     mods["mcp.server.lowlevel"].Server = Server
     mods["mcp.server.stdio"].stdio_server = stdio_server
     mods["mcp.types"].Tool, mods["mcp.types"].TextContent = Tool, TextContent
+    mods["mcp.types"].ImageContent, mods["mcp.types"].EmbeddedResource = ImageContent, EmbeddedResource
+    mods["mcp.types"].BlobResourceContents = BlobResourceContents
     return mods, seen
 
 

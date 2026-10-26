@@ -19,6 +19,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
 - **對話壓縮**：聊天超過 30 則訊息（或約 120,000 字元）時，較舊的回合會由模型寫成摘要並取代原文；最新約 10 則訊息保持原樣，下一次壓縮會以上一份摘要為基礎繼續累積。以前舊訊息只會直接掉出上下文。摘要呼叫計入這次執行的預算；預算不夠或呼叫失敗時就跳過（舊訊息照舊掉出上下文）；每次壓縮都以 `(compact)` 記在審計日誌。讀過不可信內容的回合所寫成的摘要會標記為受污染，聊天會一直保持受污染（不自動核准），直到 `/reset` 連同歷史一起清掉。`/summary` 顯示摘要，`chat --compact-at N` 調整門檻，`--compact-at 0` 關閉。定時任務、子代理與 A2A 對話不壓縮（它們每次從空白開始或從不保存）。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
+- **圖片與 PDF（多模態輸入）**：在對話中用 `/attach <檔案>` 把圖片或 PDF 附在下一則訊息（`/attach` 列出、`/detach` 移除），或讓 agent 用 `view_file` 查看工作區裡的檔案。MCP 工具回傳的圖片（例如瀏覽器伺服器的螢幕截圖）會以圖片交給模型，不再被丟掉。支援 PNG、JPEG、GIF、WebP（上限 5 MB）與 PDF（上限 20 MB）；檔案類型依檔案內容判斷，不看副檔名。每個 agent 的歷史只保留最新 4 個圖片／PDF（較舊的換成一行說明），長對話不會在每一步都重送所有圖片。使用 `--provider openai` 時，圖片以 `image_url` 傳送（需要支援視覺的模型），PDF 則換成一行說明。附加的檔案和 agent 讀到的檔案一樣算不可信內容：圖片或 PDF 裡也可能寫著指令。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時優先選用，否則改用 AppContainer。
@@ -28,7 +29,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
 - **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
-- **不可信內容標記＋污染政策**：`read_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
+- **不可信內容標記＋污染政策**：`read_file`、`view_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出，以及你用 `/attach` 附加的檔案，都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
 - **速率限制**（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)）：政策中的代理可以在滑動時間窗內限制模型呼叫與工具呼叫次數，例如 `[agents.reporter.rate]` 底下寫 `model = "30/min"` 與 `tools = { "*" = "200/hour", fetch_url = "10/min" }`（單位為 `s`、`min`、`hour`、`day`，可加倍數如 `5/30s`；符合的工具限制全部都要遵守）。和 `max_calls` 不同，它跨越多次執行：次數記在 `aios.db`，所以同一代理的所有對話、定時任務、協作代理與 `serve`/`a2a-serve` 連線共用同一額度，跨程序、重新啟動後也不會歸零。超過限制的工具呼叫會被拒絕（狀態 `denied`，並告知多久後可重試）；超過限制的模型呼叫最多等 60 秒，等不到就停止這次執行，狀態為 `rate`。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
@@ -44,7 +45,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
-- **CLI**：互動式對話，支援 `/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
+- **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
 
 ## 快速開始
 
@@ -73,6 +74,7 @@ python aios.py chat --sandbox docker          # run_python 改在用完即丟的
 python aios.py chat --skill examples/skills/meeting-notes        # 載入你已固定的技能（見「技能」）
 python aios.py chat --embed-model nomic-embed-text               # 同時依語意搜尋記憶（需先 `ollama pull nomic-embed-text`）
 python aios.py chat --auto-approve          # 乾淨的執行略過 [y/N] 詢問（不安全）
+#   對話中：/attach screenshot.png   接著就可以問它（圖片與 PDF；見「目前可用的功能」）
 python aios.py demo                         # 腳本化示範（高風險工具會被拒絕）
 python aios.py doctor                       # 這台機器能給 AIOS 什麼：沙箱隔離程度、選用套件、審計日誌是否完好
 ```
@@ -292,7 +294,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 ```
 
 - 客戶端被當成模型看待：**不受信任**。權限、範圍、審計日誌與 `<untrusted>` 標記都和 `chat` 相同。
-- 沒有政策檔時只提供唯讀工具（`now`、`read_file`、`list_files`、`recall`、`list_facts`）。
+- 沒有政策檔時只提供唯讀工具（`now`、`read_file`、`view_file`、`list_files`、`recall`、`list_facts`）。`view_file` 以 MCP 圖片內容回傳（PDF 則是內嵌資源）。
 - stdio 上沒有人能回答 `[y/N]`，所以高風險工具（`write_file`、`run_python`、被污染後的 `remember`）一律**拒絕**，除非政策用 `auto_paths` 預先允許某些路徑。只要這次連線讀過檔案，連這些也會被拒絕，直到伺服器重啟。
 - `max_calls` 以伺服器連線為單位計算。所有資料都放在 `--home` 底下（`aios.db`、`workspace/`）。
 - **狀態**：支援官方 `mcp` SDK 1.x 與 2.x。CI 會用 SDK 自己的 stdio 客戶端驅動 `aios serve`（初始化、列出、呼叫、拒絕、稽核），兩個版本都測，也會讓 aios 連上真正的 SDK 伺服器。尚未用 Claude Desktop 或其他圖形介面客戶端試過：如果你的客戶端連不上或列不出工具，請開 issue 並附上 stderr 輸出。
@@ -382,6 +384,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|
 | `now` | 目前本地日期與時間 |
 | `read_file`／`write_file`／`list_files` | 僅限工作區的檔案存取 |
+| `view_file` | 查看工作區裡的圖片（PNG、JPEG、GIF、WebP）或 PDF |
 | `remember`／`recall`／`list_facts` | 每個 agent 各自的長期記憶 |
 | `run_python` | 沙箱化 Python（`--sandbox process`、`docker` 或 `microvm`） |
 | `fetch_url` | 以純文字抓取公開網頁（GET）。policy 沒列出就不會授權；每次抓取都要有人核准，或符合 `auto_args` 的網址樣式。不會自動跟隨轉址（回應會寫出新網址，抓它是另一次、會再檢查的呼叫），拒絕本機與私有網路位址，最多讀 1 MB。抓回的內容視為不可信，會讓這次執行受污染 |
@@ -464,7 +467,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
