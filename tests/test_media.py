@@ -220,6 +220,35 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prov.calls[1]["messages"][-1]["content"], "and this?")  # sent once
 
 
+class CompactionTests(unittest.TestCase):
+    def history(self):
+        big = aios_media.block(PNG + b"\0" * 200_000)  # ~270k chars of base64
+        return [{"role": "user", "content": [big, text("what is this?")]},
+                {"role": "assistant", "content": [tool_use("view_file", {"path": "a.png"})]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1",
+                                              "content": aios.tag_untrusted("view_file", [big])}]},
+                {"role": "assistant", "content": [text("a chart")]},
+                {"role": "user", "content": "thanks"},
+                {"role": "assistant", "content": [text("you're welcome")]}]
+
+    def test_image_data_does_not_count_as_history_size(self):
+        import aios_compact
+        self.assertLess(aios_compact.size(self.history()), 2000)
+        self.assertFalse(aios_compact.due(self.history(), at=30))
+
+    def test_an_attachment_turn_can_start_the_kept_tail(self):
+        import aios_compact
+        h = self.history()
+        self.assertEqual(aios_compact.split_point(h[2:] + h[:2] + h[2:4], keep=4), 4)
+
+    def test_rendered_turns_describe_media_without_data(self):
+        import aios_compact
+        out = aios_compact.render(self.history())
+        self.assertIn("User attached [image/png", out)
+        self.assertIn("image/png", out.split("Tool result:")[1])
+        self.assertNotIn(b64(PNG)[:20], out)
+
+
 class OpenAIWireTests(unittest.TestCase):
     def test_images_become_image_url_parts_and_pdfs_a_note(self):
         msgs = [{"role": "user", "content": [aios_media.block(PNG), aios_media.block(PDF), text("what?")]}]
