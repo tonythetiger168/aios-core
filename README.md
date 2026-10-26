@@ -25,6 +25,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **MCP client**: attach stdio MCP servers; their tools are registered as `<server>__<tool>` and are *not* granted to agents unless you allow them. `--confine-mcp NAME` runs that server without access to your files: it reads only Python, system libraries, its own program and the files named in its command, writes only a throwaway home folder, and keeps the network (Landlock on Linux 5.13+, `sandbox-exec` on macOS; refused elsewhere). `--offline-mcp NAME` does the same and also takes the network away, for servers that need none (a calculator, a local database tool): with its own network namespace (or `sandbox-exec`) it cannot send anything out; with Landlock alone only TCP is blocked and AIOS says so at start. `--mcp-egress 'NAME=api.github.com,*.example.com'` is for servers that call one API: no network either, except HTTPS to the hosts listed (`host`, `*.domain` for its subdomains, `host:port` for a port other than 443), through a proxy AIOS runs that checks every name resolves to a public address and writes every connection, allowed or refused, to the audit log (needs its own network namespace or `sandbox-exec`; the server must honor `HTTPS_PROXY`, which Python, Go and curl do and Node 24+ does with the `NODE_USE_ENV_PROXY=1` AIOS sets). `aios doctor` shows which you get.
 - **Model providers**: Anthropic (default) or any OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp) via `--provider openai --model <name>`. The openai provider uses the standard library only; the `anthropic` package is imported only when you use Anthropic.
 - **Budgets**: per-run limits on model calls (`--max-steps`), tokens (`--max-tokens`) and cost (`--max-cost` with `--price-in/--price-out`). A run that hits a limit stops *before* running more tools and says why. Each run's usage is written to the audit log.
+- **Loop guard**: a model that asks for the same tool with exactly the same arguments more than 3 times in one run (`--max-repeats`, 0 = off) gets an error instead of another call; if its next reply asks only for such calls again, the run stops (`stop=loop` in the audit log, a `loop-stop` alert). A stuck model or an injected loop then costs a few calls, not the whole budget.
 - **Human approval**: `write_file`, `run_python` and every MCP tool ask you `[y/N]` before running. With no approver configured (e.g. `demo`, library use) they are refused. `--auto-approve` turns the prompt off; unsafe.
 - **Untrusted-content tagging + taint policy**: output of `read_file`, `list_files`, `run_python` and every MCP tool is wrapped in `<untrusted>` tags (fake closing tags inside are defused) and the system prompt tells the model never to obey it. While such content is in the context, the run is *tainted*: `--auto-approve` stops applying, every risky call needs a person at the prompt (shown with a warning), and `remember` needs approval too, so injected text cannot silently poison memory.
 - **Capability scopes**: beyond tool names, limit a tool to workspace paths (`paths`), skip the prompt for safe paths in clean runs (`auto_paths`) and cap calls per run (`max_calls`). Argument rules (`args`) allow or deny values of any argument with glob patterns and a length cap, so MCP tools are no longer all-or-nothing (for example a fetch tool limited to `https://docs.python.org/*`), and `auto_args` skips the prompt for pre-approved values the same way `auto_paths` does for paths. Set them in code (`Agent(..., scopes=...)`) or in a TOML file: `--policy policy.example.toml` (Python 3.11+). Typos in a policy fail loudly instead of silently allowing.
@@ -157,6 +158,7 @@ python aios.py alerts --home ~/aios-data     # open alerts; --ack <id>|all, --al
 | `unattended-refused` | warning | a job tried a risky call its policy does not pre-allow |
 | `refusal-spike` | warning | one agent was refused 10 or more times |
 | `budget-stop` | info | a run stopped on its token or cost budget |
+| `loop-stop` | warning | the loop guard stopped a run that kept repeating the same tool call |
 | `job-failing` | warning | a job's last 3 runs ended in error or timeout |
 | `audit-tampered` | critical | the audit log's hash chain no longer checks out (whole log, not just 15 minutes), or no longer matches the `--anchor` file |
 | `audit-sink-failing` | warning | `--audit-sink` has been failing for 15 minutes or more |
@@ -309,12 +311,28 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *Worker pool and backpressure*: a fixed pool of `--parallel` workers (default 8) pulls from the task list, so 100,000 tasks never mean 100,000 runs in memory, and a task file is read only when a worker is free.
 - *Rate limit*: every model call of every agent in the process waits for one of `--model-slots` slots (default 16). Nested swarms and parallel jobs share them, so the provider never sees more requests at once than that, whatever the fan-out.
 - *Shared budget*: all workers of one swarm spend from one ledger, `--swarm-max-tokens` (default 1,000,000) and `--swarm-max-cost` (with prices). When it runs out, no new task starts (the rest are reported `skipped`) and running workers stop before their next model call. A swarm inside a swarm also charges its parent's ledger. Each worker still has its own per-run budget.
-- *How far it goes*: one process has run 131,072 agents at once with a fake model (no failures, ~2,300 agents/s, ~8 KB each) and 10,000 through HTTP; with a real model the GPU is the limit. `scripts/stress-swarm.py` measures it, `scripts/runpod-stress.py` runs it on one rented GPU; see [docs/stress-test.md](docs/stress-test.md).
+- *How far it goes*: one process has run 131,072 agents at once with a fake model (no failures, ~2,300 agents/s, ~8 KB each) and 10,000 through HTTP; with a real model the GPU is the limit (one RTX 3090: 4,096 at once, 55-80 agents/s). `scripts/stress-swarm.py` measures it, `scripts/runpod-stress.py` runs it on one rented GPU; see [docs/stress-test.md](docs/stress-test.md).
 - *Isolation of failures*: each task has a timeout (`--timeout`, default 600 s); an error or timeout in one never stops the others, and cancelling the swarm cancels every worker.
 - *Combining large results*: `reduce` packs answers into bounded groups and has the reducer combine them in rounds until one answer is left, so a thousand answers never land in one prompt. Without `reduce`, the lead gets each answer clipped (1,500 chars, 20,000 in total).
 - *Database*: the SQLite store now uses WAL, so hundreds of workers can write audit entries without stalling, and the console reads while they do. Tested with 3,000 tasks, 400 workers and 150 model slots.
 
 **Security.** Workers inherit the lead's taint, as in delegation: if the lead has read untrusted content, no worker gets `auto_paths`/`auto_args`. The reducer always runs tainted, because the answers it reads may carry text the workers read. The swarm's answer is tagged untrusted. `max_calls` on `agent__<name>` counts every swarm task. Approvals are asked one at a time, so a swarm that needs many is slow by design; for unattended swarms pre-allow what workers may do with scopes. Every task is audited under the caller's name with a shared swarm id. `aios swarm` tasks are the operator's own, so they run untainted.
+
+**Load test.** How many agents one AIOS process runs at once, measured with `scripts/stress-swarm.py` (agents doubled each level until something breaks; full numbers in [docs/stress-test.md](docs/stress-test.md)):
+
+- *AIOS alone* (fake model answering in 1 s, 4 vCPUs): 131,072 agents at once with no failures. The scheduler handles ~2,300 agents/s with ~8 KB each; 10,000 agents finish in 3.4 s using 111 MB.
+- *Real model*: one rented RTX 3090 24 GB running vLLM with `Qwen/Qwen2.5-3B-Instruct` (11 minutes, about US$0.05 on RunPod, via `scripts/runpod-stress.py`):
+
+| agents at once | ok | failed | all done (s) | agents/s | median wait (s) |
+|---|---|---|---|---|---|
+| 1 | 1 | 0 | 0.07 | 14 | 0.07 |
+| 16 | 16 | 0 | 0.29 | 55 | 0.29 |
+| 128 | 128 | 0 | 1.6 | 80 | 1.6 |
+| 512 | 512 | 0 | 6.3 | 82 | 6.2 |
+| 1,024 | 1,024 | 0 | 18.2 | 56 | 12.2 |
+| 4,096 | 4,096 | 0 | 51.7 | 79 | 29.6 |
+
+  The GPU is the limit at 55-80 agents/s: past ~16 agents more of them only queue longer, so 10,000 take about 2.5 minutes on one card (add cards to go faster). At 8,192+ the run failed with "can't start new thread"; the HTTP provider now caps its threads at 512 and queues the rest.
 
 ## Architecture
 
@@ -412,12 +430,14 @@ Months are relative estimates (month 1 = project start) and will move.
 | Phase | When | Goal | Exit criterion |
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
-| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
+| **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) · ✅ loop guard (`--max-repeats`) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
 | **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`) · ✅ public registry on GitHub Pages, built from `registry/` · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
 Explicit non-goal for now: writing an actual OS kernel.
+
+Packaging note: the name `aios-core` is already taken on PyPI (by [agiresearch/AIOS](https://github.com/agiresearch/AIOS), since 2024-11), so a PyPI release needs a different package name. Until then, install from GitHub as shown above.
 
 Detailed tracking (gap analysis, per-item status, Gantt chart): [`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx).
 

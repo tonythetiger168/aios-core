@@ -57,6 +57,11 @@ class RuleTests(WatchCase):
         self.st.log_audit("main", wd.RUN_ENTRY, {"task": "t"}, "steps=1 stop=finished", "ok")
         self.assertEqual(self.rules(), [("budget-stop", "main")])
 
+    def test_loop_stop(self):
+        self.st.log_audit("main", wd.RUN_ENTRY, {"task": "t"}, "steps=4 stop=loop", "loop")
+        self.st.log_audit("main", "read_file", {"path": "a"}, "loop guard: ...", "loop")  # one refused call: no alert
+        self.assertEqual(self.rules(), [("loop-stop", "main")])
+
     def test_job_failing_only_after_consecutive_failures(self):
         for status in ("error", "timeout"):
             self.st.add_run("sync", "2026-10-23T09:00:00", status, "boom")

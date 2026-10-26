@@ -25,6 +25,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`--mcp-egress '名稱=api.github.com,*.example.com'` 適合只呼叫某個 API 的伺服器：一樣沒有網路，只能用 HTTPS 連到列出的主機（`host`、`*.domain` 代表其子網域、`host:port` 代表 443 以外的連接埠），經由 AIOS 執行的代理：它會確認名稱只解析到公開位址，並把每次連線（允許或拒絕）寫進審計日誌（需要獨立的網路 namespace 或 `sandbox-exec`；伺服器必須遵守 `HTTPS_PROXY`，Python、Go 與 curl 都會，Node 24+ 則靠 AIOS 設定的 `NODE_USE_ENV_PROXY=1`）。`aios doctor` 會顯示你的機器是哪一種。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
+- **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
@@ -157,6 +158,7 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `unattended-refused` | warning | 定時任務嘗試政策未預先允許的高風險呼叫 |
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
+| `loop-stop` | warning | 迴圈保護停止了一次不斷重複同一個工具呼叫的執行 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
 | `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘），或與 `--anchor` 檔案不符 |
 | `audit-sink-failing` | warning | `--audit-sink` 已連續失敗 15 分鐘以上 |
@@ -309,12 +311,28 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *Worker 池與背壓*：固定 `--parallel` 個 worker（預設 8）從任務清單取工作，所以 10 萬個任務也不會在記憶體裡同時有 10 萬個執行；任務檔只有在有 worker 空出來時才會往下讀。
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
-- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每秒約 2,300 個，每個約 8 KB），經 HTTP 跑過 10,000 個；接真模型時瓶頸是 GPU。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
+- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每秒約 2,300 個，每個約 8 KB），經 HTTP 跑過 10,000 個；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 4,096 個，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
 - *資料庫*：SQLite 改用 WAL，上百個 worker 寫審計日誌時不會卡住，控制台也能同時讀取。已用 3,000 個任務、400 個 worker、150 個模型槽位測試。
 
 **安全性。** 和委派一樣，worker 會繼承領頭代理的污染狀態：領頭代理讀過不可信內容時，所有 worker 的 `auto_paths`／`auto_args` 都失效。彙整代理一律以被污染狀態執行，因為它讀到的答案可能夾帶 worker 讀到的文字。代理群的回覆會被標記為不可信。`agent__<名稱>` 上的 `max_calls` 會計算每一個代理群任務。審批一次只問一個，所以需要大量審批的代理群本來就會慢；無人值守時請用範圍預先允許 worker 能做的事。每個任務都以呼叫者名義寫入審計日誌，並帶有同一個 swarm id。`aios swarm` 的任務來自操作者本人，所以以未污染狀態執行。
+
+**壓力測試。** 單一 AIOS 行程能同時跑多少代理，用 `scripts/stress-swarm.py` 量測（每一級代理數加倍，直到出錯；完整數據見 [docs/stress-test.md](docs/stress-test.md)）：
+
+- *只看 AIOS 本身*（假模型每次 1 秒回答，4 vCPU）：同時 131,072 個代理，0 失敗。排程器每秒處理約 2,300 個代理，每個約 8 KB；10,000 個代理 3.4 秒跑完，用 111 MB。
+- *真模型*：租一張 RTX 3090 24 GB，用 vLLM 跑 `Qwen/Qwen2.5-3B-Instruct`（11 分鐘，RunPod 約 US$0.05，用 `scripts/runpod-stress.py`）：
+
+| 同時代理數 | 成功 | 失敗 | 全部完成（秒） | 每秒代理數 | 中位等待（秒） |
+|---|---|---|---|---|---|
+| 1 | 1 | 0 | 0.07 | 14 | 0.07 |
+| 16 | 16 | 0 | 0.29 | 55 | 0.29 |
+| 128 | 128 | 0 | 1.6 | 80 | 1.6 |
+| 512 | 512 | 0 | 6.3 | 82 | 6.2 |
+| 1,024 | 1,024 | 0 | 18.2 | 56 | 12.2 |
+| 4,096 | 4,096 | 0 | 51.7 | 79 | 29.6 |
+
+  瓶頸是 GPU，每秒 55–80 個代理：超過約 16 個以後，再加代理只會排隊更久，所以一張卡跑 10,000 個約 2.5 分鐘（要更快就加卡）。8,192 個以上時出現「can't start new thread」；HTTP 供應器現在最多開 512 個執行緒，其餘排隊。
 
 ## 架構
 
@@ -412,12 +430,14 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | 階段 | 時間 | 目標 | 完成標準 |
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
-| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
+| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。
+
+套件發布備註：PyPI 上的 `aios-core` 名稱已被 [agiresearch/AIOS](https://github.com/agiresearch/AIOS) 使用（2024-11 起），因此要上架 PyPI 必須換一個套件名稱。在那之前，請照上面的方式從 GitHub 安裝。
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 
