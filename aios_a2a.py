@@ -105,6 +105,27 @@ def text_of(parts) -> str:
 
 
 # ---- serving ----
+
+DRAIN_MAX = 1024 * 1024  # bytes of a refused, oversized request body read and thrown away
+
+
+def drain_body(rfile, n: int, sock=None, limit: int = DRAIN_MAX):
+    """Read and discard up to `limit` bytes of a request body that is refused for its size, so the
+    connection closes cleanly. Closing with unread data makes Windows reset it, and the caller sees
+    "connection aborted" instead of the 413. Stops early when the caller sends less than it claimed."""
+    if sock is not None:
+        sock.settimeout(1)  # a caller that sent less than it claimed is not waited on long
+    left = min(max(n, 0), limit)
+    try:
+        while left > 0:
+            chunk = rfile.read1(min(left, 65536)) if hasattr(rfile, "read1") else rfile.read(min(left, 65536))
+            if not chunk:
+                break
+            left -= len(chunk)
+    except OSError:  # timeout or reset: the refusal is still answered if the socket allows
+        pass
+
+
 class Server:
     """Runs `make_agent()` for each new conversation (context) and `run(agent, text)` for each message,
     a coroutine on `loop` that returns the answer. Requests are handled one at a time."""
@@ -497,6 +518,7 @@ class Server:
                     return self.reply(411, {"error": "Content-Length required"})
                 if not 0 < n <= BODY_MAX:
                     self.close_connection = True
+                    drain_body(self.rfile, n, self.connection)
                     return self.reply(413, {"error": f"body must be 1..{BODY_MAX} bytes"})
                 # read the body before any refusal: closing with it unread resets the connection on
                 # Windows, and the caller sees "connection aborted" instead of our answer
