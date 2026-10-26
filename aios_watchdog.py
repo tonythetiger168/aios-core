@@ -13,9 +13,12 @@ Rules (over the last WINDOW_MINUTES):
   unattended-refused  a scheduled job tried a risky call its policy does not pre-allow
   refusal-spike     one agent was refused DENIED_SPIKE or more times
   budget-stop       a run stopped on its token or cost budget
+  loop-stop         the loop guard stopped a run that kept repeating the same tool call
   job-failing       a job's last JOB_FAIL_RUNS runs all ended in error or timeout
   audit-tampered    the audit log's hash chain no longer checks out: an entry was edited, removed
                     or inserted outside AIOS (checked over the whole log, not just the window)
+  audit-sink-failing  the daemon's --audit-sink has been failing for 15 minutes or more (entries
+                    wait in aios.db and go out once it is back; see aios_auditout)
 The same rule for the same subject is not raised again within COOLDOWN_MINUTES.
 """
 import hashlib
@@ -30,7 +33,8 @@ JOB_FAIL_RUNS = 3
 STALE_AFTER = 120  # seconds without a heartbeat before the daemon counts as down (at least 3 ticks)
 RUN_ENTRY = "(run)"
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
-            "budget-stop": "info", "job-failing": "warning", "audit-tampered": "critical"}
+            "budget-stop": "info", "loop-stop": "warning", "job-failing": "warning", "audit-tampered": "critical",
+            "audit-sink-failing": "warning"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
@@ -135,6 +139,10 @@ def check(db: sqlite3.Connection, now=None) -> list[dict]:
     for agent, result in db.execute("SELECT agent, result FROM audit WHERE tool=? AND status='budget' AND ts>=?",
                                     (RUN_ENTRY, since)).fetchall():
         found.append(("budget-stop", agent, f"a run of {agent} stopped on its budget ({result})."))
+    for agent, result in db.execute("SELECT agent, result FROM audit WHERE tool=? AND status='loop' AND ts>=?",
+                                    (RUN_ENTRY, since)).fetchall():
+        found.append(("loop-stop", agent, f"a run of {agent} kept repeating the same tool call and was stopped "
+                                          f"({result}). Look at its audit trail: a stuck tool or an injected loop."))
     jobs = [j for (j,) in db.execute("SELECT DISTINCT job FROM job_runs").fetchall()]
     for job in jobs:
         last = db.execute("SELECT status FROM job_runs WHERE job=? AND status!='skipped' ORDER BY id DESC LIMIT ?",
@@ -147,9 +155,19 @@ def check(db: sqlite3.Connection, now=None) -> list[dict]:
         if not v["ok"]:
             found.append(("audit-tampered", "audit", f"{v['problem']}. Run `aios audit --verify`; "
                           "do not trust the log past that point."))
+    import aios_auditout
+    found += [("audit-sink-failing", url, detail) for url, detail in aios_auditout.failing(db, now)]
     added = [a for rule, subject, detail in found if (a := _raise(db, now, rule, subject, detail))]
     db.commit()
     return added
+
+
+def alert(db: sqlite3.Connection, rule: str, subject: str, detail: str, now=None) -> dict | None:
+    """Raise one alert from outside the rules (for example a failed anchor check), with the cooldown."""
+    ensure(db)
+    a = _raise(db, now or datetime.now(), rule, subject, detail)
+    db.commit()
+    return a
 
 
 def list_alerts(db: sqlite3.Connection, include_acked: bool = False, n: int = 50) -> list[dict]:

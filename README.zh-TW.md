@@ -17,7 +17,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
-- **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。
+- **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時優先選用，否則改用 AppContainer。
@@ -25,9 +25,11 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`--mcp-egress '名稱=api.github.com,*.example.com'` 適合只呼叫某個 API 的伺服器：一樣沒有網路，只能用 HTTPS 連到列出的主機（`host`、`*.domain` 代表其子網域、`host:port` 代表 443 以外的連接埠），經由 AIOS 執行的代理：它會確認名稱只解析到公開位址，並把每次連線（允許或拒絕）寫進審計日誌（需要獨立的網路 namespace 或 `sandbox-exec`；伺服器必須遵守 `HTTPS_PROXY`，Python、Go 與 curl 都會，Node 24+ 則靠 AIOS 設定的 `NODE_USE_ENV_PROXY=1`）。`aios doctor` 會顯示你的機器是哪一種。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
+- **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
+- **速率限制**（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)）：政策中的代理可以在滑動時間窗內限制模型呼叫與工具呼叫次數，例如 `[agents.reporter.rate]` 底下寫 `model = "30/min"` 與 `tools = { "*" = "200/hour", fetch_url = "10/min" }`（單位為 `s`、`min`、`hour`、`day`，可加倍數如 `5/30s`；符合的工具限制全部都要遵守）。和 `max_calls` 不同，它跨越多次執行：次數記在 `aios.db`，所以同一代理的所有對話、定時任務、協作代理與 `serve`/`a2a-serve` 連線共用同一額度，跨程序、重新啟動後也不會歸零。超過限制的工具呼叫會被拒絕（狀態 `denied`，並告知多久後可重試）；超過限制的模型呼叫最多等 60 秒，等不到就停止這次執行，狀態為 `rate`。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策，並有心跳與規則式看門狗（`aios status`、`aios alerts`；見下）。
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
@@ -38,7 +40,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
-- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。
+- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
 - **CLI**：互動式對話，支援 `/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/reset`、`/quit`。
 
@@ -157,11 +159,27 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `unattended-refused` | warning | 定時任務嘗試政策未預先允許的高風險呼叫 |
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
+| `loop-stop` | warning | 迴圈保護停止了一次不斷重複同一個工具呼叫的執行 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
-| `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘） |
+| `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘），或與 `--anchor` 檔案不符 |
+| `audit-sink-failing` | warning | `--audit-sink` 已連續失敗 15 分鐘以上 |
 
 - 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。告警只負責回報，絕不停止、阻擋或更改任何東西。
 - 「down」代表超過 3 次 tick 加上一次任務逾時（至少 2 分鐘）沒有心跳，所以長時間的任務不會被誤判成守護程式掛掉。把 `aios status` 放進 cron 或監控檢查，守護程式掛掉時就會收到通知。
+
+### aios.db 以外的副本
+
+能寫入 `aios.db` 的人可以重算整條審計鏈，讓 `--verify` 照樣通過。守護程式有兩個選項，把證據放到這個人碰不到的地方（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)，只用標準函式庫）：
+
+```bash
+AIOS_AUDIT_SINK_TOKEN=... python aios.py daemon --home ~/aios-data --policy policy.toml \
+    --audit-sink https://siem.example.com/aios --anchor /mnt/backup/aios-anchors.jsonl
+python aios.py audit --home ~/aios-data --anchor /mnt/backup/aios-anchors.jsonl       # 立刻錨定一次（給 cron 用）
+python aios.py audit --home ~/aios-data --verify --anchors /mnt/backup/aios-anchors.jsonl
+```
+
+- `--audit-sink URL` 把該 `aios.db` 上任何 AIOS 程序（chat、`serve`、`a2a-serve`、定時任務）寫入的每筆新紀錄，以 JSON 批次 POST 出去：`{"source": "aios", "host": ..., "entries": [{"id", "ts", "agent", "tool", "args", "result", "status", "hash"}]}`。由背景執行緒傳送，收集端再慢也不會拖慢任務。送到哪一筆記錄在 `aios.db` 裡：收集端掛掉時紀錄會等著，恢復後（包括重新啟動後）再送出。至少送達一次（可用 `hash` 去掉重複的批次）。只接受 HTTPS，送到本機除外；遇到轉址算失敗；`AIOS_AUDIT_SINK_TOKEN` 會以 `Authorization: Bearer` 送出。參數中名稱像密鑰的欄位（`password`、`token`、`api_key`、`authorization` 等）在副本中會換成 `[redacted]`，但結果照原樣送出，所以只送給你信得過、可以看整份日誌的收集端。`aios status` 會顯示落後多少筆；連續失敗 15 分鐘後看門狗會發出 `audit-sink-failing`。搭配 `--once` 時，會在那一輪結束時盡量送出。
+- `--anchor FILE` 每 `--anchor-every` 秒（預設 3600）以及守護程式停止時，若日誌有新增，就在 FILE 附加一行 `{"ts", "id", "head"}`。每一行把第 `id` 筆紀錄綁定到它的雜湊：之後若日誌在那一筆之前被改寫，或被截短到那一筆之前，`aios audit --verify --anchors FILE` 就會失敗，守護程式下次錨定時也會發出 `audit-tampered`。驗證不過的鏈絕不會被錨定。請把 FILE 放在另一顆磁碟、掛載的共享資料夾或代理所用帳號寫不到的機器上；跟 `aios.db` 放在一起只能防手誤。
 
 ## 照顧記憶
 
@@ -177,6 +195,22 @@ python aios.py memory archived              # 不會遺失：memory restore <代
 
 - tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
 - restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
+
+## 還原一次執行
+
+`write_file` 建立或覆寫檔案之前，AIOS 會把原本的內容存進 `aios.db`。`aios undo` 可以把工作區還原成某次執行之前的樣子：
+
+```bash
+python aios.py undo --list                  # 最近改過檔案的執行，最新的在前
+python aios.py undo --dry-run               # 還原最近一次執行會做什麼
+python aios.py undo                         # 還原最近一次執行（--agent NAME：該代理最近一次）
+python aios.py undo --run 20261026-101500-ab12   # 指定 --list 列出的某次執行
+```
+
+- 被覆寫的檔案會恢復成執行前的內容，該次執行新建的檔案會被刪除。同一次執行對同一個檔案寫了好幾次，也會一次還原。
+- 執行之後又被改過的檔案（你自己改的，或之後的執行改的）會被跳過，`undo` 以 1 結束，所以較新的成果不會被悄悄丟掉。請先還原較晚的執行，或加上 `--force`。
+- 每次還原都會寫進審計日誌。版本保留 30 天；原本超過 1 MB 的檔案不會保存（還原時會說明）。
+- 不涵蓋：`run_python`（它只能寫自己的暫存資料夾）與 MCP 工具（它們寫到伺服器能寫的任何地方）。
 
 ## 技能（Skills）
 
@@ -295,12 +329,29 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
 - *多核心*：`aios swarm --workers N` 把幫手放到 N 個行程裡跑，每個用一顆 CPU 核心（`--workers 0` = 保留一顆，其餘全用）。`--parallel` 與 `--model-slots` 由各行程分攤，預算仍然共用，所有審計紀錄由主行程寫進同一條雜湊鏈。代理內的 `swarm` 工具仍在單一行程中執行。
-- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
+- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
 - *資料庫*：SQLite 改用 WAL，上百個 worker 寫審計日誌時不會卡住，控制台也能同時讀取。已用 3,000 個任務、400 個 worker、150 個模型槽位測試。
 
 **安全性。** 和委派一樣，worker 會繼承領頭代理的污染狀態：領頭代理讀過不可信內容時，所有 worker 的 `auto_paths`／`auto_args` 都失效。彙整代理一律以被污染狀態執行，因為它讀到的答案可能夾帶 worker 讀到的文字。代理群的回覆會被標記為不可信。`agent__<名稱>` 上的 `max_calls` 會計算每一個代理群任務。審批一次只問一個，所以需要大量審批的代理群本來就會慢；無人值守時請用範圍預先允許 worker 能做的事。每個任務都以呼叫者名義寫入審計日誌，並帶有同一個 swarm id。`aios swarm` 的任務來自操作者本人，所以以未污染狀態執行。
+
+**壓力測試。** 單一 AIOS 行程能同時跑多少代理，用 `scripts/stress-swarm.py` 量測（每一級代理數加倍，直到出錯；完整數據見 [docs/stress-test.md](docs/stress-test.md)）：
+
+- *只看 AIOS 本身*（假模型每次 1 秒回答，4 vCPU）：同時 131,072 個代理，0 失敗。排程器每秒處理約 2,300 個代理，每個約 8 KB；10,000 個代理 3.4 秒跑完，用 111 MB。
+- *真模型*：租一張 RTX 3090 24 GB，用 vLLM 跑 `Qwen/Qwen2.5-3B-Instruct`（11 分鐘，RunPod 約 US$0.05，用 `scripts/runpod-stress.py`）：
+
+| 同時代理數 | 成功 | 失敗 | 全部完成（秒） | 每秒代理數 | 中位等待（秒） |
+|---|---|---|---|---|---|
+| 1 | 1 | 0 | 0.07 | 14 | 0.07 |
+| 16 | 16 | 0 | 0.29 | 55 | 0.29 |
+| 128 | 128 | 0 | 1.6 | 80 | 1.6 |
+| 512 | 512 | 0 | 6.3 | 82 | 6.2 |
+| 1,024 | 1,024 | 0 | 18.2 | 56 | 12.2 |
+| 4,096 | 4,096 | 0 | 51.7 | 79 | 29.6 |
+| 10,000（修正後重跑） | 10,000 | 0 | 128 | 78 | 68 |
+
+  瓶頸是 GPU，每秒 55–80 個代理：超過約 16 個以後，再加代理只會排隊更久，所以一張卡跑 10,000 個約 2 分鐘（要更快就加卡）。第一次跑到 8,192 個以上時出現「can't start new thread」；HTTP 供應器現在最多開 512 個執行緒，其餘排隊，重跑時 10,000 個全部完成。
 
 ## 架構
 
@@ -331,7 +382,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - 記憶檢索只涵蓋已儲存的記憶（不含對話歷史）。向量檢索會把每條記憶的文字送到你設定的嵌入伺服器：私人記憶請用本機的。CI 會用真正的 Ollama 伺服器搭配 `nomic-embed-text` 實測：查詢和筆記沒有共同字詞也找得到，無關的查詢則什麼都不回傳。因為真實模型會把任何兩段文字都評為有點相似，只有分數明顯高於「查詢與幾句無關句子」的分數時，才算語意相符。其他模型與 OpenAI 端點尚未測試。關鍵字檢索不需要任何設定。
 - 技能信任的是**你審查過的內容**，不是作者；選用的簽章只記錄是誰發布的。掃描只抓得到明顯的手法，抓不到細膩的，而你信任的技能仍可能引導模型。把 `--force` 當成「我讀過每一行」。
 - `serve` 無法透過 stdio 詢問（它是協議通道）。請用 `--approvals console`、用 `auto_paths` 預先允許路徑（或用 `auto_args` 預先允許參數值），或不開放高風險工具。連線的污染狀態會持續到伺服器重啟。
-- 審計日誌能發現竄改，但無法防止竄改。每筆紀錄的雜湊都涵蓋前一筆，所以 `aios audit --verify`（以及看門狗）查得出手動修改、刪除、插入的紀錄，也查得出最新幾筆被截掉。不過能寫入 `aios.db` 的人仍可把整條鏈重算一遍。要連這種情況也抓到，請把 `--verify` 印出的 head 存到 `aios.db` 碰不到的地方，之後用 `--verify --head <雜湊>` 比對。啟用雜湊鏈之前寫入的紀錄會被計數，但不在保護範圍內。
+- 審計日誌能發現竄改，但無法防止竄改。每筆紀錄的雜湊都涵蓋前一筆，所以 `aios audit --verify`（以及看門狗）查得出手動修改、刪除、插入的紀錄，也查得出最新幾筆被截掉。不過能寫入 `aios.db` 的人仍可把整條鏈重算一遍。要連這種情況也抓到，請把 `--verify` 印出的 head 存到 `aios.db` 碰不到的地方，之後用 `--verify --head <雜湊>` 比對，或交給守護程式用 `--anchor FILE` 與 `--audit-sink URL` 自動處理（見「aios.db 以外的副本」）。啟用雜湊鏈之前寫入的紀錄會被計數，但不在保護範圍內。
 - 控制台連結在控制台執行期間就等於密碼：拿到它（或它設定的瀏覽器 cookie）的人都能讀你的日誌與記憶，在 `--approve` 模式下也能回答審批請求。每次啟動都會產生新的連結。它防不了以你同一個使用者身分執行的其他軟體，那些軟體本來就能直接讀 `aios.db`。
 - **`process` 沙箱不是完整的安全邊界**：會要求資源限制，並在可用時使用 Linux 網路 namespace。在 Linux 5.13+ 上，Landlock 讓它讀不到你的家目錄與其他檔案（仍可讀工作區、Python、系統函式庫與 `/usr` 底下的內容）；在 macOS 上，`sandbox-exec` 讓它不能使用網路、不能寫入自己資料夾以外的地方，也讀不到 `/Users`、其他磁碟區與暫存資料夾（工作區與 Python 本身除外）；在較舊的 Linux 核心上，它仍可讀取該使用者讀得到的所有檔案。受限的程式（這個沙箱，以及 `--confine-mcp`／`--offline-mcp`／`--mcp-egress` 的伺服器）也無法開啟 Unix socket，因此無法透過 socket 檔連到 Docker daemon、ssh-agent 或 D-Bus 工作階段匯流排（Linux x86_64、arm64、riscv64 用 seccomp，同時擋下 io_uring；macOS 用 `sandbox-exec`，受限的 MCP 伺服器仍可使用系統的名稱查詢 socket）；需要這些 socket（或 `multiprocessing` 的 forkserver）的程式在受限模式下無法運作。macOS 也不接受記憶體限制（`RLIMIT_AS`），所以在 macOS 上只有 CPU、檔案大小與時間限制；AIOS 啟動時會印出警告。在 Linux 上，它最多只能比你的使用者現有的數量多開 64 個行程或執行緒，fork 炸彈會在那裡停下；AIOS 以 root 執行時核心不套用這個限制。要執行不可信程式碼，請用 `--sandbox docker`。容器與 Docker 主機共用核心，核心或 Docker 逃逸漏洞可能突破隔離。Docker Desktop 有自己的 VM，但此後端沒有實作 microVM 隔離；需要時請在 Linux＋KVM 上用 `--sandbox microvm`。每次呼叫先建立容器，再附加執行；AIOS 不安裝額外 Python 套件。映像檔、Docker CLI、daemon 與選定的 Docker context 必須可信。
 - Docker 輸出以固定大小串流讀取，預設最多保留 10,000 個 UTF-8 bytes。逾時或取消會觸發有期限的容器 kill、強制移除與不存在確認；清理失敗會明確報錯。建立容器逾時的結果仍未知，daemon 延遲作業可能稍後才建立容器，必須在該 daemon 檢查指定名稱。參見[驗證範圍](docs/docker-sandbox-validation.md)。
@@ -398,12 +449,14 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | 階段 | 時間 | 目標 | 完成標準 |
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
-| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
+| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。
+
+套件發布備註：PyPI 上的 `aios-core` 名稱已被 [agiresearch/AIOS](https://github.com/agiresearch/AIOS) 使用（2024-11 起），因此要上架 PyPI 必須換一個套件名稱。在那之前，請照上面的方式從 GitHub 安裝。
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 

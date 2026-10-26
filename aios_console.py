@@ -213,7 +213,7 @@ def page_audit(r: Reader, q: dict) -> str:
     tools = [t for (t,) in r.query("SELECT DISTINCT tool FROM audit ORDER BY tool")]
     form = (f'<form method="get" action="/audit"><select name="agent">{options(agents, agent, "all agents")}</select>'
             f'<select name="tool">{options(tools, tool, "all tools")}</select>'
-            f'<select name="status">{options(["ok", "denied", "error", "finished", "budget", "max_steps"], st, "any status")}</select>'
+            f'<select name="status">{options(["ok", "denied", "error", "finished", "budget", "max_steps", "loop"], st, "any status")}</select>'
             f'<input name="n" value="{esc(limit)}" size="4" aria-label="rows"><button>Filter</button></form>')
     body = table(["Time", "Agent", "Tool", "Status", "Arguments", "Result"],
                  [[esc(ts), esc(a), esc(t), status(s), pre(ar), pre(res)] for ts, a, t, s, ar, res in rows],
