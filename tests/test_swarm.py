@@ -374,6 +374,22 @@ class HttpProviderConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(out), 40)
         self.assertEqual(state["peak"], 40)
 
+    async def test_threads_are_capped_and_extra_calls_queue(self):
+        # 8,192 slots used to mean 8,192 threads; a container refused new threads past ~5,500
+        p = aios.OpenAICompatProvider("m")
+        p.workers = 50
+        state = {"n": 0}
+
+        def post(payload):
+            state["n"] += 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        with mock.patch.object(aios, "MODEL_THREADS_MAX", 4), mock.patch.object(p, "_post", post):
+            out = await asyncio.gather(*(p.complete("s", [{"role": "user", "content": "x"}], [])
+                                         for _ in range(50)))
+        self.assertEqual((len(out), state["n"]), (50, 50))
+        self.assertEqual(p._pool._max_workers, 4)
+
 
 class StressScriptTests(unittest.TestCase):
     def test_ramp_runs_the_real_swarm_path(self):

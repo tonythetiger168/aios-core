@@ -74,6 +74,10 @@ MAX_DELEGATION_DEPTH = 2  # main -> helper -> helper's helper, no deeper
 DEFAULT_APPROVAL = ("write_file", "run_python", "fetch_url")  # need human approval; MCP tools are added on connect
 # Swarms (the `swarm` tool, `aios swarm`): many helpers at once. The CLI flags set these.
 MODEL_SLOTS = 16  # model calls in flight at once, across every agent of the process (rate limit)
+# Threads one OpenAICompatProvider may block on HTTP calls; more slots queue for a thread. A real
+# server batches a few hundred at most, and containers cap threads (a RunPod pod refused the
+# ~5,500th: "can't start new thread"), so thousands of threads only add failures.
+MODEL_THREADS_MAX = 512
 SWARM_PARALLEL = 8  # helpers running at once in one swarm (a swarm may ask for fewer)
 SWARM_MAX_TASKS = 1000  # tasks one `swarm` tool call may hand out (`aios swarm` streams any number)
 SWARM_MAX_TOKENS = 1_000_000  # input + output tokens all helpers of one swarm may spend together
@@ -198,7 +202,8 @@ class OpenAICompatProvider:
             payload["temperature"] = self.temperature
         if self._pool is None:
             from concurrent.futures import ThreadPoolExecutor
-            self._pool = ThreadPoolExecutor(self.workers or MODEL_SLOTS, thread_name_prefix="aios-model")
+            self._pool = ThreadPoolExecutor(min(self.workers or MODEL_SLOTS, MODEL_THREADS_MAX),
+                                            thread_name_prefix="aios-model")
         return self.from_wire(await asyncio.get_running_loop().run_in_executor(self._pool, self._post, payload))
 
 
