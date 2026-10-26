@@ -71,6 +71,34 @@ The provider now has its own pool, sized to the kernel's model slots. The HTTP p
 of CPU per call (thread + urllib + JSON under the GIL), so one process tops out near **~450 HTTP
 model calls/s**; a real model server on one GPU is slower than that, so the GPU stays the limit.
 
+### Real model on one rented GPU (2026-10-26)
+
+`scripts/runpod-stress.py` on RunPod: **1x RTX 3090 24 GB** (community cloud), vLLM 0.6.6 serving
+`Qwen/Qwen2.5-3B-Instruct` (`--max-num-seqs 256`), the ramp running inside the same pod. The pod
+lived 699 s (about US$0.05). Each agent asks for a one-word answer.
+
+| agents | ok | fail | wall s | tasks/s | p50 s | p99 s | RSS MB |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 0 | 0.07 | 13.6 | 0.07 | 0.07 | 40 |
+| 16 | 16 | 0 | 0.29 | 54.8 | 0.29 | 0.29 | 29 |
+| 128 | 128 | 0 | 1.61 | 79.6 | 1.59 | 1.60 | 34 |
+| 512 | 512 | 0 | 6.27 | 81.6 | 6.24 | 6.27 | 53 |
+| 1,024 | 1,024 | 0 | 18.2 | 56.3 | 12.2 | 18.2 | 117 |
+| 2,048 | 2,048 | 0 | 33.6 | 61.0 | 22.8 | 33.6 | 199 |
+| 4,096 | 4,096 | 0 | 51.7 | 79.2 | 29.6 | 51.6 | 293 |
+| 8,192 | 5,495 | 33% | 83.9 | 65.5 | 20.7 | 80.7 | 383 |
+| 16,384 | 5,495 | 66% | 91.2 | 60.3 | 4.7 | 81.7 | 427 |
+
+- Up to 4,096 agents at once: no failures. Throughput rises from 14 to ~55 agents/s by 16 agents,
+  then stays at **55-80 agents/s**: from there every extra agent only waits longer (p99 grows with
+  the queue: 1.6 s at 128, 52 s at 4,096). The limit is the model server on that pod, not AIOS.
+- 8,192 and up failed with `RuntimeError: can't start new thread` after ~5,500 threads: the HTTP
+  provider kept one thread per model slot and the container caps threads. Fixed: the provider now
+  uses at most `MODEL_THREADS_MAX` (512) threads and further calls queue for one. With the fake HTTP
+  server, 10,000 agents still finish in 21 s with no failures (and the event loop lags 3.5 s, not 17 s).
+- 10,000 real agents on this one card would take about 10,000 / 70 = ~2.5 minutes. To finish
+  faster, add GPUs (one vLLM per card, or tensor/data parallel) or a faster card; AIOS is not the limit.
+
 ## What it takes to run 10,000 real agents at once
 
 AIOS itself holds 10,000 concurrent agents in one process (~110-190 MB). With a real model, the
@@ -89,7 +117,7 @@ number of agents *in flight* is easy; the number *finishing per second* is what 
 
 ## Real GPU on RunPod (`scripts/runpod-stress.py`)
 
-Rents **one** GPU (RTX A5000 / RTX 3090 / A40, cheapest available, community cloud), runs vLLM
+Rents **one** GPU (the first free 16-48 GB card under `--max-price`, US$0.60/h by default: A4000, A4500, A5000, 3090, 4090, L4, A40...; community cloud first, then secure), runs vLLM
 with `Qwen/Qwen2.5-3B-Instruct` and the ramp up to 16,384 agents *inside* the pod (localhost, no
 proxy in between), downloads the results, and deletes the pod. Spending is capped by: a confirmation
 with the worst-case cost before renting, the pod deleting itself after `--max-minutes` (default 45)
