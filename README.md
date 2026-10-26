@@ -17,6 +17,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Kernel**: async task queue with a worker pool; each agent is a "process" with its own permissions, history and memory.
 - **Tool registry** ("syscalls") with JSON-schema tools; an agent only sees tools it is permitted to use (exact name or `prefix*` wildcard).
 - **Persistent memory** (SQLite): conversation history survives restarts; long-term facts via `remember` / `recall` / `list_facts` and are injected into the system prompt.
+- **Conversation compaction**: once a chat has more than 30 messages (or about 120,000 characters), the older turns are summarised by the model and replaced by that summary; the newest ~10 messages stay word for word, and the next compaction builds on the last summary. Before, older messages just dropped out of context. The summary call counts against the run's budget and is skipped (old messages drop out as before) when the budget has too little room or the call fails; each compaction is in the audit log as `(compact)`. A summary of turns that read untrusted content is stored as tainted and keeps the chat tainted (no auto-approval) until `/reset`, which clears it with the history. `/summary` shows it, `chat --compact-at N` changes the threshold, `--compact-at 0` turns it off. Jobs, helpers and A2A conversations are not compacted (they start fresh or are never saved).
 - **Workspace file tools** (`read_file`, `write_file`, `list_files`), path-escape protected, UTF-8. Every write is checkpointed: `aios undo` puts back what a run changed (see [Undoing a run](#undoing-a-run)).
 - **Sandboxed code execution** (`run_python`), three backends chosen with `--sandbox` (or `AIOS_SANDBOX`):
   - `process` (the default): separate process, CPU/memory/file-size limits, a cap on new processes (Linux, not as root), no network (Linux with unprivileged user namespaces; else at least no TCP via Landlock), and on Linux 5.13+ [Landlock](https://docs.kernel.org/userspace-api/landlock.html) file confinement: it reads only Python, system libraries and the workspace, and writes only its own throwaway folder. On macOS, `sandbox-exec` gives it no network and keeps it out of home and temp folders. On Windows it runs in an [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) inside a job object: no network at all (loopback included), no access to your user folder (it reads Windows, Program Files, Python and the workspace, and writes only its own folder), and limits on memory per process, CPU time and processes, with everything it started killed at the end. AIOS grants its container (`aios.sandbox`, SID shown by `aios doctor`) read access to Python's folder once; undo with `icacls <folder> /remove *<SID>`.
@@ -43,7 +44,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Prompt-injection test suite**: `python tests/test_injection.py --report` prints which attacks get through under each defense (below).
 - **Audit log** (SQLite, append-only API): every tool call is recorded with agent, tool, arguments, result and status (`ok` / `error` / `denied`). View it with `/audit`. Entries are hash-chained, so `python aios.py audit --verify` finds an entry that was edited, removed or inserted, and the daemon's watchdog checks the chain every tick. The daemon can also copy every entry to a log collector (`--audit-sink URL`) and save the chain head to a file elsewhere (`--anchor FILE`), so even a rebuilt chain is caught (see Copies outside aios.db).
 - **Tests**: `python -m unittest discover -s tests -v` (standard library only, no API key needed); CI runs on Linux and Windows.
-- **CLI**: interactive chat with `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/reset`, `/quit`.
+- **CLI**: interactive chat with `/facts`, `/search <words>`, `/remember <key> <value>`, `/forget <key>`, `/audit`, `/summary`, `/reset`, `/quit`.
 
 ## Quick start
 
@@ -65,6 +66,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # attach an MCP ser
 python aios.py chat --provider openai --model llama3.1   # local model via Ollama (http://localhost:11434/v1)
 python aios.py chat --max-tokens 20000 --max-steps 6     # hard limits per run
 python aios.py chat --daily-max-tokens 500000            # and for all of this agent's chats in any 24 hours
+python aios.py chat --compact-at 20                      # summarise older turns sooner (default 30 messages; 0 = off)
 python aios.py chat --policy policy.example.toml --agent notes   # per-agent permissions and path scopes
 python aios.py chat --policy policy.example.toml --agent lead    # an agent that hands writing to 'notes'
 python aios.py chat --sandbox docker          # run_python in a throwaway container (after `docker pull python:3.12-slim`)

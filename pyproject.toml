@@ -24,6 +24,6 @@ Homepage = "https://github.com/tonythetiger168/aios-core"
 
 [tool.setuptools]
 # every aios*.py module; tests/test_packaging.py fails when a new one is missing here
-py-modules = ["aios", "aios_a2a", "aios_appcontainer", "aios_auditout", "aios_checkpoint", "aios_console",
+py-modules = ["aios", "aios_a2a", "aios_appcontainer", "aios_auditout", "aios_checkpoint", "aios_compact", "aios_console",
               "aios_egress", "aios_fetch", "aios_keeper", "aios_memory", "aios_microvm_init", "aios_schedule",
               "aios_service", "aios_skills", "aios_swarm", "aios_telegram", "aios_watchdog"]
