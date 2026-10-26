@@ -89,7 +89,7 @@ number of agents *in flight* is easy; the number *finishing per second* is what 
 
 ## Real GPU on RunPod (`scripts/runpod-stress.py`)
 
-Rents **one** GPU (RTX A5000 / RTX 3090 / A40, cheapest available, community cloud), runs vLLM
+Rents **one** GPU (the first free 16-48 GB card under `--max-price`, US$0.60/h by default: A4000, A4500, A5000, 3090, 4090, L4, A40...; community cloud first, then secure), runs vLLM
 with `Qwen/Qwen2.5-3B-Instruct` and the ramp up to 16,384 agents *inside* the pod (localhost, no
 proxy in between), downloads the results, and deletes the pod. Spending is capped by: a confirmation
 with the worst-case cost before renting, the pod deleting itself after `--max-minutes` (default 45)
