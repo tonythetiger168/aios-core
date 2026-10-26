@@ -22,9 +22,16 @@ import urllib.error
 import urllib.request
 
 API = "https://rest.runpod.io/v1"
-# cheapest 24-48 GB cards first; USD/hour on-demand (runpod.io/gpu-cloud/pricing, 2026-10): only
-# used for the cost estimate, the real price is whatever RunPod charges for the card it picks.
-GPUS = {"NVIDIA RTX A5000": 0.27, "NVIDIA GeForce RTX 3090": 0.50, "NVIDIA A40": 0.59}
+# Cards that fit a 3B model (16-48 GB), cheapest first, with a rough upper bound of their on-demand
+# USD/hour per cloud (runpod.io/gpu-cloud/pricing, 2026-10). Only used to pick cards under
+# --max-price and for the estimate; RunPod charges its live price for the card it assigns.
+GPUS = {  # id: (COMMUNITY, SECURE)
+    "NVIDIA RTX A4000": (0.20, 0.25), "NVIDIA RTX 4000 Ada Generation": (0.25, 0.30),
+    "NVIDIA RTX A4500": (0.25, 0.30), "NVIDIA RTX A5000": (0.27, 0.30),
+    "NVIDIA GeForce RTX 3090": (0.30, 0.50), "NVIDIA GeForce RTX 3090 Ti": (0.35, 0.55),
+    "NVIDIA GeForce RTX 4090": (0.40, 0.89), "NVIDIA L4": (0.45, 0.59), "NVIDIA A40": (0.45, 0.59),
+}
+CLOUDS = ("COMMUNITY", "SECURE")
 IMAGE = "vllm/vllm-openai:v0.6.6"
 REPO = "https://github.com/tonythetiger168/aios-core"
 
@@ -40,7 +47,7 @@ vllm serve "$MODEL" --port 8000 --max-model-len 4096 --max-num-seqs 256 --disabl
     > /results/vllm.log 2>&1 &
 until curl -sf localhost:8000/v1/models >/dev/null; do sleep 5; done
 echo "vllm ready"; nvidia-smi --query-gpu=name,memory.total --format=csv > /results/gpu.csv
-git clone --depth 1 "$REPO" /aios
+git init -q /aios && git -C /aios fetch -q --depth 1 "$REPO" "$REF" && git -C /aios checkout -q FETCH_HEAD
 python3 /aios/scripts/stress-swarm.py --model-kind openai --base-url http://localhost:8000/v1 \
     --model "$MODEL" --start "$START" --factor "$FACTOR" --max "$MAX_AGENTS" --timeout 600 \
     --out /results/ramp.jsonl > /results/ramp.md 2> /results/stress.log
@@ -49,18 +56,31 @@ sleep infinity
 """
 
 
+# RunPod sits behind Cloudflare, which answers 403 to urllib's default "Python-urllib/3.x" agent
+UA = {"User-Agent": "aios-runpod-stress/1.0 (+https://github.com/tonythetiger168/aios-core)"}
+
+
+class ApiError(RuntimeError):
+    pass
+
+
 def call(method, path, key, body=None):
     req = urllib.request.Request(API + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        raw = r.read()
+                                 headers={**UA, "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise ApiError(f"RunPod {method} {path}: HTTP {e.code}: {detail or e.reason}") from None
     return json.loads(raw) if raw else {}
 
 
 def fetch(pod, name):
     try:
-        with urllib.request.urlopen(f"https://{pod}-8080.proxy.runpod.net/{name}", timeout=30) as r:
+        req = urllib.request.Request(f"https://{pod}-8080.proxy.runpod.net/{name}", headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError):
         return None
@@ -68,9 +88,13 @@ def fetch(pod, name):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ref", default="main", help="branch, tag or commit of aios-core the pod tests")
     ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct", help="Hugging Face model vLLM serves")
-    ap.add_argument("--gpu", action="append", help=f"GPU type id, in order of preference (default {list(GPUS)})")
-    ap.add_argument("--cloud", choices=["COMMUNITY", "SECURE"], default="COMMUNITY")
+    ap.add_argument("--gpu", action="append", help="GPU type id, in order of preference (default: every card "
+                    "in GPUS under --max-price)")
+    ap.add_argument("--cloud", choices=["COMMUNITY", "SECURE", "ANY"], default="ANY",
+                    help="ANY: community first, secure if community has no card free")
+    ap.add_argument("--max-price", type=float, default=0.60, help="most USD/hour a card may cost")
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--factor", type=float, default=2.0)
     ap.add_argument("--max", type=int, default=16384, help="most agents at once (ramp stops earlier on failures)")
@@ -81,18 +105,51 @@ def main():
     key = os.environ.get("RUNPOD_API_KEY")
     if not key:
         sys.exit("set RUNPOD_API_KEY (runpod.io > Settings > API Keys)")
-    gpus = a.gpu or list(GPUS)
-    worst = max(GPUS.get(g, 1.0) for g in gpus) * a.max_minutes / 60 + 0.05  # + disk
-    print(f"1x {' / '.join(gpus)} ({a.cloud}), at most {a.max_minutes} min: worst case about US${worst:.2f}")
+    try:  # free check first: a bad key or a blocked client fails here, before anything is rented
+        call("GET", "/pods", key)
+    except (ApiError, urllib.error.URLError) as e:
+        sys.exit(f"{e}\n401/403: check the key is a Read/Write (or All) API key and the account has credit")
+    plan = []  # (cloud, cards that cloud may use)
+    for i, cloud in enumerate(CLOUDS):
+        if a.cloud in (cloud, "ANY"):
+            cards = [g for g in (a.gpu or GPUS) if GPUS.get(g, (9, 9))[i] <= a.max_price]
+            if cards:
+                plan.append((cloud, cards))
+    if not plan:
+        sys.exit(f"no card in the list costs at most US${a.max_price}/h")
+    top = max(GPUS.get(g, (9, 9))[CLOUDS.index(c)] for c, cards in plan for g in cards)
+    worst = top * a.max_minutes / 60 + 0.05  # + disk
+    for cloud, cards in plan:
+        print(f"{cloud}: {', '.join(g.replace('NVIDIA ', '') for g in cards)}")
+    print(f"1 card (the first free one above, at most ~US${top:.2f}/h), at most {a.max_minutes} min: "
+          f"worst case about US${worst:.2f}")
     if not a.yes and input("rent it? [y/N] ").strip().lower() != "y":
         return
     env = {"MODEL": a.model, "START": str(a.start), "FACTOR": str(a.factor), "MAX_AGENTS": str(a.max),
-           "MAX_MINUTES": str(a.max_minutes), "REPO": REPO, "RUNPOD_API_KEY": key}
-    pod = call("POST", "/pods", key, {
-        "name": "aios-stress", "imageName": IMAGE, "gpuTypeIds": gpus, "gpuCount": 1, "cloudType": a.cloud,
+           "MAX_MINUTES": str(a.max_minutes), "REPO": REPO, "REF": a.ref, "RUNPOD_API_KEY": key}
+    pod = None
+    for cloud, cards in plan:
+        try:
+            pod = create(key, cloud, cards, env)
+            break
+        except ApiError as e:
+            if "no instances" not in str(e).lower():
+                sys.exit(f"{e}\nnothing was rented")
+            print(f"{cloud}: no card free right now")
+    if pod is None:
+        sys.exit("no card free in any cloud right now; nothing was rented. Try again in a while.")
+    print(f"pod {pod} created; results at https://{pod}-8080.proxy.runpod.net/")
+    watch(pod, key, a)
+
+
+def create(key, cloud, gpus, env):
+    return call("POST", "/pods", key, {
+        "name": "aios-stress", "imageName": IMAGE, "gpuTypeIds": gpus, "gpuCount": 1, "cloudType": cloud,
         "containerDiskInGb": 40, "volumeInGb": 0, "ports": ["8080/http"], "env": env,
         "dockerEntrypoint": ["bash", "-c"], "dockerStartCmd": [POD_SCRIPT]})["id"]
-    print(f"pod {pod} created; results at https://{pod}-8080.proxy.runpod.net/")
+
+
+def watch(pod, key, a):
     t0, last = time.time(), ""
     try:
         while time.time() - t0 < a.max_minutes * 60:
@@ -118,7 +175,7 @@ def main():
         try:
             call("DELETE", f"/pods/{pod}", key)
             print(f"pod {pod} deleted after {int(time.time() - t0)}s")
-        except (urllib.error.URLError, OSError) as e:
+        except (ApiError, urllib.error.URLError, OSError) as e:
             print(f"!! could not delete pod {pod} ({e}): delete it at runpod.io/console/pods", file=sys.stderr)
 
 
