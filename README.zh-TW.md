@@ -328,7 +328,8 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *Worker 池與背壓*：固定 `--parallel` 個 worker（預設 8）從任務清單取工作，所以 10 萬個任務也不會在記憶體裡同時有 10 萬個執行；任務檔只有在有 worker 空出來時才會往下讀。
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
-- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每秒約 2,300 個，每個約 8 KB），經 HTTP 跑過 10,000 個；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
+- *多核心*：`aios swarm --workers N` 把幫手放到 N 個行程裡跑，每個用一顆 CPU 核心（`--workers 0` = 保留一顆，其餘全用）。`--parallel` 與 `--model-slots` 由各行程分攤，預算仍然共用，所有審計紀錄由主行程寫進同一條雜湊鏈。代理內的 `swarm` 工具仍在單一行程中執行。
+- *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
 - *資料庫*：SQLite 改用 WAL，上百個 worker 寫審計日誌時不會卡住，控制台也能同時讀取。已用 3,000 個任務、400 個 worker、150 個模型槽位測試。
@@ -449,7 +450,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
