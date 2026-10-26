@@ -25,6 +25,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`--mcp-egress '名稱=api.github.com,*.example.com'` 適合只呼叫某個 API 的伺服器：一樣沒有網路，只能用 HTTPS 連到列出的主機（`host`、`*.domain` 代表其子網域、`host:port` 代表 443 以外的連接埠），經由 AIOS 執行的代理：它會確認名稱只解析到公開位址，並把每次連線（允許或拒絕）寫進審計日誌（需要獨立的網路 namespace 或 `sandbox-exec`；伺服器必須遵守 `HTTPS_PROXY`，Python、Go 與 curl 都會，Node 24+ 則靠 AIOS 設定的 `NODE_USE_ENV_PROXY=1`）。`aios doctor` 會顯示你的機器是哪一種。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
+- **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
@@ -157,6 +158,7 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `unattended-refused` | warning | 定時任務嘗試政策未預先允許的高風險呼叫 |
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
+| `loop-stop` | warning | 迴圈保護停止了一次不斷重複同一個工具呼叫的執行 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
 | `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘） |
 
@@ -413,12 +415,14 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | 階段 | 時間 | 目標 | 完成標準 |
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
-| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
+| **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
 | **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（GitHub Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。
+
+套件發布備註：PyPI 上的 `aios-core` 名稱已被 [agiresearch/AIOS](https://github.com/agiresearch/AIOS) 使用（2024-11 起），因此要上架 PyPI 必須換一個套件名稱。在那之前，請照上面的方式從 GitHub 安裝。
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 
