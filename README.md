@@ -296,7 +296,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *Worker pool and backpressure*: a fixed pool of `--parallel` workers (default 8) pulls from the task list, so 100,000 tasks never mean 100,000 runs in memory, and a task file is read only when a worker is free.
 - *Rate limit*: every model call of every agent in the process waits for one of `--model-slots` slots (default 16). Nested swarms and parallel jobs share them, so the provider never sees more requests at once than that, whatever the fan-out.
 - *Shared budget*: all workers of one swarm spend from one ledger, `--swarm-max-tokens` (default 1,000,000) and `--swarm-max-cost` (with prices). When it runs out, no new task starts (the rest are reported `skipped`) and running workers stop before their next model call. A swarm inside a swarm also charges its parent's ledger. Each worker still has its own per-run budget.
-- *How far it goes*: one process has run 131,072 agents at once with a fake model (no failures, ~2,300 agents/s, ~8 KB each) and 10,000 through HTTP; with a real model the GPU is the limit (one RTX 3090: 4,096 at once, 55-80 agents/s). `scripts/stress-swarm.py` measures it, `scripts/runpod-stress.py` runs it on one rented GPU; see [docs/stress-test.md](docs/stress-test.md).
+- *How far it goes*: one process has run 131,072 agents at once with a fake model (no failures, ~2,300 agents/s, ~8 KB each) and 10,000 through HTTP; with a real model the GPU is the limit (one RTX 3090: 10,000 at once in 128 s, 55-80 agents/s). `scripts/stress-swarm.py` measures it, `scripts/runpod-stress.py` runs it on one rented GPU; see [docs/stress-test.md](docs/stress-test.md).
 - *Isolation of failures*: each task has a timeout (`--timeout`, default 600 s); an error or timeout in one never stops the others, and cancelling the swarm cancels every worker.
 - *Combining large results*: `reduce` packs answers into bounded groups and has the reducer combine them in rounds until one answer is left, so a thousand answers never land in one prompt. Without `reduce`, the lead gets each answer clipped (1,500 chars, 20,000 in total).
 - *Database*: the SQLite store now uses WAL, so hundreds of workers can write audit entries without stalling, and the console reads while they do. Tested with 3,000 tasks, 400 workers and 150 model slots.
@@ -316,8 +316,9 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 | 512 | 512 | 0 | 6.3 | 82 | 6.2 |
 | 1,024 | 1,024 | 0 | 18.2 | 56 | 12.2 |
 | 4,096 | 4,096 | 0 | 51.7 | 79 | 29.6 |
+| 10,000 (rerun after the fix) | 10,000 | 0 | 128 | 78 | 68 |
 
-  The GPU is the limit at 55-80 agents/s: past ~16 agents more of them only queue longer, so 10,000 take about 2.5 minutes on one card (add cards to go faster). At 8,192+ the run failed with "can't start new thread"; the HTTP provider now caps its threads at 512 and queues the rest.
+  The GPU is the limit at 55-80 agents/s: past ~16 agents more of them only queue longer, so 10,000 take about 2 minutes on one card (add cards to go faster). The first run failed from 8,192 agents with "can't start new thread"; the HTTP provider now caps its threads at 512 and queues the rest, and the rerun finished all 10,000.
 
 ## Architecture
 
