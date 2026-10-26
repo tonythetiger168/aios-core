@@ -45,6 +45,12 @@ auto_paths = ["reports/*"]
 auto_when_tainted = true
 max_calls = 5           # per run
 
+# Rate limits over a sliding window, shared by every job of this agent (and across restarts):
+# a runaway or hijacked job cannot loop on the model or a tool. Units: s, min, hour, day ("5/30s").
+[agents.reporter.rate]
+model = "20/hour"       # model calls; over it a run waits up to 60 s, then stops
+tools = { "*" = "100/hour", write_file = "10/hour" }   # over it a call is refused
+
 # ---------------------------------------------------------------------------------
 # Several agents working together:  python aios.py chat --agent lead --policy policy.example.toml
 # Every agent in this file can be handed a sub-task through a tool named agent__<name>. Grant it like
