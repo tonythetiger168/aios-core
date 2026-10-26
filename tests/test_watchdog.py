@@ -4,6 +4,7 @@ import io
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -56,6 +57,11 @@ class RuleTests(WatchCase):
         self.st.log_audit("main", wd.RUN_ENTRY, {"task": "t"}, "steps=1 stop=finished", "ok")
         self.assertEqual(self.rules(), [("budget-stop", "main")])
 
+    def test_loop_stop(self):
+        self.st.log_audit("main", wd.RUN_ENTRY, {"task": "t"}, "steps=4 stop=loop", "loop")
+        self.st.log_audit("main", "read_file", {"path": "a"}, "loop guard: ...", "loop")  # one refused call: no alert
+        self.assertEqual(self.rules(), [("loop-stop", "main")])
+
     def test_job_failing_only_after_consecutive_failures(self):
         for status in ("error", "timeout"):
             self.st.add_run("sync", "2026-10-23T09:00:00", status, "boom")
@@ -79,7 +85,12 @@ class RuleTests(WatchCase):
         self.assertEqual(wd.check(self.st.db), [])  # same rule + subject inside the cooldown
         self.assertEqual(len(wd.list_alerts(self.st.db)), 1)
         later = datetime.now() + timedelta(minutes=wd.COOLDOWN_MINUTES + 1)
-        self.st.db.execute("UPDATE audit SET ts=?", (later.isoformat(timespec="seconds"),))
+        class Later(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return later
+        with mock.patch.object(aios, "datetime", Later):  # a new refusal, logged after the cooldown
+            self.st.log_audit("job-mail", "write_file", {"path": "x"}, TAINTED, "denied")
         self.assertEqual(len(wd.check(self.st.db, later)), 1)
 
     def test_ack_one_and_all(self):
@@ -98,6 +109,18 @@ class RuleTests(WatchCase):
         before = self.st.db.execute("SELECT * FROM audit").fetchall()
         wd.check(self.st.db)
         self.assertEqual(self.st.db.execute("SELECT * FROM audit").fetchall(), before)
+
+
+    def test_an_edited_audit_log_is_critical(self):
+        for i in range(3):
+            self.st.log_audit("main", "read_file", {"path": str(i)}, "text", "ok")
+        self.assertEqual(self.rules(), [])
+        self.st.db.execute("UPDATE audit SET status='ok', result='harmless' WHERE id=2")
+        self.st.db.commit()
+        added = wd.check(self.st.db)
+        self.assertEqual([(a["rule"], a["severity"]) for a in added], [("audit-tampered", "critical")])
+        self.assertIn("entry 2", added[0]["detail"])
+        self.assertEqual(self.rules(), [])  # cooldown: not raised again every tick
 
 
 class HeartbeatTests(WatchCase):

@@ -59,6 +59,32 @@ write.
 5. Always (success, timeout, error or cancellation): SIGKILL the process group, wait up to
    3 s to confirm exit (otherwise raise "cleanup unconfirmed"), delete the temp dir.
 
+## Snapshots (on by default)
+
+Booting costs about a second per call, so AIOS boots once and then restores:
+
+1. The first call (per process, or whenever Firecracker, the kernel, the root image or the VM
+   shape changes) boots a VM with `aios_wait=1` and an empty job drive of a fixed size. The init
+   mounts proc/sys/dev/tmpfs, prints `AIOS-READY` and waits for a line on the console. No code
+   has run in it yet. AIOS pauses it and saves a full snapshot to
+   `$AIOS_MICROVM_DIR/snapshots/<key>/` (`vm.snap`, `vm.mem`, `job.img`, all read-only),
+   removing snapshots made for older binaries or images. This VMM runs as the AIOS user even in
+   jailed mode, since the guest runs nothing untrusted before the snapshot.
+2. A probe call (`print('ok')`) restores it once. If making or probing the snapshot fails, for
+   example with a root image built before snapshots, AIOS says so once and every call boots as
+   before.
+3. Each call starts a fresh VMM (jailed if configured), restores the snapshot into it with this
+   call's job drive in the same place (paths in the snapshot are relative), and sends the line.
+   The init drops the block cache for the job drive, reads the job, mixes the job's 32 fresh
+   random bytes into the kernel's pool and forces a reseed (`RNDADDENTROPY`, `RNDRESEEDCRNG`;
+   it refuses to run the code if that fails), sets the clock, then runs the code as before.
+
+What this changes: every call still gets its own VM and VMM, so nothing a call does reaches the
+next one; all calls start from the same memory image, so guest kernel and init addresses (KASLR)
+are the same in every call, as they would be for anyone who can run code in one VM and read
+them. Random numbers are not shared, because of the reseed. `AIOS_MICROVM_SNAPSHOT=0` turns
+snapshots off. A snapshot holds the guest's memory (256 MiB by default) on disk.
+
 ## Selection: no silent fallback
 
 `microvm` is chosen only by `--sandbox microvm` or `AIOS_SANDBOX=microvm`; `auto` never
@@ -84,12 +110,33 @@ python aios.py chat --sandbox microvm
 
 Your user needs read/write access to `/dev/kvm` (usually the `kvm` group).
 
+## Jailed VMMs (AIOS running as root)
+
+When AIOS runs as root, for example as a system service, set `AIOS_MICROVM_JAILER=1` and put
+the `jailer` binary from the same Firecracker release next to `firecracker`:
+
+```sh
+install -m 0755 release-v1.13.1-x86_64/jailer-v1.13.1-x86_64 $d/jailer
+AIOS_MICROVM_JAILER=1 python aios.py daemon --sandbox microvm ...
+```
+
+Each call then gets its own jail. The kernel and root image are hard-linked (copied if they live
+on another filesystem) into a fresh chroot under `$AIOS_MICROVM_DIR/jails/firecracker/<id>/root`,
+owned by uid/gid 65534 and mode 0700, next to the job drive and config. The jailer starts
+Firecracker in a new mount namespace, chrooted there, as uid/gid 65534 with no capabilities. On
+cgroup v2 it runs in its own cgroup capped at the guest memory plus 128 MiB. After the call, the
+jail directory and the cgroup are removed. The kernel and root image must be readable by uid
+65534. AIOS refuses to start in this mode when it is not root or the jailer is missing.
+The microVM CI job runs the real tests both ways. When jailed, it also checks from the host that
+the running VMM's uid, gid, capabilities, chroot and cgroup are as described, and that both the
+jail and the cgroup are gone afterwards.
+
 ## Known limits
 
-- Firecracker runs as the AIOS user without the `jailer` (no chroot, cgroups or separate
-  UID for the VMM). Firecracker's built-in seccomp filters are on. A production deployment
-  that treats the VMM as an attack surface should add the jailer.
-- Boot costs roughly a second per call; there is no warm pool or snapshot restore yet.
+- By default Firecracker runs as the AIOS user without the `jailer` (no chroot, cgroups or
+  separate UID for the VMM). Firecracker's built-in seccomp filters are on. See "Jailed VMMs"
+  below for deployments that treat the VMM itself as an attack surface.
+- Without snapshots (`AIOS_MICROVM_SNAPSHOT=0`, or a root image that predates them), boot costs roughly a second per call. There is no warm pool of running VMs.
 - The root image comes from a mutable Docker tag; record its digest (the build script
   prints it). No image signing.
 - Linux x86_64 only in CI. aarch64 should work with an aarch64 kernel and binary but is
@@ -102,13 +149,19 @@ Your user needs read/write access to `/dev/kvm` (usually the `kvm` group).
 - Unit tests (`tests/test_microvm.py`, every platform): job encoding and parsing, config
   contents (no network devices, read-only drives), result parsing, output bounds, guest
   and host timeouts, cleanup of the temp dir and VMM after timeout and cancellation, VMM
-  failure raising instead of returning, a block with the wrong nonce being ignored. These
-  use a fake `firecracker` and do not prove isolation.
+  failure raising instead of returning, a block with the wrong nonce being ignored; for
+  snapshots (Linux), one boot then a restore per call, a fresh seed and fixed-size job drive
+  per call, a new snapshot when an image changes, falling back to booting when the init
+  predates snapshots or a restore fails, jailed restores, cancellation. These use a fake
+  `firecracker` and do not prove isolation.
 - Real tests (`RealMicroVMTests`, `AIOS_TEST_MICROVM=1`), run by the `microvm` CI job on
   an Ubuntu runner with KVM: guest kernel differs from the host's, UID/GID 65534, no groups,
   no capabilities, `NoNewPrivs`, only `lo`, no outbound connection, read-only root, empty
   `/tmp` of at most 16 MiB, only `vda`/`vdb`, job drive and `/run` unreadable, init hidden,
   MemTotal below 256 MiB, a 512 MiB allocation failing, timeout plus no leftover VMM or
-  temp dir, a fork bomb and output flood contained.
+  temp dir, a fork bomb and output flood contained; restored calls start with an empty `/tmp`,
+  different random numbers and the right time, and are faster than a booted call (the timings
+  are in the evidence). The job runs these tests with snapshots, again with
+  `AIOS_MICROVM_SNAPSHOT=0`, and jailed.
 - Evidence: the CI job uploads `microvm-evidence` (runner kernel, KVM node, Firecracker
   version, sha256 of binary, kernel and root image, image digest, full test output).

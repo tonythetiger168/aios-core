@@ -45,6 +45,12 @@ auto_paths = ["reports/*"]
 auto_when_tainted = true
 max_calls = 5           # per run
 
+# Rate limits over a sliding window, shared by every job of this agent (and across restarts):
+# a runaway or hijacked job cannot loop on the model or a tool. Units: s, min, hour, day ("5/30s").
+[agents.reporter.rate]
+model = "20/hour"       # model calls; over it a run waits up to 60 s, then stops
+tools = { "*" = "100/hour", write_file = "10/hour" }   # over it a call is refused
+
 # ---------------------------------------------------------------------------------
 # Several agents working together:  python aios.py chat --agent lead --policy policy.example.toml
 # Every agent in this file can be handed a sub-task through a tool named agent__<name>. Grant it like
@@ -53,19 +59,39 @@ max_calls = 5           # per run
 [agents.lead]
 permissions = ["now", "read_file", "list_files", "agent__notes"]
 
-# Argument rules: limit the VALUES a tool may be called with. Useful for MCP tools, which have no
-# workspace path. Start with: python aios.py chat --agent researcher --policy policy.example.toml \
-#                                --mcp "web=<command for your fetch MCP server>"
+# Argument rules: limit the VALUES a tool may be called with, here the built-in fetch_url (the same
+# works for MCP tools, which have no workspace path, e.g. "web__fetch").
+# Start with: python aios.py chat --agent researcher --policy policy.example.toml
 [agents.researcher]
-permissions = ["now", "web__fetch"]
+permissions = ["now", "fetch_url"]
 
-[agents.researcher.scopes."web__fetch"]
+[agents.researcher.scopes.fetch_url]
 max_calls = 10
 # No [y/N] prompt for these URLs (clean runs only, like auto_paths). Write host/* rather than
 # host*: '*' matches anything, so "https://docs.python.org*" would also match docs.python.org.evil.com
 auto_args = { url = ["https://docs.python.org/*"] }
 
-[agents.researcher.scopes."web__fetch".args.url]
+# fetch_url refuses local and private addresses and does not follow redirects by itself; these
+# rules matter most for MCP fetch tools, which may do neither
+[agents.researcher.scopes.fetch_url.args.url]
 allow = ["https://*"]                                       # case-sensitive; an allowed argument must be given
 deny = ["*localhost*", "*127.0.0.1*", "*169.254.169.254*"]  # ignores case
 max_len = 2000
+
+# ---------------------------------------------------------------------------------
+# Agent swarm: many helpers at once.  python aios.py chat --agent swarm_lead --policy policy.example.toml
+# The `swarm` tool reaches only helpers this agent may call one by one (agent__worker, agent__editor);
+# each task gets the same permission, scope, approval, taint and audit as a single delegation.
+# Batch mode, no lead model:  python aios.py swarm --policy policy.example.toml --agent worker \
+#                                 --tasks tasks.txt --out results.jsonl --parallel 64 --reduce editor
+[agents.swarm_lead]
+permissions = ["now", "list_files", "swarm", "agent__worker", "agent__editor"]
+
+[agents.swarm_lead.scopes.agent__worker]
+max_calls = 500         # per run: every swarm task counts
+
+[agents.worker]         # read-only: safe to run hundreds at once without approvals
+permissions = ["now", "read_file", "list_files"]
+
+[agents.editor]         # combines the workers' answers; it reads only what they returned
+permissions = []

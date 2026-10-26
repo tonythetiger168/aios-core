@@ -1,0 +1,60 @@
+name: larger models
+# The prompt-injection suite against bigger local models than the per-PR `ollama` job can afford
+# (that one uses qwen2.5:3b). CPU-only runners make each model take an hour or more, so this runs
+# weekly, by hand (Actions > larger models > Run workflow, any Ollama model name), and when this
+# file changes. Results are printed in the log and kept as the `injection-<model>` artifact.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ollama model to measure (empty: the default list)"
+        required: false
+  pull_request:
+    paths: [".github/workflows/models.yml"]
+
+jobs:
+  injection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(github.event.inputs.model && format('["{0}"]', github.event.inputs.model) || '["qwen2.5:7b","llama3.1:8b"]') }}
+    env:
+      AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
+      AIOS_TEST_CHAT_MODEL: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Install Ollama and pull the model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+          up() { timeout "$1" sh -c 'until curl -fsS http://127.0.0.1:11434/api/version; do sleep 1; done'; }
+          if ! up 20; then
+            (setsid ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &)
+            up 60 || { cat "$RUNNER_TEMP/ollama.log"; exit 1; }
+          fi
+          echo
+          ollama pull "$AIOS_TEST_CHAT_MODEL"
+          ollama list
+          nproc; free -m
+      - name: Prompt-injection suite against the model
+        shell: bash
+        run: |
+          start=$(date +%s)
+          python -m unittest tests.test_injection.RealModelTests -v 2>&1 | tee injection.txt
+          echo "took $(( $(date +%s) - start )) s on $(nproc) CPUs" | tee -a injection.txt
+      - name: Name the artifact
+        if: always()
+        run: echo "ARTIFACT=injection-$(printf %s "$AIOS_TEST_CHAT_MODEL" | tr -c 'A-Za-z0-9._-' '-')" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: injection.txt

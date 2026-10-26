@@ -12,6 +12,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11", "3.12"]
+        include:
+          - os: macos-latest  # the process sandbox is the default there too
+            python: "3.12"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +22,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt
+      - name: Install the MCP SDK (latest on 3.12, last 1.x on Windows 3.11, none on Ubuntu 3.11)
+        if: matrix.python == '3.12' || runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ matrix.python }}" = "3.12" ]; then pip install mcp; else pip install "mcp<2"; fi
+          python -c "import importlib.metadata as m; print('mcp', m.version('mcp'))"
       - name: Prepare the Docker sandbox tests (Linux runners only)
         if: runner.os == 'Linux'
         run: |
@@ -27,7 +36,126 @@ jobs:
           docker info --format 'CgroupVersion={{.CgroupVersion}} CgroupDriver={{.CgroupDriver}} SecurityOptions={{json .SecurityOptions}}'
           docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
           echo "AIOS_TEST_DOCKER=1" >> "$GITHUB_ENV"
+      - name: Let one job stop and restart the Docker daemon during calls
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: |
+          echo "AIOS_TEST_DOCKER_STOP=sudo systemctl stop docker.socket docker.service" >> "$GITHUB_ENV"
+          echo "AIOS_TEST_DOCKER_START=sudo systemctl start docker.socket docker.service && until docker info >/dev/null 2>&1; do sleep 0.5; done" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
+      - name: Install as a package and run the aios command outside the checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/pkg"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$RUNNER_TEMP/pkg/Scripts"; else bin="$RUNNER_TEMP/pkg/bin"; fi
+          "$bin/python" -m pip install -q .
+          cd "$RUNNER_TEMP"
+          "$bin/aios" --help > /dev/null
+          "$bin/aios" doctor --home "$RUNNER_TEMP/aios-home" || true  # exits 1 when something is unavailable
+          "$bin/python" -c "import aios, aios_egress, aios_a2a; print('installed', aios.__file__)"
+
+  docker-rootless:
+    # Rootless Docker: without cgroup delegation the daemon ignores --memory/--pids-limit/--cpus and
+    # AIOS must refuse it; with delegation (systemd user session) the real sandbox tests must pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Install rootless Docker (same version as the runner's Docker)
+        run: |
+          V=$(docker version --format '{{.Server.Version}}'); echo "docker $V"
+          sudo apt-get install -y -q uidmap
+          curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-$V.tgz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1
+          # the setup tool looks for the docker CLI next to itself
+          [ -e /usr/local/bin/docker ] || sudo ln -s "$(command -v docker)" /usr/local/bin/docker
+          grep -q "^$USER:" /etc/subuid || echo "$USER:200000:65536" | sudo tee -a /etc/subuid /etc/subgid
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor by default
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Without cgroup delegation the limits are ignored and AIOS refuses the daemon
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          # rootless with the cgroupfs driver gets no cgroups at all (CgroupDriver=none)
+          (setsid dockerd-rootless.sh --exec-opt native.cgroupdriver=cgroupfs > "$RUNNER_TEMP/rootless-nocgroup.log" 2>&1 &)
+          export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+          timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 0.5; done' || { cat "$RUNNER_TEMP/rootless-nocgroup.log"; exit 1; }
+          docker info --format 'CgroupDriver={{.CgroupDriver}} MemoryLimit={{.MemoryLimit}} PidsLimit={{.PidsLimit}} SecurityOptions={{json .SecurityOptions}}'
+          docker pull -q python:3.12-slim
+          AIOS_TEST_DOCKER_NO_LIMITS=1 python -m unittest tests.test_aios.RealDockerWithoutLimitsTests -v
+          pkill -u "$USER" -x rootlesskit; timeout 30 sh -c 'while pgrep -u "$USER" -x dockerd >/dev/null; do sleep 0.5; done'
+      - name: With cgroup v2 delegation the real sandbox tests pass on rootless Docker
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl restart "user@$(id -u).service"  # a running user manager keeps its old delegation
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          timeout 60 sh -c 'until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 0.5; done'
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+          dockerd-rootless-setuptool.sh install --force
+          export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+          timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 0.5; done'
+          docker info --format 'CgroupDriver={{.CgroupDriver}} MemoryLimit={{.MemoryLimit}} PidsLimit={{.PidsLimit}} SecurityOptions={{json .SecurityOptions}}'
+          docker pull -q python:3.12-slim
+          AIOS_TEST_DOCKER=1 python -m unittest tests.test_aios.RealDockerSandboxTests -v
+
+  ollama:
+    # Real models on a real Ollama server: vector memory search with an embedding model (not the
+    # stand-in), and the prompt-injection suite measured against a small local chat model.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # the injection suite on qwen2.5:3b takes about 25 minutes
+    env:
+      AIOS_TEST_EMBED_URL: http://127.0.0.1:11434/v1
+      AIOS_TEST_EMBED_MODEL: nomic-embed-text
+      AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
+      AIOS_TEST_CHAT_MODEL: qwen2.5:3b
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Install Ollama and pull the embedding model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+          # install.sh starts a systemd service, but on some runners it never comes up: start one here then
+          up() { timeout "$1" sh -c 'until curl -fsS http://127.0.0.1:11434/api/version; do sleep 1; done'; }
+          if ! up 20; then
+            sudo systemctl status ollama --no-pager || true
+            (setsid ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &)
+            up 60 || { cat "$RUNNER_TEMP/ollama.log"; exit 1; }
+          fi
+          echo
+          ollama pull "$AIOS_TEST_EMBED_MODEL"
+          ollama pull "$AIOS_TEST_CHAT_MODEL"
+          ollama list
+      - name: Record how the model scores notes against queries
+        run: |
+          python - <<'PY'
+          import asyncio, os, statistics, aios_memory as m
+          notes = {"pet": "my dog is named Max", "editor": "I use vim for programming",
+                   "drink": "I like green tea", "health": "I am allergic to peanuts",
+                   "sister": "my sister lives in Taipei"}
+          queries = ["puppy", "nut allergy", "beverage", "sibling", "tomorrow weather forecast"]
+          e = m.Embedder(os.environ["AIOS_TEST_EMBED_MODEL"], os.environ["AIOS_TEST_EMBED_URL"])
+          async def main():
+              docs = await e.embed([f"{k}: {v}" for k, v in notes.items()])
+              anchors = await e.embed(list(m.ANCHORS))
+              for q in queries:
+                  (qv,) = await e.embed([q])
+                  base = statistics.median(m.cosine(qv, a) for a in anchors)
+                  print(f"{q:28} anchors={base:.3f} floor={max(m.MIN_COSINE, base + m.VECTOR_MARGIN):.3f}",
+                        "  ".join(f"{k}={m.cosine(qv, d):.3f}" for k, d in zip(notes, docs)))
+          asyncio.run(main())
+          PY
+      - run: python -m unittest tests.test_memory -v
+      - name: Prompt-injection suite against a real model
+        run: python -m unittest tests.test_injection -v
 
   microvm:
     # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
@@ -57,6 +185,7 @@ jobs:
           echo "$FC_SHA256  $RUNNER_TEMP/fc.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/fc.tgz" -C "$RUNNER_TEMP"
           install -m 0755 "$RUNNER_TEMP/release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64" "$d/firecracker"
+          install -m 0755 "$RUNNER_TEMP/release-$FC_VERSION-x86_64/jailer-$FC_VERSION-x86_64" "$d/jailer"
           curl -fsSL -o "$d/vmlinux" "https://s3.amazonaws.com/spec.ccfc.min/$KERNEL_KEY"
           echo "$KERNEL_SHA256  $d/vmlinux" | sha256sum -c -
           docker pull python:3.12-slim
@@ -72,6 +201,11 @@ jobs:
             sha256sum "$AIOS_MICROVM_DIR"/firecracker "$AIOS_MICROVM_DIR"/vmlinux "$AIOS_MICROVM_DIR"/rootfs.ext4
             docker image inspect --format '{{json .RepoDigests}}' python:3.12-slim
             python -m unittest tests.test_microvm -v 2>&1
+            echo "--- booting every call (AIOS_MICROVM_SNAPSHOT=0)"
+            AIOS_MICROVM_SNAPSHOT=0 python -m unittest tests.test_microvm -v 2>&1
+            echo "--- jailed (as root, AIOS_MICROVM_JAILER=1)"
+            sudo -E env "PATH=$PATH" AIOS_MICROVM_JAILER=1 python -m unittest tests.test_microvm -v 2>&1
+            ls -la "$AIOS_MICROVM_DIR/snapshots"/*
           } 2>&1 | tee microvm-evidence.txt
       - uses: actions/upload-artifact@v4
         if: always()

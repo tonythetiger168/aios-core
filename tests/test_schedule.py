@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -317,6 +318,64 @@ class SchedulerTests(SchedulerCase):
         self.assertEqual(len(prov.calls), 2)
         self.clock.t += timedelta(days=1, minutes=5)  # the window moves on
         self.assertEqual([r["status"] for r in await s.tick()], ["ok"])
+
+    def on_clock(self):
+        """Audit timestamps follow the test clock, so the 24-hour budget window moves with it."""
+        clock = self.clock
+
+        class Clocked(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock()
+        patcher = mock.patch.object(aios, "datetime", Clocked)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_a_daily_token_budget_is_shared_by_all_jobs(self):
+        self.on_clock()
+        spend = lambda: [call("now", {}, tin=300, tout=300), text("ok")]  # 600 tokens, then an answer
+        k, prov, s = self.make(*spend(), *spend(), *spend(), *spend(), daily_tokens=1000)
+        self.job(k, "a", schedule="every 1m")
+        self.job(k, "b", schedule="every 1m")
+        first = {r["job"]: r for r in await s.tick()}
+        self.assertEqual(first["a"]["status"], "ok")  # 600 of 1000
+        self.assertEqual(first["b"]["status"], "stopped")  # only 400 were left for this run
+        self.assertIn("token budget exhausted (600/400)", first["b"]["output"])
+        self.clock.t += timedelta(minutes=2)
+        later = await s.tick()
+        self.assertEqual([r["status"] for r in later], ["skipped", "skipped"])
+        self.assertIn("daily token budget of 1000 reached (1200 used in 24h)", later[0]["output"])
+        self.assertEqual(len(prov.calls), 3)  # skipped runs never call the model
+        self.clock.t += timedelta(days=1)
+        self.assertEqual([r["status"] for r in await s.tick()], ["ok", "ok"])  # the window moved on
+
+    async def test_a_daily_cost_budget_needs_prices_and_is_enforced(self):
+        with self.assertRaisesRegex(ValueError, "needs prices"):
+            self.make(daily_cost=1.0)
+        self.on_clock()
+        priced = aios.Budget(max_total_tokens=50_000, price_in_per_mtok=1_000_000)  # $1 per input token
+        k, _, s = self.make(text("ok", tin=1), call("now", {}, tin=4), budget=priced, daily_cost=5.0)
+        self.job(k, schedule="every 1m")
+        self.assertEqual([r["status"] for r in await s.tick()], ["ok"])  # $1
+        self.clock.t += timedelta(minutes=2)
+        # $4 more, and the next prompt would cost at least $4 again with nothing left: stopped before it
+        self.assertEqual([r["status"] for r in await s.tick()], ["stopped"])
+        self.clock.t += timedelta(minutes=2)
+        (r,) = await s.tick()
+        self.assertEqual(r["status"], "skipped")
+        self.assertIn("daily cost budget of $5.0000 reached ($5.0000 used in 24h)", r["output"])
+
+    async def test_a_timed_out_run_still_records_what_it_spent(self):
+        async def slow():
+            await asyncio.sleep(5)
+
+        k, _, s = self.make(call("now", {}, tin=700, tout=50), slow, timeout=0.1)
+        self.job(k)
+        (r,) = await s.tick()
+        self.assertEqual(r["status"], "timeout")
+        (run,) = [e for e in k.store.audit_tail() if e["tool"] == aios.RUN_ENTRY]
+        self.assertEqual(run["status"], "cancelled")
+        self.assertEqual(k.store.job_usage_since("2000-01-01")[0], 750)
 
     async def test_output_is_truncated_in_history(self):
         k, _, s = self.make(text("x" * 10_000))

@@ -7,6 +7,7 @@ import contextlib
 import copy
 import io
 import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import aios  # noqa: E402
+import aios_watchdog  # noqa: E402
 
 
 # ---- scripted fake provider (no network, no API key) ----
@@ -44,7 +46,8 @@ class FakeProvider:
 
     async def complete(self, system, messages, tools, max_tokens=1024):
         # snapshot: the kernel keeps mutating history after the call
-        self.calls.append(copy.deepcopy({"system": system, "messages": messages, "tools": tools}))
+        self.calls.append(copy.deepcopy({"system": system, "messages": messages, "tools": tools,
+                                         "max_tokens": max_tokens}))
         return self.responses.pop(0)
 
 
@@ -130,7 +133,101 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([e["tool"] for e in s.audit_tail("a1")], ["now", "run_python"])
         self.assertEqual(s.audit_tail("a1", n=1)[0]["status"], "denied")
         public = [n for n in dir(aios.Store) if "audit" in n]
-        self.assertEqual(sorted(public), ["audit_tail", "log_audit"])  # no update/delete API
+        self.assertEqual(sorted(public), ["append_audit", "audit_row", "audit_tail", "log_audit",
+                                          "verify_audit"])  # no update/delete API
+
+    def chained(self, n=4):
+        s = aios.Store(":memory:")
+        self.addCleanup(s.db.close)
+        for i in range(n):
+            s.log_audit("a", f"t{i}", {"i": i}, f"r{i}", "ok")
+        return s
+
+    def test_audit_hash_chain_verifies(self):
+        s = self.chained()
+        v = s.verify_audit()
+        self.assertEqual((v["ok"], v["checked"], v["unchained"]), (True, 4, 0))
+        self.assertEqual(v["head"], s.db.execute("SELECT hash FROM audit ORDER BY id DESC").fetchone()[0])
+        self.assertTrue(aios.Store(":memory:").verify_audit()["ok"])  # an empty log is fine
+
+    def test_audit_tampering_is_detected(self):
+        edits = {
+            "edited": "UPDATE audit SET result='nothing to see' WHERE id=2",
+            "removed": "DELETE FROM audit WHERE id=2",
+            "inserted": "INSERT INTO audit(id, ts, agent, tool, args, result, status, hash) "
+                        "SELECT 25, ts, agent, 'fake', args, result, status, hash FROM audit WHERE id=2",
+            "reordered": "UPDATE audit SET id=id+100 WHERE id=1",
+            "tail removed": "DELETE FROM audit WHERE id=4",
+            "hash cleared": "UPDATE audit SET hash=NULL WHERE id=3",
+        }
+        for what, sql in edits.items():
+            with self.subTest(what):
+                s = self.chained()
+                s.db.execute(sql)
+                v = s.verify_audit()
+                self.assertFalse(v["ok"], v)
+                self.assertTrue(v["problem"])
+
+    def test_a_rebuilt_chain_is_caught_by_a_saved_head(self):
+        s = self.chained()
+        head = s.verify_audit()["head"]
+        self.assertTrue(s.verify_audit(head)["head_found"])
+        s.log_audit("a", "later", {}, "", "ok")
+        self.assertTrue(s.verify_audit(head)["ok"])  # later entries do not matter
+        # an attacker who can write aios.db edits an entry and recomputes every hash after it
+        s.db.execute("UPDATE audit SET result='edited' WHERE id=2")
+        prev = ""
+        for rid, *row in s.db.execute("SELECT id, ts, agent, tool, args, result, status FROM audit ORDER BY id").fetchall():
+            prev = aios_watchdog.audit_hash(prev, *row)
+            s.db.execute("UPDATE audit SET hash=? WHERE id=?", (prev, rid))
+        self.assertTrue(s.verify_audit()["ok"])  # the chain alone cannot tell
+        v = s.verify_audit(head)
+        self.assertFalse(v["ok"])
+        self.assertIn("saved head", v["problem"])
+
+    def test_entries_from_before_chaining_are_reported_not_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "aios.db")
+            old = sqlite3.connect(db)  # an older AIOS: audit table without a hash column
+            old.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, agent TEXT, "
+                        "tool TEXT, args TEXT, result TEXT, status TEXT)")
+            old.execute("INSERT INTO audit(ts, agent, tool, args, result, status) VALUES('t','a','x','{}','','ok')")
+            old.commit()
+            old.close()
+            s = aios.Store(db)
+            s.log_audit("a", "new", {}, "", "ok")
+            v = s.verify_audit()
+            self.assertEqual((v["ok"], v["checked"], v["unchained"]), (True, 1, 1))
+            s.db.close()
+
+    def test_two_writers_on_one_database_keep_one_chain(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = str(Path(d) / "aios.db")
+            a, b = aios.Store(db), aios.Store(db)
+            for i in range(20):
+                (a if i % 2 else b).log_audit("x", f"t{i}", {}, "", "ok")
+            v = a.verify_audit()
+            self.assertEqual((v["ok"], v["checked"]), (True, 20))
+            a.db.close()
+            b.db.close()
+
+    def test_audit_verify_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = aios.Store(str(Path(d) / "aios.db"))
+            s.log_audit("a", "t", {}, "r", "ok")
+            head = s.verify_audit()["head"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True), 0)
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True, head=head), 0)
+            self.assertIn(f"OK. head: {head}", out.getvalue())
+            s.db.execute("UPDATE audit SET result='x'")
+            s.db.commit()
+            s.db.close()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(aios.audit_cmd(None, 5, d, verify=True), 1)
+            self.assertIn("TAMPERED", out.getvalue())
 
     def test_audit_truncates_large_payloads(self):
         s = aios.Store(":memory:")
@@ -328,6 +425,18 @@ class BudgetTests(unittest.TestCase):
         self.assertIn("cost budget", c.exceeded(1000, 2000))  # $0.011
         self.assertIsNone(aios.Budget().exceeded(10**9, 10**9))  # no limits by default
 
+    def test_output_room_leaves_space_for_the_next_prompt(self):
+        self.assertEqual(aios.Budget().output_room(10**9, 10**9, 10**9), aios.REPLY_TOKENS)
+        b = aios.Budget(max_total_tokens=1000)
+        self.assertEqual(b.output_room(0, 0, 0), 1000)
+        self.assertEqual(b.output_room(300, 100, 300), 300)  # 1000 - 400 used - a 300-token prompt
+        self.assertEqual(b.output_room(600, 100, 600), 0)
+        c = aios.Budget(max_cost_usd=0.01, price_in_per_mtok=1.0, price_out_per_mtok=10.0)
+        self.assertEqual(c.output_room(1000, 0, 1000), 800)  # $0.008 left / $10 per Mtok
+        only_in = aios.Budget(max_cost_usd=0.01, price_in_per_mtok=10.0)  # replies cost nothing
+        self.assertEqual(only_in.output_room(0, 0, 500), aios.REPLY_TOKENS)
+        self.assertEqual(only_in.output_room(500, 0, 500), 0)  # the prompt alone uses the rest
+
 
 class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
     def kernel(self, *resp, **kw):
@@ -351,6 +460,29 @@ class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["status"], "budget")
         self.assertIn("tokens_in=600 tokens_out=500", r["result"])
         self.assertEqual(len(k.provider.calls), 1)
+
+    async def test_each_reply_is_capped_to_what_the_budget_has_left(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50),
+                        Resp([text("done")], "end_turn", 450, 20),
+                        budget=aios.Budget(max_total_tokens=1000))
+        self.assertEqual(await k._run(aios.Agent("a", {"act"}), "go"), "done")
+        self.assertEqual([c["max_tokens"] for c in k.provider.calls], [1000, 150])  # 1000 - 450 - 400
+
+    async def test_no_call_when_the_next_prompt_alone_would_use_the_budget(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50), budget=aios.Budget(max_total_tokens=900))
+        out = await k._run(aios.Agent("a", {"act"}), "go")
+        self.assertIn("no room for another model call: 450 tokens used, the last prompt was 400", out)
+        self.assertEqual(len(k.provider.calls), 1)
+        self.assertEqual(self.ran, [1])  # the first step was within budget, so its tool ran
+        self.assertEqual(run_log(k)[0]["status"], "budget")
+
+    async def test_a_reply_cut_off_by_the_budget_says_so(self):
+        k = self.kernel(Resp([tool_use("act", {})], "tool_use", 400, 50),
+                        Resp([text("half an ans")], "max_tokens", 450, 150),
+                        budget=aios.Budget(max_total_tokens=1000))
+        out = await k._run(aios.Agent("a", {"act"}), "go")
+        self.assertTrue(out.startswith("half an ans\n(stopped: the reply was cut off at the budget)"), out)
+        self.assertEqual(run_log(k)[0]["status"], "budget")
 
     async def test_history_is_repaired_after_budget_stop(self):
         k = self.kernel(Resp([tool_use("act", {})], "tool_use", 2000, 0),
@@ -386,6 +518,47 @@ class KernelBudgetTests(unittest.IsolatedAsyncioTestCase):
         out = await k._run(aios.Agent("a", {"act"}), "go", aios.Budget(max_steps=2))
         self.assertEqual(out, "(max steps reached)")
         self.assertEqual(run_log(k)[0]["status"], "max_steps")
+
+    def pick_kernel(self, *resp, **kw):
+        k = self.kernel(*resp, **kw)
+
+        @k.tools.register("pick", "pick", {"x": {"type": "integer"}})
+        async def pick(x):
+            self.ran.append(x)
+            return "picked"
+
+        return k
+
+    async def test_loop_guard_refuses_a_repeated_call_then_stops_the_run(self):
+        k = self.pick_kernel(*[Resp([tool_use("pick", {"x": 1}, id=f"t{i}")], "tool_use") for i in range(8)])
+        out = await k._run(aios.Agent("a", {"pick"}), "go", aios.Budget(max_steps=10, max_repeats=2))
+        self.assertEqual(len(self.ran), 2)  # the third identical call is refused, the fourth stops the run
+        self.assertIn("loop guard", out)
+        self.assertEqual(run_log(k)[0]["status"], "loop")
+        refused = [r for r in k.store.audit_tail(n=50) if r["status"] == "loop" and r["tool"] == "pick"]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("loop guard", k.store.load_messages("a")[-2]["content"][0]["content"])
+
+    async def test_loop_guard_recovers_when_the_model_changes_course(self):
+        k = self.pick_kernel(Resp([tool_use("pick", {"x": 1}, id="t1")], "tool_use"),
+                        Resp([tool_use("pick", {"x": 1}, id="t2")], "tool_use"),  # refused
+                        Resp([tool_use("pick", {"x": 2}, id="t3")], "tool_use"),  # different arguments: runs
+                        Resp([text("done")], "end_turn"))
+        out = await k._run(aios.Agent("a", {"pick"}), "go", aios.Budget(max_repeats=1))
+        self.assertEqual(out, "done")
+        self.assertEqual(len(self.ran), 2)
+        self.assertEqual(run_log(k)[0]["status"], "ok")
+
+    async def test_loop_guard_off(self):
+        k = self.kernel(*[Resp([tool_use("act", {}, id=f"t{i}")], "tool_use") for i in range(6)])
+        await k._run(aios.Agent("a", {"act"}), "go", aios.Budget(max_steps=6, max_repeats=None))
+        self.assertEqual(len(self.ran), 6)
+
+    def test_loop_guard_key_ignores_argument_order(self):
+        self.assertEqual(aios._call_key("t", {"a": 1, "b": 2}), aios._call_key("t", {"b": 2, "a": 1}))
+        self.assertNotEqual(aios._call_key("t", {"a": 1}), aios._call_key("u", {"a": 1}))
+        with self.assertRaises(ValueError):
+            aios.Budget(max_repeats=0)
 
     async def test_provider_error_is_logged_and_raised(self):
         class Boom:
@@ -450,6 +623,8 @@ class OpenAICompatTests(unittest.IsolatedAsyncioTestCase):
     def test_plain_answer_and_bad_arguments(self):
         c = self.P.from_wire({"choices": [{"message": {"content": "done"}}]})
         self.assertEqual((c.stop_reason, c.input_tokens), ("end_turn", 0))
+        cut = self.P.from_wire({"choices": [{"message": {"content": "hal"}, "finish_reason": "length"}]})
+        self.assertEqual(cut.stop_reason, "max_tokens")
         bad = self.P.from_wire({"choices": [{"message": {"content": None, "tool_calls": [
             {"id": "1", "function": {"name": "t", "arguments": "{not json"}}]}}]})
         self.assertIn("_invalid_arguments", bad.content[0]["input"])  # becomes a tool error, no crash
@@ -492,6 +667,9 @@ class OpenAICompatTests(unittest.IsolatedAsyncioTestCase):
 
         await Fake("m").complete("S", [{"role": "user", "content": "x"}], [])
         self.assertNotIn("tools", sent[0])
+        self.assertNotIn("temperature", sent[0])  # the server's default unless asked
+        await Fake("m", temperature=0.2).complete("S", [{"role": "user", "content": "x"}], [])
+        self.assertEqual(sent[1]["temperature"], 0.2)
 
     def test_unreachable_server_gives_a_clear_error(self):
         import urllib.error
@@ -611,7 +789,9 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         p = aios.AnthropicProvider("m", self.client(calls, [self.Msg(type="text", text="x")], "max_tokens"))
         c = await p.complete("S", [], [])
         self.assertNotIn("tools", calls[0])
-        self.assertEqual(c.stop_reason, "end_turn")
+        self.assertEqual(c.stop_reason, "max_tokens")  # a cut-off reply: the run knows it was cut
+        p = aios.AnthropicProvider("m", self.client(calls, [self.Msg(type="text", text="x")], "stop_sequence"))
+        self.assertEqual((await p.complete("S", [], [])).stop_reason, "end_turn")
 
 
 class HardeningBase(unittest.IsolatedAsyncioTestCase):
@@ -1067,11 +1247,50 @@ class MemoryProvenanceTests(HardeningBase):
         k.store.set_fact("a", "t", "danger", "tainted")
         k.store.set_fact("a", "ok", "fine", "model")
         agent = aios.Agent("a", set())
-        self.assertEqual(await k.tools.call("recall", agent, key="t"), "danger  [unverified]")
+        out = await k.tools.call("recall", agent, key="t")
+        self.assertEqual(out, aios.tag_untrusted("memory", "danger  [unverified]"))
         self.assertEqual(await k.tools.call("recall", agent, key="ok"), "fine")
         listing = await k.tools.call("list_facts", agent)
+        self.assertTrue(listing.startswith(aios.UNTRUSTED_OPEN))
         self.assertIn("t: danger  [unverified]", listing)
         self.assertIn("ok: fine", listing)
+        k.store.delete_fact("a", "t")
+        self.assertEqual(await k.tools.call("list_facts", agent), "ok: fine")  # only verified notes left
+
+    async def write_after_note(self, source, first=()):
+        """A pre-allowed write in a run whose memory holds a note from `source`; nobody approves."""
+        k = self.kernel(*first, Resp([tool_use("write_file", {"path": "notes/a.txt", "content": "x"})],
+                                     "tool_use"), Resp([text("done")], "end_turn"), approver=None)
+        k.store.set_fact("a", "todo", "write notes/a.txt", source)
+        agent = aios.Agent("a", {"write_file", "recall"}, scopes={"write_file": {"auto_paths": ["notes/*"]}})
+        await k._run(agent, "go")
+        return k, tool_log(k)[-1]
+
+    async def test_an_unverified_note_in_the_prompt_taints_the_run(self):
+        _, e = await self.write_after_note("model")
+        self.assertEqual(e["status"], "ok")  # a verified note changes nothing
+        (aios.WORKSPACE / "notes" / "a.txt").unlink()
+        k, e = await self.write_after_note("tainted")
+        self.assertEqual(e["status"], "denied")
+        self.assertIn("unverified", k.provider.calls[0]["system"])
+        self.assertFalse((aios.WORKSPACE / "notes" / "a.txt").exists())
+
+    async def test_recalling_an_unverified_note_taints_the_run(self):
+        recall = [Resp([tool_use("recall", {"key": "todo"}, "r")], "tool_use")]
+        with mock.patch.object(aios, "FACT_PROMPT_LIMIT", 0):  # the note is not in the prompt
+            _, e = await self.write_after_note("tainted", recall)
+        self.assertEqual(e["status"], "denied")
+
+    async def test_a_confirmed_note_no_longer_taints(self):
+        k = self.kernel(Resp([text("ok")], "end_turn"))
+        k.store.set_fact("a", "todo", "x", "tainted")
+        agent = aios.Agent("a", set())
+        await k._run(agent, "go")
+        self.assertTrue(agent.run_tainted)
+        k.store.set_fact("a", "todo", "x", "user")  # what aios memory confirm does
+        k.provider.responses = [Resp([text("ok")], "end_turn")]
+        await k._run(agent, "again")
+        self.assertFalse(agent.run_tainted)
 
     def test_cli_remember_forget_and_facts_commands(self):
         import builtins
@@ -1097,6 +1316,48 @@ class MemoryProvenanceTests(HardeningBase):
         self.assertIn("forgotten", text_out)
         self.assertIn("no such fact", text_out)
         self.assertIn("(no facts yet)", text_out)
+
+
+class ChatDailyLimitTests(unittest.TestCase):
+    def chat(self, d, *lines, **kw):
+        import builtins
+        import contextlib
+        import io
+        it, out, old_cwd = iter([*lines, "/quit"]), io.StringIO(), os.getcwd()
+        provider = FakeProvider(*[Resp([text("hi")], "end_turn", 200, 50) for _ in lines])
+        os.chdir(d)
+        try:
+            with mock.patch.object(builtins, "input", lambda prompt="": next(it)), contextlib.redirect_stdout(out):
+                asyncio.run(aios.chat("t", [], provider=provider, budget=aios.Budget(), **kw))
+        finally:
+            os.chdir(old_cwd)
+        return out.getvalue(), provider
+
+    def test_the_daily_limit_covers_every_session_of_the_agent(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, p = self.chat(d, "one", "two", daily_tokens=300)
+            self.assertEqual(len(p.calls), 1)  # 250 used: too little left for another call
+            self.assertIn("daily token budget of 300 reached (250 used in 24h): not calling the model", out)
+            out, p = self.chat(d, "three", daily_tokens=300)  # a new session still counts the old one
+            self.assertEqual(p.calls, [])
+            self.assertIn("reached (250 used in 24h)", out)
+            out, p = self.chat(d, "four", daily_tokens=1000)
+            self.assertEqual(len(p.calls), 1)
+            self.assertEqual(p.calls[0]["max_tokens"], 750)  # what is left today caps the reply
+
+    def test_flags_are_checked(self):
+        import contextlib
+        import io
+        for argv, why in ((["--daily-max-tokens", "0"], "must be positive"),
+                          (["--daily-max-cost", "1"], "needs --price-in")):
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", ["aios", "chat", *argv]), contextlib.redirect_stderr(err), \
+                    mock.patch.object(aios, "chat") as c, mock.patch.object(aios, "build_model",
+                                                                           return_value=(None, None)), \
+                    self.assertRaises(SystemExit):
+                aios.cli()
+            c.assert_not_called()
+            self.assertIn(why, err.getvalue())
 
 
 @unittest.skipUnless(sys.version_info >= (3, 11), "tomllib needs Python 3.11+")
@@ -1196,6 +1457,74 @@ class WorkspaceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.call("list_facts"), "k: v")
 
 
+def _appcontainer_ok() -> bool:
+    import aios_appcontainer
+    return aios_appcontainer.unavailable() is None
+
+
+@unittest.skipUnless(aios.IS_WINDOWS and _appcontainer_ok(), "needs Windows with AppContainers")
+class WindowsSandboxTests(unittest.IsolatedAsyncioTestCase):
+    """The process sandbox on Windows: an AppContainer in a job object, really run."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(setattr, aios, "WORKSPACE", aios.WORKSPACE)
+        aios.WORKSPACE = Path(self._tmp.name).resolve()
+
+    async def test_code_runs_and_reads_only_python_and_the_workspace(self):
+        box = aios.Sandbox()
+        self.assertEqual((box.fs_isolated, box.net_isolated), ("appcontainer", "all"))
+        home = Path(os.environ["USERPROFILE"])
+        with tempfile.TemporaryDirectory(dir=home) as outside:  # in your user folder, not the workspace
+            secret = Path(outside, "secret.txt")
+            secret.write_text("key", encoding="utf-8")
+            (aios.WORKSPACE / "data.txt").write_text("ws", encoding="utf-8")
+            code = "\n".join([
+                "import json, os, sqlite3, tempfile",  # stdlib and C extensions load
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(secret)!r}).read()))",
+                f"print(try_(lambda: os.listdir({outside!r})))",
+                "print(try_(lambda: open('../data.txt').read()))",  # the workspace: read-only
+                "print(try_(lambda: open('../new.txt', 'w')))",
+                "print(try_(lambda: open('mine.txt', 'w').write('ok')))",  # its own folder
+                "print(try_(lambda: tempfile.mkstemp()[0] > 0))",
+                "print(6 * 7)",
+            ])
+            out = (await box.run_python(code)).splitlines()
+        self.assertEqual(out, ["exit=0", "PermissionError", "PermissionError", "ws", "PermissionError",
+                               "2", "True", "42"])
+
+    async def test_no_network_not_even_this_machine(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        try:
+            out = await aios.Sandbox().run_python(
+                f"import socket\ntry:\n    socket.create_connection(('127.0.0.1', {srv.getsockname()[1]}), timeout=3)\n"
+                "    print('connected')\nexcept OSError as e:\n    print('refused', type(e).__name__)")
+        finally:
+            srv.close()
+        self.assertIn("refused", out)
+
+    async def test_memory_processes_and_time_are_limited(self):
+        out = await aios.Sandbox(mem_mb=128).run_python(
+            "try:\n    b = bytearray(400 * 2**20)\n    print('allocated')\nexcept MemoryError:\n    print('MemoryError')")
+        self.assertIn("MemoryError", out)
+        code = ("import subprocess, sys\nkids, n = [], 0\nfor i in range(8):\n    try:\n"
+                "        kids.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']))\n"
+                "        n += 1\n    except OSError:\n        pass\nprint('started', n)\nfor k in kids:\n    k.kill()")
+        out = await aios.Sandbox(max_procs=3, timeout=30).run_python(code)
+        self.assertIn("started 2", out)  # the job holds 3 processes: this one and two children
+        self.assertEqual(await aios.Sandbox(timeout=2).run_python("while True:\n    pass"),
+                         "killed: timeout after 2s")
+
+
 @unittest.skipIf(aios.IS_WINDOWS, "real sandbox limits are Linux-only")
 class SandboxTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1219,6 +1548,237 @@ class SandboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_output_is_truncated(self):
         out = await aios.Sandbox(max_out=100).run_python("print('x'*5000)")
         self.assertIn("(truncated)", out)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_NPROC accounting is read from /proc")
+    def test_user_tasks_counts_our_own_threads(self):
+        import threading
+        before = aios._user_tasks()
+        self.assertGreaterEqual(before, 1)
+        stop = threading.Event()
+        ts = [threading.Thread(target=stop.wait) for _ in range(5)]
+        for t in ts:
+            t.start()
+        try:
+            self.assertGreaterEqual(aios._user_tasks(), before + 5)
+        finally:
+            stop.set()
+            for t in ts:
+                t.join()
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.getuid() != 0,
+                         "the kernel ignores RLIMIT_NPROC for root")
+    async def test_a_fork_bomb_stops_at_max_procs(self):
+        code = ("import os, time\nn = 0\ntry:\n    for _ in range(500):\n        if os.fork() == 0:\n"
+                "            time.sleep(2); os._exit(0)\n        n += 1\nexcept OSError:\n    pass\n"
+                "print('forked', n)")
+        out = await aios.Sandbox(max_procs=20, timeout=20).run_python(code)
+        n = int(out.split("forked")[1])
+        self.assertLess(n, 25, out)  # a few slack for processes the user started meanwhile
+
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(),
+                         "needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
+    async def test_files_are_confined_to_python_and_the_workspace(self):
+        with tempfile.TemporaryDirectory() as outside:  # not under the workspace
+            secret = Path(outside, "secret.txt")
+            secret.write_text("key", encoding="utf-8")
+            (aios.WORKSPACE / "data.txt").write_text("ws", encoding="utf-8")
+            code = "\n".join([
+                "import json, os, sqlite3, subprocess, tempfile",  # stdlib, C extensions, exec
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(secret)!r}).read()))",
+                f"print(try_(lambda: os.listdir({outside!r})))",
+                "print(try_(lambda: open('../data.txt').read()))",  # the workspace: read-only
+                "print(try_(lambda: open('../new.txt', 'w')))",
+                "print(try_(lambda: open('mine.txt', 'w').write('ok')))",  # its own folder
+                "print(try_(lambda: tempfile.mkstemp()[0] > 0))",
+                "print(subprocess.run(['true']).returncode)",
+            ])
+            out = (await aios.Sandbox().run_python(code)).splitlines()
+        self.assertEqual(out, ["exit=0", "PermissionError", "PermissionError", "ws", "PermissionError",
+                               "2", "True", "0"])
+
+    @unittest.skipUnless(aios.landlock_abi() >= 4 or aios.seatbelt_ok() or
+                         (aios.landlock_abi() >= 1 and aios.Sandbox().net_isolated),
+                         "needs a network namespace, Landlock ABI 4 or sandbox-exec")
+    async def test_no_tcp_connection_to_the_host(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        try:
+            port = srv.getsockname()[1]
+            out = await aios.Sandbox().run_python(
+                f"import socket\ntry:\n    socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
+                "    print('connected')\nexcept OSError as e:\n    print('refused', type(e).__name__)")
+        finally:
+            srv.close()
+        self.assertIn("refused", out)
+
+    def test_seatbelt_profile_denies_network_and_writes_outside_its_folder(self):
+        prof = aios._seatbelt_profile("/w/run1")
+        self.assertIn("(deny network*)", prof)
+        self.assertIn(f'(allow file-write* (subpath {aios._sbpl("/w/run1")})', prof)
+        self.assertIn('(deny file-read* (subpath "/Users")', prof)
+        # the allows come after the denies: in Seatbelt the last matching rule wins
+        self.assertLess(prof.index("(deny file-read*"), prof.index("(allow file-read*"))
+        self.assertIn(json.dumps(os.path.realpath(str(aios.WORKSPACE))), prof)
+
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(),
+                         "needs Landlock (Linux 5.13+) or sandbox-exec (macOS)")
+    def test_a_confined_mcp_server_keeps_the_network_but_not_your_files(self):
+        import socket
+        import subprocess
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as prog:
+            Path(outside, "secret.txt").write_text("key", encoding="utf-8")
+            server = Path(prog, "server.py")
+            server.write_text("\n".join([
+                "import os, socket, sys",
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(Path(outside, 'secret.txt'))!r}).read()))",
+                f"print(try_(lambda: open({str(Path(outside, 'new.txt'))!r}, 'w')))",
+                "print(try_(lambda: open(os.path.join(sys.argv[1], 'state.txt'), 'w').write('ok')))",
+                "print(try_(lambda: open(__file__).read()[:6]))",  # its own program
+                f"print(try_(lambda: socket.create_connection(('127.0.0.1', {srv.getsockname()[1]})) and 'net'))",
+            ]), encoding="utf-8")
+            argv = aios.confine_command(sys.executable, [str(server), state], state)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        srv.close()
+        self.assertEqual(r.stdout.splitlines(), ["PermissionError", "PermissionError", "2", "import", "net"],
+                         r.stderr)
+
+    @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(), "needs Landlock or sandbox-exec")
+    def test_confined_code_cannot_reach_unix_sockets(self):
+        """A socket file is not a file read: without this, confined code could talk to the Docker
+        daemon, ssh-agent or the D-Bus session bus and get out that way."""
+        import socket
+        import subprocess
+        with tempfile.TemporaryDirectory(dir="/tmp") as d, tempfile.TemporaryDirectory() as state:
+            path = os.path.join(d, "s.sock")
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(path)
+            srv.listen()
+            probe = Path(d, "probe.py")
+            probe.write_text("\n".join([
+                "import socket",
+                "try:",
+                "    s = socket.socket(socket.AF_UNIX)",
+                f"    s.connect({path!r})",
+                "    print('connected')",
+                "except OSError as e:",
+                "    print('refused', type(e).__name__)",
+                "a, b = socket.socketpair()",  # still fine: asyncio needs it, and it reaches nothing
+                "a.send(b'x')",
+                "print('pair', b.recv(1).decode())",
+            ]), encoding="utf-8")
+            for network in (True, False):
+                if not network and not aios.offline_level():
+                    continue
+                with self.subTest(network=network):
+                    argv = aios.confine_command(sys.executable, [str(probe)], state, network=network)
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.stdout.split()[0], "refused", r.stdout + r.stderr)
+                    self.assertIn("pair x", r.stdout, r.stderr)
+            old = aios.WORKSPACE
+            aios.WORKSPACE = Path(d).resolve()
+            try:
+                out = asyncio.run(aios.Sandbox().run_python(probe.read_text(encoding="utf-8")))
+            finally:
+                aios.WORKSPACE = old
+            self.assertIn("refused", out)
+            self.assertIn("pair x", out)
+            srv.close()
+
+    @unittest.skipUnless(aios.offline_level(), "needs a network namespace, Landlock ABI 4 or sandbox-exec")
+    def test_an_offline_mcp_server_has_no_network_and_still_no_files(self):
+        import socket
+        import subprocess
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as prog:
+            Path(outside, "secret.txt").write_text("key", encoding="utf-8")
+            server = Path(prog, "server.py")
+            server.write_text("\n".join([
+                "import os, socket, sys",
+                "def try_(f):",
+                "    try:",
+                "        return f()",
+                "    except OSError as e:",
+                "        return type(e).__name__",
+                f"print(try_(lambda: open({str(Path(outside, 'secret.txt'))!r}).read()))",
+                "print(try_(lambda: open(os.path.join(sys.argv[1], 'state.txt'), 'w').write('ok')))",
+                f"print(try_(lambda: socket.create_connection(('127.0.0.1', {srv.getsockname()[1]}), 3) and 'tcp'))",
+                "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
+                f"print(try_(lambda: u.sendto(b'x', ('127.0.0.1', {udp.getsockname()[1]})) and 'udp'))",
+            ]), encoding="utf-8")
+            modes = [False]  # as this machine is; and Landlock alone when it also has network namespaces
+            if aios.landlock_abi() >= 4 and aios.netns_ok():
+                modes.append(True)
+            for landlock_only in modes:
+                with self.subTest(landlock_only=landlock_only), \
+                        mock.patch.object(aios, "netns_ok", return_value=False) if landlock_only \
+                        else contextlib.nullcontext():
+                    argv = aios.confine_command(sys.executable, [str(server), state], state, network=False)
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                    out = r.stdout.splitlines()
+                    self.assertEqual(out[:2], ["PermissionError", "2"], r.stderr)
+                    self.assertNotEqual(out[2], "tcp", r.stderr)
+                    # with Landlock alone UDP still gets out, and doctor and the startup line say so
+                    self.assertEqual(out[3] == "udp", aios.offline_level() == "tcp", r.stderr)
+        srv.close()
+        udp.close()
+
+    def test_confining_an_mcp_server_refuses_where_it_cannot(self):
+        with mock.patch.object(aios, "landlock_abi", return_value=0), \
+                mock.patch.object(aios, "seatbelt_ok", return_value=False):
+            with self.assertRaises(RuntimeError):
+                aios.confine_command(sys.executable, [], tempfile.gettempdir())
+        with mock.patch.object(aios, "offline_level", return_value=""), \
+                self.assertRaisesRegex(RuntimeError, "off the network"):
+            aios.confine_command(sys.executable, [], tempfile.gettempdir(), network=False)
+
+    def test_landlock_failure_is_fatal_not_ignored(self):
+        if not aios.landlock_abi():
+            self.skipTest("needs Landlock")
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            bad = '{"ro": [], "rw": []}'  # Python cannot even read its own stdlib: the exec must fail
+            r = subprocess.run([sys.executable, "-I", "-c", aios.LANDLOCK_BOOT, bad, "-c", "print('ran')"],
+                               cwd=d, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("ran", r.stdout)
+
+    @unittest.skipIf(aios.IS_WINDOWS, "no rlimits on Windows")
+    async def test_a_limit_the_os_refuses_is_left_out_not_fatal(self):
+        real = aios.resource.setrlimit
+
+        def macos_like(lim, value):  # macOS refuses to lower RLIMIT_AS
+            if lim == aios.resource.RLIMIT_AS:
+                raise ValueError("current limit exceeds maximum limit")
+            real(lim, value)
+
+        with mock.patch.object(aios.sys, "platform", "darwin"), \
+                mock.patch.object(aios.resource, "setrlimit", macos_like):
+            box = aios.Sandbox()
+            self.assertNotIn("RLIMIT_AS", box.limits)
+            self.assertIn("RLIMIT_CPU", box.limits)
+            out = await box.run_python("print(6*7)")
+        self.assertTrue(out.startswith("exit=0"), out)
 
     async def test_environment_is_scrubbed(self):
         import os
@@ -1267,19 +1827,104 @@ else:
 
 class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        aios.DockerSandbox.unknown.clear()
+        self.addCleanup(aios.DockerSandbox.unknown.clear)
         aios.DockerSandbox.unavailable.cache_clear()
         self.addCleanup(aios.DockerSandbox.unavailable.cache_clear)
 
     def test_command_isolates_the_container(self):
         cmd = aios.DockerSandbox(mem_mb=128, pids=32).command("aios-sbx-x")
         joined = " ".join(cmd)
-        for flag in ("create", "--rm", "--cpus 1.0", "--tmpfs /tmp:rw,nosuid,nodev,size=16m", "--network none", "--read-only", "--cap-drop ALL", "--pull never",
+        self.assertNotIn("--rm", cmd)  # kept until cleanup, so an OOM kill can be read back
+        for flag in ("create", "--cpus 1.0", "--tmpfs /tmp:rw,nosuid,nodev,size=16m", "--network none", "--read-only", "--cap-drop ALL", "--pull never",
                      "--security-opt no-new-privileges", "--user 65534:65534", "--memory 128m",
                      "--memory-swap 128m", "--pids-limit 32", "--name aios-sbx-x"):
             self.assertIn(flag, joined)
         for mount in ("-v", "--volume", "--mount", "--privileged"):
             self.assertNotIn(mount, cmd)  # nothing from the host is shared
-        self.assertEqual(cmd[-4:], [aios.DOCKER_IMAGE, "python", "-I", "-"])
+        self.assertEqual(cmd[-5:], [aios.DOCKER_IMAGE, "python", "-I", "-c", aios.DOCKER_SUPERVISOR])
+
+    def test_the_supervisor_passes_the_codes_exit_status_through(self):
+        for code, want in (("print('hi')", 0), ("import sys; sys.exit(3)", 3),
+                           (f"import sys; sys.exit({aios.OOM_EXIT})", 1)):  # cannot fake an OOM kill
+            with self.subTest(code=code):
+                r = subprocess.run([sys.executable, "-I", "-c", aios.DOCKER_SUPERVISOR], input=code,
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, want, r.stderr)
+
+    def test_image_can_be_pinned_by_digest(self):
+        pinned = "python:3.12-slim@sha256:" + "a" * 64
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": pinned}):
+            self.assertEqual(aios.docker_image(), pinned)
+            self.assertEqual(aios.DockerSandbox().command("c")[-5], pinned)  # the daemon runs exactly this
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": ""}):
+            self.assertEqual(aios.docker_image(), aios.DOCKER_IMAGE)
+        for bad in ("python@sha256:abc", "python@md5:" + "a" * 64, "py thon@sha256:" + "a" * 64):
+            with self.subTest(bad=bad), mock.patch.dict(os.environ, {"AIOS_DOCKER_IMAGE": bad}), \
+                    self.assertRaises(ValueError):
+                aios.docker_image()
+
+    def test_require_digest_refuses_a_tag(self):
+        with mock.patch.dict(os.environ, {"AIOS_DOCKER_REQUIRE_DIGEST": "1"}), \
+                mock.patch.object(aios.shutil, "which", return_value=None):
+            self.assertIn("not pinned", aios.DockerSandbox.unavailable("python:3.12-slim"))
+            aios.DockerSandbox.unavailable.cache_clear()
+            pinned = "python@sha256:" + "b" * 64
+            self.assertIn("not installed", aios.DockerSandbox.unavailable(pinned))  # passes the pin check
+
+    def test_provenance_names_the_daemon_and_how_to_pin(self):
+        digest = "sha256:" + "c" * 64
+
+        def fake_run(args, **kw):
+            if args[1:3] == ["context", "inspect"]:
+                out = "unix:///var/run/docker.sock"
+            elif args[1:3] == ["image", "inspect"]:
+                out = json.dumps([f"other/repo@{digest.replace('c', 'd')}", f"python@{digest}"])
+            else:
+                out = ""
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(aios.subprocess, "run", side_effect=fake_run), \
+                mock.patch.dict(os.environ, {"DOCKER_HOST": ""}):
+            notes = aios.DockerSandbox.provenance("python:3.12-slim")
+            self.assertEqual(notes[0], "docker executable: /usr/bin/docker")
+            self.assertIn("docker daemon: unix:///var/run/docker.sock", notes)
+            self.assertIn(f"AIOS_DOCKER_IMAGE=python@{digest}", notes[-1])
+            self.assertEqual(aios.DockerSandbox.provenance(f"python@{digest}")[-1], f"image pinned: python@{digest}")
+            with mock.patch.dict(os.environ, {"DOCKER_HOST": "tcp://10.0.0.5:2376"}):
+                self.assertTrue(any("remote" in n and "10.0.0.5" in n
+                                    for n in aios.DockerSandbox.provenance("python:3.12-slim")))
+
+    def test_a_daemon_that_would_ignore_the_limits_is_refused(self):
+        # what rootless Docker without cgroups reports (reproduced with Docker 29.9.1): it accepts
+        # --memory 64m and lets the code allocate 300 MiB
+        rootless = {"MemoryLimit": False, "PidsLimit": False, "CpuCfsQuota": False, "SwapLimit": False,
+                    "SecurityOptions": ["name=seccomp,profile=builtin", "name=rootless"]}
+        why = aios.DockerSandbox._limits_problem(rootless)
+        self.assertIn("memory, process count, CPU limits", why)
+        self.assertIn("cgroup v2", why)
+        self.assertIn("#rootless-docker", why)
+        why = aios.DockerSandbox._limits_problem({"MemoryLimit": True, "PidsLimit": False, "CpuCfsQuota": True})
+        self.assertIn("process count limits", why)
+        self.assertNotIn("rootless", why.split(".")[0])
+        self.assertIn("cannot confirm", aios.DockerSandbox._limits_problem(None))
+        self.assertIn("memory", aios.DockerSandbox._limits_problem({}))  # unknown counts as missing
+        self.assertIsNone(aios.DockerSandbox._limits_problem(
+            {"MemoryLimit": True, "PidsLimit": True, "CpuCfsQuota": True, "SwapLimit": False}))
+
+        def fake_run(args, **kw):
+            out = json.dumps(rootless) if args[1] == "info" else "linux\n"
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        aios.DockerSandbox.unavailable.cache_clear()
+        with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(aios.subprocess, "run", side_effect=fake_run), \
+                mock.patch.dict(os.environ, {"DOCKER_HOST": ""}):
+            self.assertIn("cannot enforce", aios.DockerSandbox.unavailable())
+            notes = aios.DockerSandbox.provenance("python:3.12-slim")
+        self.assertTrue(any("rootless" in n for n in notes))
+        self.assertTrue(any("cannot limit swap" in n for n in notes))
 
     def test_unavailable_explains_what_is_missing(self):
         u = aios.DockerSandbox.unavailable
@@ -1287,9 +1932,14 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("not installed", u())
         u.cache_clear()
 
+        limits = json.dumps({"MemoryLimit": True, "PidsLimit": True, "CpuCfsQuota": True})
+
         def fake_run(out="", err="", rc=0):
-            return mock.patch.object(aios.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], rc, stdout=out, stderr=err))
+            def run(args, **kw):
+                if args[1] == "info":
+                    return subprocess.CompletedProcess(args, 0, stdout=limits, stderr="")
+                return subprocess.CompletedProcess(args, rc, stdout=out, stderr=err)
+            return mock.patch.object(aios.subprocess, "run", side_effect=run)
 
         with mock.patch.object(aios.shutil, "which", return_value="/usr/bin/docker"):
             for (out, err, rc), want in ((("", "Error: No such image: python:3.12-slim", 1), "docker pull"),
@@ -1317,10 +1967,14 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             with ok:
                 self.assertIsInstance(aios.make_sandbox("auto"), aios.DockerSandbox)
-            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):
+            no_box = mock.patch.object(aios, "_appcontainer_unavailable", return_value="no AppContainer")
+            with missing, no_box, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):
                 self.assertIsNone(aios.make_sandbox("auto"))
                 self.assertIsNone(aios.make_sandbox("process"))
-            with missing, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": "1"}):
+            with missing, no_box, mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": "1"}):
+                self.assertIs(aios.make_sandbox("auto"), weak.return_value)
+            with missing, mock.patch.object(aios, "_appcontainer_unavailable", return_value=None), \
+                    mock.patch.dict(os.environ, {"AIOS_ALLOW_WEAK_SANDBOX": ""}):  # a real one: no opt-in needed
                 self.assertIs(aios.make_sandbox("auto"), weak.return_value)
         if not aios.IS_WINDOWS:
             self.assertIsInstance(aios.make_sandbox("auto"), aios.Sandbox)
@@ -1334,10 +1988,14 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         for box, want in (
                 (aios.DockerSandbox(), "not a microVM"),
                 (aios.MicroVMSandbox(), "Firecracker microVM"),
-                (types.SimpleNamespace(name="process", net_isolated=False, timeout=10),
+                (types.SimpleNamespace(name="process", net_isolated=False, fs_isolated=False, timeout=10),
                  "network NOT isolated"),
-                (types.SimpleNamespace(name="process", net_isolated=True, timeout=10),
-                 "network namespace enabled")):
+                (types.SimpleNamespace(name="process", net_isolated=True, fs_isolated=False, timeout=10),
+                 "network namespace enabled"),
+                (types.SimpleNamespace(name="process", net_isolated="tcp", fs_isolated="landlock", timeout=10),
+                 "no TCP connections"),
+                (types.SimpleNamespace(name="process", net_isolated="all", fs_isolated="seatbelt", timeout=10),
+                 "no network")):
             with self.subTest(backend=box.name, want=want), \
                     mock.patch.object(aios, "make_sandbox", return_value=box):
                 k = make_kernel()
@@ -1347,7 +2005,8 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                                 if t['name'] == 'run_python')
                     self.assertIn(want, desc)
                     if box.name == 'process':
-                        self.assertIn('can read files', desc)
+                        self.assertIn({"landlock": "reads only Python", "seatbelt": "cannot read home"}.get(
+                            box.fs_isolated, "can read files"), desc)
                 finally:
                     k.store.db.close()
 
@@ -1387,8 +2046,9 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             return 1, 'Cannot connect to the Docker daemon'
 
         with mock.patch.object(box, '_invoke', side_effect=invoke):
-            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed'):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup unconfirmed.*remove it during the next calls'):
                 await box.run_python('while True: pass')
+        self.assertEqual(len(aios.DockerSandbox.unknown), 1)  # the daemon was down: removed once it is back
 
     async def test_force_remove_can_recover_from_failed_or_hung_kill(self):
         for fail in ('nonzero', 'timeout'):
@@ -1419,6 +2079,95 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, 'create timed out; outcome unknown'):
                 await box.run_python('print(42)')
             cleanup.assert_awaited_once()
+
+    async def test_oom_kill_is_identified(self):
+        box = aios.DockerSandbox(mem_mb=64)
+
+        async def invoke(args, *a, **kw):
+            if args[1] == 'create':
+                return 0, 'id'
+            if args[1] == 'start':
+                return 137, 'partial output'
+            if args[1:3] == ['container', 'inspect']:
+                inspects.append(1)
+                return 0, 'true\n' if oom and len(inspects) >= oom else 'false\n'
+            return 0, ''
+
+        # the supervisor saw the OOM kill itself: no need to ask Docker
+        async def supervised(args, *a, **kw):
+            return (aios.OOM_EXIT, 'partial') if args[1] == 'start' else (0, 'id')
+
+        with mock.patch.object(box, '_invoke', side_effect=supervised), \
+                mock.patch.object(box, '_cleanup'), mock.patch.object(box, '_oom_killed') as asked:
+            self.assertEqual(await box.run_python('x'), 'killed: out of memory (64 MiB limit)\npartial')
+            asked.assert_not_called()
+        # oom: on which inspect Docker reports OOMKilled (it records it asynchronously), 0 = never
+        for oom, want in ((1, 'killed: out of memory (64 MiB limit)\npartial output'),
+                          (3, 'killed: out of memory (64 MiB limit)\npartial output'),
+                          (0, 'exit=137 (killed from outside the code: the Docker daemon stopped or restarted, '
+                              'or someone killed the container)\npartial output')):
+            inspects = []
+            with self.subTest(oom=oom), mock.patch.object(box, '_invoke', side_effect=invoke), \
+                    mock.patch.object(box, '_cleanup'), mock.patch.object(aios.asyncio, 'sleep', new=mock.AsyncMock()):
+                self.assertEqual(await box.run_python('x'), want)
+
+    async def test_unknown_creates_are_reconciled_on_later_calls(self):
+        box = aios.DockerSandbox()
+        with mock.patch.object(box, '_invoke', side_effect=asyncio.TimeoutError), \
+                mock.patch.object(box, '_cleanup'):
+            with self.assertRaises(RuntimeError):
+                await box.run_python('print(1)')
+        (late,) = aios.DockerSandbox.unknown
+        calls = []
+
+        async def invoke(args, *a, **kw):
+            calls.append(args[1:])
+            if args[1:3] == ['container', 'inspect']:
+                return 0, 'abc123'  # the daemon did create it after all
+            return (0, 'id') if args[1] == 'create' else (0, 'ok')
+
+        err = io.StringIO()
+        with mock.patch.object(box, '_invoke', side_effect=invoke), mock.patch.object(box, '_cleanup'), \
+                contextlib.redirect_stderr(err):
+            await box.run_python('print(1)')
+        self.assertEqual(calls[0], ['container', 'inspect', '--format', '{{.Id}}', late])  # exact name
+        self.assertEqual(calls[1], ['rm', '--force', late])  # before this call's create
+        self.assertIn(f'removed {late}', err.getvalue())
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+
+    async def test_a_missing_container_stays_watched(self):
+        # `docker rm --force` exits 0 for a container that does not exist (Docker 23+), so its exit
+        # code cannot tell "removed" from "not created yet"
+        box = aios.DockerSandbox()
+        aios.DockerSandbox.unknown['aios-sbx-late'] = asyncio.get_running_loop().time()
+
+        async def invoke(args, *a, **kw):
+            if args[1:3] == ['container', 'inspect']:
+                return 1, 'Error: No such object: aios-sbx-late'
+            return 0, ''
+
+        with mock.patch.object(box, '_invoke', side_effect=invoke) as inv, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            await box._reconcile()
+        self.assertIn('aios-sbx-late', aios.DockerSandbox.unknown)
+        self.assertNotIn('removed', err.getvalue())
+        self.assertNotIn('rm', [c.args[0][1] for c in inv.call_args_list])
+        with mock.patch.object(box, '_invoke', side_effect=OSError("daemon down")):
+            await box._reconcile()
+        self.assertIn('aios-sbx-late', aios.DockerSandbox.unknown)  # unreachable: try again later
+
+    async def test_reconciliation_gives_up_after_its_window(self):
+        box = aios.DockerSandbox()
+        aios.DockerSandbox.unknown['aios-sbx-old'] = asyncio.get_running_loop().time() - 10_000
+        with mock.patch.object(box, '_invoke', return_value=(1, 'No such container')), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            await box._reconcile()
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+        self.assertIn('stopped watching aios-sbx-old', err.getvalue())
+        aios.DockerSandbox.unknown['aios-sbx-new'] = asyncio.get_running_loop().time()
+        with mock.patch.object(box, '_invoke', return_value=(1, 'No such container')):
+            await box._reconcile()
+        self.assertIn('aios-sbx-new', aios.DockerSandbox.unknown)  # still inside the window
 
     async def test_create_failure_never_starts_code(self):
         box = aios.DockerSandbox()
@@ -1475,6 +2224,28 @@ class DockerSandboxTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(Path(d, "killed").read_text().startswith("aios-sbx-"))  # the container is killed
 
 
+@unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER_NO_LIMITS") == "1",
+                     "set AIOS_TEST_DOCKER_NO_LIMITS=1 with DOCKER_HOST pointing at a daemon that cannot "
+                     "enforce limits (rootless Docker without cgroup delegation)")
+class RealDockerWithoutLimitsTests(unittest.TestCase):
+    def test_the_gap_is_real_and_aios_refuses_the_daemon(self):
+        # plain Docker accepts the flags and ignores them...
+        r = subprocess.run(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                            "--memory", "64m", "--memory-swap", "64m", aios.DOCKER_IMAGE, "python", "-c",
+                            "b = bytearray(300 * 2**20); print('allocated')"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertIn("allocated", r.stdout, r.stderr)
+        # ...so AIOS will not run code there
+        aios.DockerSandbox.unavailable.cache_clear()
+        self.addCleanup(aios.DockerSandbox.unavailable.cache_clear)
+        why = aios.DockerSandbox.unavailable()
+        self.assertIsNotNone(why)
+        self.assertIn("cannot enforce the sandbox's memory", why)
+        self.assertIn("rootless", why)
+        with self.assertRaisesRegex(RuntimeError, "--sandbox docker: the Docker daemon cannot enforce"):
+            aios.make_sandbox("docker")
+
+
 @unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER") == "1",
                      "set AIOS_TEST_DOCKER=1 (and `docker pull python:3.12-slim`) to run against real Docker")
 class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
@@ -1500,6 +2271,83 @@ class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nonet", out)
         self.assertIn("readonly", out)
         self.assertIn("[]", out)  # an empty scratch dir: the workspace is not mounted
+
+    async def test_pinned_digest_runs_and_a_wrong_one_fails_closed(self):
+        r = subprocess.run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", aios.DOCKER_IMAGE],
+                           capture_output=True, text=True, timeout=20)
+        pinned = json.loads(r.stdout)[0]  # python@sha256:<index digest>, recorded by the pull
+        aios.DockerSandbox.unavailable.cache_clear()
+        self.assertIsNone(aios.DockerSandbox.unavailable(pinned))
+        out = await aios.DockerSandbox(pinned, timeout=20).run_python("print('pinned')")
+        self.assertEqual(out.strip(), "exit=0\npinned")
+        wrong = pinned.split("@")[0] + "@sha256:" + "0" * 64
+        self.assertIn("not present", aios.DockerSandbox.unavailable(wrong))  # never pulled, never run
+
+    async def test_effective_cgroup_limits(self):
+        box = aios.DockerSandbox(timeout=20, mem_mb=96, cpus=0.5, pids=32)
+        out = await box.run_python(
+            "import json, os\n"
+            "def read(n):\n"
+            "    try: return open('/sys/fs/cgroup/' + n).read().strip()\n"
+            "    except OSError: return None\n"
+            "print(json.dumps({k: read(k) for k in ('memory.max', 'memory.swap.max', 'pids.max', 'cpu.max')}))\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        got = json.loads(out.split("\n", 1)[1])
+        if got["memory.max"] is None:
+            self.skipTest("not cgroup v2: limits are not readable from inside the container")
+        self.assertEqual(got["memory.max"], str(96 * 1024 * 1024))
+        self.assertEqual(got["memory.swap.max"], "0")  # --memory-swap equal to --memory: no swap
+        self.assertEqual(got["pids.max"], "32")
+        quota, period = got["cpu.max"].split()
+        self.assertAlmostEqual(int(quota) / int(period), 0.5, places=2)
+
+    async def test_pid_limit_is_enforced(self):
+        out = await aios.DockerSandbox(timeout=20, pids=16).run_python(
+            "import os, time\nn = 0\n"
+            "for _ in range(64):\n"
+            "    try:\n        pid = os.fork()\n"
+            "    except OSError:\n        break\n"
+            "    if pid == 0:\n        time.sleep(5); os._exit(0)\n"
+            "    n += 1\n"
+            "print('forked', n)\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        self.assertLess(int(out.split()[-1]), 16)
+
+    async def test_cpu_quota_is_enforced(self):
+        out = await aios.DockerSandbox(timeout=30, cpus=0.5).run_python(
+            "import os, time\nkids = []\n"
+            "for _ in range(2):\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        end = time.time() + 2\n"
+            "        while time.time() < end: pass\n"
+            "        os._exit(0)\n"
+            "    kids.append(pid)\n"
+            "t = time.time()\n"
+            "for k in kids: os.waitpid(k, 0)\n"
+            "c = os.times()\n"
+            "print((c.children_user + c.children_system) / max(time.time() - t, 0.1))\n")
+        self.assertTrue(out.startswith("exit=0\n"), out)
+        self.assertLess(float(out.split()[-1]), 0.8)  # two busy processes share half a CPU
+
+    async def test_memory_kill_is_identified_as_oom(self):
+        out = await aios.DockerSandbox(timeout=30, mem_mb=64).run_python(
+            "chunks = []\n"
+            "for _ in range(64):\n"
+            "    chunks.append(b'x' * (8 * 1024 * 1024))\n"  # written, so really resident
+            "print('not killed')\n")
+        self.assertTrue(out.startswith("killed: out of memory (64 MiB limit)"), out)
+
+    async def test_concurrent_calls_are_separate_and_cleaned_up(self):
+        outs = await asyncio.gather(*(self.box.run_python("import os; print(os.uname().nodename)")
+                                      for _ in range(3)))
+        ids = [o.split()[-1] for o in outs]
+        self.assertTrue(all(o.startswith("exit=0") for o in outs), outs)
+        self.assertEqual(len(set(ids)), 3)  # three containers
+        for cid in ids:  # each exact container is gone
+            r = subprocess.run(["docker", "ps", "-aq", "--no-trunc", "--filter", f"id={cid}"],
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.strip(), "", cid)
 
     async def test_memory_cap(self):
         out = await aios.DockerSandbox(timeout=20, mem_mb=64).run_python("x = bytearray(512 * 1024 * 1024)")
@@ -1534,6 +2382,80 @@ class RealDockerSandboxTests(unittest.IsolatedAsyncioTestCase):
         rc, out = await self.box._invoke(['docker', 'container', 'inspect', name], timeout=3)
         self.assertNotEqual(rc, 0)
         self.assertIn('no such', out.lower())
+
+
+
+@unittest.skipUnless(os.environ.get("AIOS_TEST_DOCKER") == "1" and os.environ.get("AIOS_TEST_DOCKER_STOP")
+                     and os.environ.get("AIOS_TEST_DOCKER_START"),
+                     "set AIOS_TEST_DOCKER_STOP/START to shell commands that stop and start the Docker daemon")
+class RealDockerDaemonTests(unittest.IsolatedAsyncioTestCase):
+    """The daemon stops or restarts while a call runs (CI: systemctl on the runner)."""
+    SLEEPER = "import time\nprint('started', flush=True)\ntime.sleep(120)\n"
+
+    async def asyncSetUp(self):
+        aios.DockerSandbox.unknown.clear()
+        self.addCleanup(aios.DockerSandbox.unknown.clear)
+        self.box = aios.DockerSandbox(timeout=90)
+
+    def sh(self, var):
+        subprocess.run(os.environ[var], shell=True, check=True, timeout=120,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def ours(self):
+        r = subprocess.run(["docker", "ps", "-a", "--filter", "name=aios-sbx-", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=30)
+        return set(r.stdout.split())
+
+    async def running(self, before):
+        for _ in range(300):
+            new = self.ours() - before
+            if new:
+                return new.pop()
+            await asyncio.sleep(0.1)
+        self.fail("the sandbox container never appeared")
+
+    async def test_a_daemon_restart_during_a_call_is_never_a_silent_success(self):
+        before = self.ours()
+        call = asyncio.create_task(self.box.run_python(self.SLEEPER))
+        name = await self.running(before)
+        await asyncio.sleep(1)
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_STOP")
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_START")
+        try:  # the call ends when the daemon goes away; whether cleanup ran before it was back is a race
+            out = await asyncio.wait_for(call, 120)
+            print(f"\n[daemon restart] {out!r}", file=sys.stderr)
+            self.assertFalse(out.startswith("exit=0"), out)
+            if out.startswith("exit=137"):
+                self.assertIn("killed from outside the code", out)
+        except RuntimeError as e:
+            print(f"\n[daemon restart] {e}", file=sys.stderr)
+            self.assertIn("remove it during the next calls", str(e))
+            self.assertIn(name, aios.DockerSandbox.unknown)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual((await self.box.run_python("print(1)")).strip(), "exit=0\n1")
+        self.assertNotIn(name, self.ours())  # removed by the call itself or by the next one
+        self.assertEqual(aios.DockerSandbox.unknown, {})
+
+    async def test_a_daemon_that_stays_down_is_reported_and_reconciled_later(self):
+        before = self.ours()
+        call = asyncio.create_task(self.box.run_python(self.SLEEPER))
+        name = await self.running(before)
+        await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_STOP")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "(?s)cleanup unconfirmed.*remove it during the next calls"):
+                await asyncio.wait_for(call, 120)
+            self.assertIn(name, aios.DockerSandbox.unknown)
+        finally:
+            await asyncio.to_thread(self.sh, "AIOS_TEST_DOCKER_START")
+        if name not in self.ours():
+            self.skipTest("this daemon removed the stopped container itself")  # nothing left to reconcile
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = await self.box.run_python("print(6 * 7)")
+        self.assertEqual(out.strip(), "exit=0\n42")
+        self.assertIn(f"removed {name}", err.getvalue())
+        self.assertNotIn(name, self.ours())
+        self.assertEqual(aios.DockerSandbox.unknown, {})
 
 
 if __name__ == "__main__":

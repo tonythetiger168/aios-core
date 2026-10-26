@@ -490,5 +490,114 @@ class ShippedExampleTests(unittest.TestCase):
         self.assertEqual([f for f in sk.scan(path) if f.severity in ("high", "medium")], [])
 
 
+
+def _keygen_signs() -> bool:
+    exe = sk.ssh_keygen()
+    if not exe:
+        return False
+    r = subprocess.run([exe, "-Y", "sign"], capture_output=True, text=True)  # usage error if supported
+    return "unknown option" not in (r.stderr + r.stdout).lower() and "illegal option" not in (r.stderr + r.stdout).lower()
+
+
+@needs_toml
+@unittest.skipUnless(os.name == "posix" and _keygen_signs(), "needs ssh-keygen with -Y (OpenSSH 8.1+) on POSIX")
+class SignatureTests(SkillCase):
+    def setUp(self):
+        super().setUp()
+        self.keys = self.base / "keys"
+        self.keys.mkdir()
+        self.alice = self.key("alice")
+        self.mallory = self.key("mallory")
+        self.signers = self.base / "allowed_signers"
+        pub = (self.keys / "alice.pub").read_text().strip()
+        self.signers.write_text(f'alice@example.com namespaces="{sk.SIG_NAMESPACE}" {pub}\n')
+
+    def key(self, name):
+        path = self.keys / name
+        subprocess.run([sk.ssh_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(path)],
+                       check=True, capture_output=True)
+        return str(path)
+
+    def test_sign_and_verify(self):
+        d = self.make()
+        before = sk.load(d).sha256
+        sig = sk.sign(d, self.alice)
+        self.assertEqual(sig.resolve(), (d / sk.SIG_FILE).resolve())  # macOS: /var is /private/var
+        self.assertTrue(sig.read_text().startswith("-----BEGIN SSH SIGNATURE-----"))
+        skill = sk.load(d)
+        self.assertEqual(skill.sha256, before)  # SKILL.sig is not part of what it signs
+        self.assertEqual(sk.verify(skill, self.signers), ("valid", "alice@example.com"))
+
+    def test_any_change_after_signing_breaks_the_signature(self):
+        d = self.make()
+        sk.sign(d, self.alice)
+        (d / "notes.txt").write_text("added later")
+        self.assertEqual(sk.verify(sk.load(d), self.signers)[0], "invalid")
+
+    def test_unknown_signer_unsigned_and_unchecked(self):
+        d = self.make()
+        self.assertEqual(sk.verify(sk.load(d), self.signers)[0], "unsigned")
+        sk.sign(d, self.mallory)
+        self.assertEqual(sk.verify(sk.load(d), self.signers)[0], "unknown-signer")
+        self.assertEqual(sk.verify(sk.load(d), self.base / "missing")[0], "unavailable")
+        with mock.patch.object(sk, "ssh_keygen", return_value=None):
+            self.assertEqual(sk.verify(sk.load(d), self.signers)[0], "unavailable")
+
+    def test_a_signature_for_another_purpose_is_refused(self):
+        d = self.make()
+        msg = self.base / "statement"
+        msg.write_bytes(sk.statement(sk.load(d)))
+        subprocess.run([sk.ssh_keygen(), "-Y", "sign", "-q", "-f", self.alice, "-n", "git", str(msg)],
+                       check=True, capture_output=True)  # e.g. a git commit signature
+        (d / sk.SIG_FILE).write_bytes((self.base / "statement.sig").read_bytes())
+        self.assertNotEqual(sk.verify(sk.load(d), self.signers)[0], "valid")
+
+    def run_cmd(self, *args, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = aios.skills_cmd(*args, **kw)
+        return code, out.getvalue()
+
+    def test_cli_sign_trust_and_require_signed(self):
+        home = str(self.base / "home")
+        d = self.make()
+        code, out = self.run_cmd("trust", str(d), home, yes=True, signers=str(self.signers), require_signed=True)
+        self.assertEqual(code, 1)
+        self.assertIn("valid signature from an allowed signer is required", out)
+        code, out = self.run_cmd("sign", str(d), home, key=self.alice)
+        self.assertEqual(code, 0, out)
+        code, out = self.run_cmd("scan", str(d), home, signers=str(self.signers))
+        self.assertIn("signature: valid, signed by alice@example.com", out)
+        code, out = self.run_cmd("trust", str(d), home, yes=True, signers=str(self.signers), require_signed=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("signed by alice@example.com", out)
+        code, out = self.run_cmd("list", None, home)
+        self.assertIn("signed by alice@example.com", out)
+        (d / "SKILL.md").write_text(GOOD_MD + "one more line\n")
+        code, out = self.run_cmd("scan", str(d), home, signers=str(self.signers))
+        self.assertEqual(code, 1)
+        self.assertIn("signature: INVALID", out)
+        code, out = self.run_cmd("trust", str(d), home, yes=True, signers=str(self.signers))
+        self.assertEqual(code, 1)  # a broken signature is never trusted, even without --require-signed
+
+
+class SignerColumnTests(unittest.TestCase):
+    def test_old_databases_gain_the_signer_column(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "aios.db"
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE skills(name TEXT PRIMARY KEY, sha256 TEXT, version TEXT, ts TEXT, "
+                        "forced INTEGER DEFAULT 0)")
+            con.execute("INSERT INTO skills VALUES('old', 'abc', '1', '2026-01-01', 0)")
+            con.commit()
+            con.close()
+            st = aios.Store(str(db))
+            self.assertEqual(st.get_skill_pin("old")["signer"], "")
+            st.pin_skill("new", "def", "2", signer="bob@example.com")
+            self.assertEqual(st.list_skill_pins()[0]["signer"], "bob@example.com")
+            st.db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

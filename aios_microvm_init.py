@@ -6,14 +6,28 @@ It reads one job from the second (read-only) drive, runs the code once as an unp
 user with a timeout, prints the bounded result between nonce markers on the serial console
 and powers the VM off. Standard library only; runs on the guest's Python, never the host's.
 
-Job drive layout: "AIOS1 <nonce> <timeout> <max_out> <code_len>\n" + code (UTF-8),
-zero-padded to a 512-byte multiple.
+Job drive layout: "AIOS1 <nonce> <timeout> <max_out> <code_len>\n" + code (UTF-8), then
+"\nAIOSX seed=<64 hex> time=<unix time>\n", zero-padded to a 512-byte multiple (to a fixed
+size for snapshots). An older init ignores the AIOSX line.
+
+Snapshot mode (`aios_wait=1` on the kernel command line): after mounting, the init prints
+AIOS-READY and waits for a line on the console. The host snapshots the VM there, once, and
+every call restores that snapshot with its own job drive and sends the line. Each restored VM
+starts from the same memory, so before reading the job the init drops the block cache, and it
+mixes the job's seed into the kernel's random pool and forces a reseed, so no two calls share
+random numbers; it also sets the clock, which stopped at snapshot time.
 """
 import base64
 import ctypes
 import os
+import struct
 import subprocess
 import sys
+import time
+try:
+    import fcntl
+except ImportError:  # not POSIX (tests)
+    fcntl = None
 try:
     import resource
 except ImportError:  # not POSIX: only parse_job/result_lines are usable (tests)
@@ -23,6 +37,12 @@ MAGIC = "AIOS1"
 JOB_DEVICE = "/dev/vdb"
 HEADER_MAX = 256
 CODE_MAX = 1 << 20  # 1 MiB of source is plenty for a tool call
+EXTRA_MAX = 256
+WAIT_FLAG = "aios_wait=1"
+READY = "AIOS-READY"
+BLKFLSBUF = 0x1261
+RNDADDENTROPY = 0x40085203
+RNDRESEEDCRNG = 0x5207
 UNPRIVILEGED = 65534  # nobody / nogroup
 CHILD_FSIZE = 8 << 20  # largest file the code may write (output file included)
 CHILD_NPROC = 64
@@ -53,6 +73,58 @@ def parse_job(data: bytes):
     if len(body) < length:
         raise JobError("job truncated")
     return nonce, timeout, max_out, body[:length]
+
+
+def parse_extras(data: bytes) -> dict:
+    """The AIOSX line after the code: {'seed': bytes, 'time': float}, or {} (older host)."""
+    head, _, body = data[:HEADER_MAX + CODE_MAX + EXTRA_MAX].partition(b"\n")
+    try:
+        length = int(head.split()[4])
+    except (IndexError, ValueError):
+        return {}
+    line = body[length:length + EXTRA_MAX]
+    if not line.startswith(b"\nAIOSX "):
+        return {}
+    fields = dict(f.split("=", 1) for f in line[7:].split(b"\n", 1)[0].decode("ascii", "replace").split()
+                  if "=" in f)
+    out = {}
+    try:
+        seed = bytes.fromhex(fields.get("seed", ""))
+        if len(seed) == 32:
+            out["seed"] = seed
+        if "time" in fields:
+            out["time"] = float(fields["time"])
+    except ValueError:
+        pass
+    return out
+
+
+def reseed(seed: bytes):
+    """Mix seed into the kernel's input pool and reseed its generator right away (as root)."""
+    fd = os.open("/dev/urandom", os.O_WRONLY)
+    try:
+        fcntl.ioctl(fd, RNDADDENTROPY, struct.pack("ii", len(seed) * 8, len(seed)) + seed)
+        fcntl.ioctl(fd, RNDRESEEDCRNG)
+    finally:
+        os.close(fd)
+
+
+def read_job(path: str, flush: bool) -> bytes:
+    with open(path, "rb") as f:
+        if flush:  # the kernel read this device at boot, before the snapshot: drop that cache
+            fcntl.ioctl(f.fileno(), BLKFLSBUF)
+        return f.read(HEADER_MAX + CODE_MAX + EXTRA_MAX)
+
+
+def wait_for_go(console):
+    console.write(f"\n{READY}\n")
+    console.flush()
+    while True:
+        chunk = os.read(0, 64)
+        if not chunk:
+            raise JobError("console closed before the job was sent")
+        if b"\n" in chunk:
+            return
 
 
 def result_lines(nonce: str, status: str, rc: int, out: bytes, truncated: bool) -> str:
@@ -129,8 +201,27 @@ def main():
         _mount("-t", "devtmpfs", "-o", "nosuid,noexec", "devtmpfs", "/dev")
         _mount("-t", "tmpfs", "-o", "nosuid,nodev,mode=1777,size=16m", "tmpfs", "/tmp")
         _mount("-t", "tmpfs", "-o", "nosuid,nodev,noexec,mode=700,size=24m", "tmpfs", "/run")
-        with open(JOB_DEVICE, "rb") as f:
-            nonce, timeout, max_out, code = parse_job(f.read(HEADER_MAX + CODE_MAX))
+        with open("/proc/cmdline") as f:
+            restored = WAIT_FLAG in f.read().split()
+        if restored:
+            wait_for_go(console)  # the snapshot is taken here; each call resumes from here
+        data = read_job(JOB_DEVICE, flush=restored)
+        nonce, timeout, max_out, code = parse_job(data)
+        extras = parse_extras(data)
+        if restored:  # a clone must not run with its snapshot's random state
+            if "seed" not in extras:
+                raise JobError("a restored VM needs a fresh seed")
+            reseed(extras["seed"])
+        elif "seed" in extras:
+            try:
+                reseed(extras["seed"])
+            except OSError:
+                pass
+        if restored and "time" in extras:  # the clock stopped when the snapshot was taken
+            try:
+                time.clock_settime(time.CLOCK_REALTIME, extras["time"])
+            except (OSError, AttributeError):
+                pass
         status, rc, out, truncated = run_code(code, timeout, max_out, "/tmp", "/run")
         console.write(result_lines(nonce, status, rc, out, truncated))
     except Exception as e:  # the host reports a missing result as a sandbox failure
