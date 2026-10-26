@@ -3,9 +3,12 @@ import contextlib
 import http.client
 import io
 import json
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -148,6 +151,29 @@ class ListenerTests(Home):
         with contextlib.redirect_stdout(io.StringIO()):
             aios.jobs_cmd("disable", ["hook"], None, "main", str(self.home))
         self.assertEqual(self.post()[0], 409)
+
+    def test_the_database_is_closed_before_the_reply(self):
+        # Windows cannot delete an open aios.db: once a caller has its answer, nothing may hold it
+        opened, connect = [], sqlite3.connect
+
+        class SlowClose(sqlite3.Connection):  # makes the old race certain: closing after the reply is too late
+            def close(self):
+                time.sleep(0.3)
+                super().close()
+                self.done = True
+
+        def slow_connect(*a, **kw):
+            opened.append(connect(*a, factory=SlowClose, **kw))
+            return opened[-1]
+
+        with mock.patch.object(aios.sqlite3, "connect", slow_connect):
+            for args in ({}, {"secret": "wrong"}, {"headers": {"Content-Length": str(aios.HOOK_BODY_MAX + 1)}}):
+                self.post(**args)
+                self.assertTrue(getattr(opened[-1], "done", False), args)
+
+    def test_an_oversized_body_gets_its_413(self):
+        # the refused body is read, so the connection closes cleanly instead of being reset
+        self.assertEqual(self.post(body=b"x" * (aios.HOOK_BODY_MAX + 1))[0], 413)
 
     def test_the_old_secret_stops_working_after_rotation(self):
         old = self.secret

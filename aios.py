@@ -3532,9 +3532,14 @@ def start_webhook_listener(db_path: str, port: int):
             self.wfile.write(data)
 
         def do_POST(self):
+            # the database is closed before the answer goes out: once the caller has its reply, this
+            # request holds nothing open (Windows cannot delete or move an open aios.db)
+            self.reply(*self.handle_hook())
+
+        def handle_hook(self) -> tuple[int, dict]:
             name = self.path.split("?", 1)[0].removeprefix("/hook/")
             if not self.path.startswith("/hook/") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", name):
-                return self.reply(404, {"error": "use POST /hook/<job name>"})
+                return 404, {"error": "use POST /hook/<job name>"}
             auth = self.headers.get("Authorization", "")
             store = Store(db_path)
             try:
@@ -3544,20 +3549,23 @@ def start_webhook_listener(db_path: str, port: int):
                 # one answer for "no such job" and "wrong secret": callers cannot probe job names
                 if not (job and job["schedule"] == "on webhook" and want
                         and hmac.compare_digest(got, want)):
-                    return self.reply(401, {"error": "unknown job or wrong secret"})
+                    return 401, {"error": "unknown job or wrong secret"}
                 if not job["enabled"]:
-                    return self.reply(409, {"error": "job is disabled"})
+                    return 409, {"error": "job is disabled"}
                 try:
                     n = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
-                    return self.reply(400, {"error": "bad Content-Length"})
+                    return 400, {"error": "bad Content-Length"}
                 if not 0 <= n <= HOOK_BODY_MAX:
-                    return self.reply(413, {"error": f"body over {HOOK_BODY_MAX} bytes"})
+                    self.close_connection = True
+                    from aios_a2a import drain_body  # stdlib only, shared with the A2A server
+                    drain_body(self.rfile, n, self.connection)
+                    return 413, {"error": f"body over {HOOK_BODY_MAX} bytes"}
                 payload = self.rfile.read(n).decode("utf-8", "replace") if n else ""
                 eid = store.add_hook_event(name, payload)
                 if eid is None:
-                    return self.reply(429, {"error": f"{HOOK_QUEUE_MAX} requests already waiting"})
-                return self.reply(202, {"queued": eid})
+                    return 429, {"error": f"{HOOK_QUEUE_MAX} requests already waiting"}
+                return 202, {"queued": eid}
             finally:
                 store.db.close()
 
