@@ -4297,6 +4297,12 @@ def parser() -> argparse.ArgumentParser:
     co.add_argument("--open", action="store_true", help="open the console in your browser")
     co.add_argument("--approve", action="store_true",
                     help="also let this console answer approval requests from `daemon`/`serve --approvals console`")
+    tg = sub.add_parser("telegram", help="answer approval requests (--approvals console) from your phone via a Telegram bot")
+    tg.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    tg.add_argument("--chat-id", type=int, default=None,
+                    help="chat to send requests to (your user id for a private chat; default $AIOS_TELEGRAM_CHAT)")
+    tg.add_argument("--allow-user", type=int, action="append", default=[], metavar="USER_ID",
+                    help="Telegram user allowed to answer (repeatable; default: the chat id, i.e. you in a private chat)")
     au = sub.add_parser("audit", help="print the audit log")
     au.add_argument("--agent", help="only this agent (default: all)")
     au.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
@@ -4404,7 +4410,7 @@ def parser() -> argparse.ArgumentParser:
     for p in (sv, dm, sw):
         p.add_argument("--approvals", choices=["none", "console"], default="none",
                        help="risky calls: none = refused unless a scope pre-allows them (default); "
-                            "console = ask a person in `aios console --approve`")
+                            "console = ask a person in `aios console --approve` or `aios telegram`")
         p.add_argument("--approve-timeout", type=float, default=240,
                        help="seconds to wait for an answer before refusing (default 240)")
     for p in (c, dm, sw):
@@ -4466,6 +4472,16 @@ def cli():
         raise SystemExit(status_cmd(a.home))
     if a.cmd == "alerts":
         raise SystemExit(alerts_cmd(a.home, a.all, a.ack, a.check, a.n))
+    if a.cmd == "telegram":
+        import aios_telegram
+        chat = a.chat_id
+        if chat is None:
+            env = os.environ.get("AIOS_TELEGRAM_CHAT", "").strip()
+            if not env.lstrip("-").isdigit():
+                ap.error("--chat-id (or $AIOS_TELEGRAM_CHAT) is required: message your bot, then open "
+                         "https://api.telegram.org/bot<TOKEN>/getUpdates to see your chat id")
+            chat = int(env)
+        raise SystemExit(aios_telegram.run(a.home, chat, set(a.allow_user) or None))
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))

@@ -38,6 +38,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign|publish|search|install`, optional publisher signatures, a static skill registry, `chat --skill <folder>` (see below).
 - **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
+- **Approvals from your phone**: `python aios.py telegram` sends approval requests from the daemon, `serve` and `swarm` (`--approvals console`) to a Telegram chat with Approve/Deny buttons (see Scheduled jobs).
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript, so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
 - **Prompt-injection test suite**: `python tests/test_injection.py --report` prints which attacks get through under each defense (below).
@@ -125,6 +126,17 @@ python aios.py console --approve                                       # answer 
 - Each risky call that no scope pre-allows becomes a request showing the agent, the tool and the full arguments, with a warning when the run has read untrusted content. You press Approve or Deny. No answer before the timeout (default 240 s, kept below the job's `--timeout`) means no, and a request closes when its run ends, so it cannot be approved later.
 - Only a console started with `--approve` can answer; without it the page is read-only. The only write it can make is that one answer. A submission needs the console's cookie, a form token made at each start, and a same-origin `Origin` header, so another web page cannot press the button for you.
 - One request at a time: a job waits while it is open.
+
+**Approve from your phone (Telegram).** The same requests can also be answered in Telegram, with or without the console running:
+
+```bash
+export AIOS_TELEGRAM_TOKEN=123456:ABC...        # create a bot with @BotFather; never put the token on the command line
+python aios.py telegram --chat-id 987654321      # your user id (message the bot, then see .../bot<TOKEN>/getUpdates)
+```
+
+- Each request arrives as a message with the agent, the tool, the arguments (clipped to fit one message) and the untrusted-content warning, with ✅ Approve / ❌ Deny buttons. A press answers it exactly as the console would: only a request that is still open changes. The message then shows the outcome, also when the request expired or was answered in the console.
+- Only presses in that chat by an allowed user count (`--allow-user ID`, repeatable; by default the chat id, which in a private chat is you). Anyone who finds the bot can message it; their presses are refused and logged. Messages are plain text, so arguments cannot reformat or hide parts of the request.
+- What you approve passes through Telegram's servers: do not use it for agents whose arguments are confidential. The token can answer for you, so keep it like a password. `AIOS_TELEGRAM_API` points it to a self-hosted Bot API server. Standard library only, no extra package.
 
 **File-change triggers.** `--schedule "on change inbox/*"` runs the job when files matching the pattern (relative to the workspace, subfolders included) are added, edited or removed:
 
