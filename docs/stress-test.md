@@ -96,8 +96,18 @@ lived 699 s (about US$0.05). Each agent asks for a one-word answer.
   provider kept one thread per model slot and the container caps threads. Fixed: the provider now
   uses at most `MODEL_THREADS_MAX` (512) threads and further calls queue for one. With the fake HTTP
   server, 10,000 agents still finish in 21 s with no failures (and the event loop lags 3.5 s, not 17 s).
-- 10,000 real agents on this one card would take about 10,000 / 70 = ~2.5 minutes. To finish
-  faster, add GPUs (one vLLM per card, or tensor/data parallel) or a faster card; AIOS is not the limit.
+- Rerun with the fix (same card type, `--start 1250 --max 10000`, about US$0.03):
+
+| agents | ok | fail | wall s | tasks/s | p50 s | p99 s | RSS MB |
+|---|---|---|---|---|---|---|---|
+| 1,250 | 1,250 | 0 | 15.5 | 80.8 | 9.6 | 15.3 | 63 |
+| 2,500 | 2,500 | 0 | 30.7 | 81.4 | 15.8 | 30.7 | 72 |
+| 5,000 | 5,000 | 0 | 65.3 | 76.5 | 36.4 | 65.3 | 115 |
+| 10,000 | 10,000 | 0 | 128.0 | 78.1 | 67.9 | 128.0 | 169 |
+
+  **10,000 real agents at once, no failures, all done in 128 s** (~78 agents/s, the same GPU ceiling).
+  To finish faster, add GPUs (one vLLM per card, or tensor/data parallel) or a faster card; AIOS is
+  not the limit.
 
 ## What it takes to run 10,000 real agents at once
 
