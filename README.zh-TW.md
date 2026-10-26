@@ -17,6 +17,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
 - **工具註冊表**（「系統呼叫」）：以 JSON schema 定義；agent 只看得到被授權的工具（完整名稱或 `前綴*` 萬用字元）。
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
+- **對話壓縮**：聊天超過 30 則訊息（或約 120,000 字元）時，較舊的回合會由模型寫成摘要並取代原文；最新約 10 則訊息保持原樣，下一次壓縮會以上一份摘要為基礎繼續累積。以前舊訊息只會直接掉出上下文。摘要呼叫計入這次執行的預算；預算不夠或呼叫失敗時就跳過（舊訊息照舊掉出上下文）；每次壓縮都以 `(compact)` 記在審計日誌。讀過不可信內容的回合所寫成的摘要會標記為受污染，聊天會一直保持受污染（不自動核准），直到 `/reset` 連同歷史一起清掉。`/summary` 顯示摘要，`chat --compact-at N` 調整門檻，`--compact-at 0` 關閉。定時任務、子代理與 A2A 對話不壓縮（它們每次從空白開始或從不保存）。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
@@ -42,7 +43,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
-- **CLI**：互動式對話，支援 `/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/reset`、`/quit`。
+- **CLI**：互動式對話，支援 `/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
 
 ## 快速開始
 
@@ -64,6 +65,7 @@ python aios.py chat --mcp "demo=python demo_mcp_server.py"   # 接上 MCP 伺服
 python aios.py chat --provider openai --model llama3.1   # 用 Ollama 的本機模型
 python aios.py chat --max-tokens 20000 --max-steps 6     # 每次執行的硬性上限
 python aios.py chat --daily-max-tokens 500000            # 以及這個 agent 所有聊天在任何 24 小時內的合計上限
+python aios.py chat --compact-at 20                      # 提早把舊回合寫成摘要（預設 30 則訊息；0 = 關閉）
 python aios.py chat --policy policy.example.toml --agent notes   # 每個代理的權限與路徑範圍
 python aios.py chat --policy policy.example.toml --agent lead    # 把寫作交給 'notes' 的代理
 python aios.py chat --sandbox docker          # run_python 改在用完即丟的容器裡執行（需先 `docker pull python:3.12-slim`）
