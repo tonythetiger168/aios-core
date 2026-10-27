@@ -1,0 +1,15 @@
+# AIOS Workstation: one 32 GB GPU, a 7B/8B model served by vLLM, scheduled jobs approved from the browser.
+name = "workstation"
+title = "AIOS Workstation"
+plan = "Core (free); Team ($15/seat/month) when more than 3 people share it"
+hardware = "16 cores / 32 threads, 64-128 GB RAM, GPU with 32 GB VRAM (e.g. RTX 5090)"
+agents = "~200 waiting on an answer, ~6,000 in batch"
+pip = ["mcp"]
+env = []
+
+[flags]
+common = ["--provider", "openai", "--base-url", "http://localhost:8000/v1", "--model", "Qwen/Qwen2.5-7B-Instruct",
+          "--max-tokens", "50000"]
+chat = []
+daemon = ["--approvals", "console"]
+swarm = ["--parallel", "200", "--model-slots", "128", "--swarm-max-tokens", "100000000"]

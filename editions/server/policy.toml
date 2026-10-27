@@ -1,0 +1,53 @@
+# AIOS Server policy: what each agent may do. Tools not listed under `permissions` are invisible.
+# python start.py chat                     -> agent "main"
+# python start.py chat --agent lead        -> hands sub-tasks to "worker" helpers, many at once
+# python start.py swarm --agent worker --tasks tasks.txt --out results.jsonl
+# python start.py daemon                   -> scheduled jobs (`python start.py jobs add ... --agent reporter`)
+
+# Everyday chat: reads the workspace freely, writes only notes/ and out/ (asks [y/N] before each write).
+[agents.main]
+permissions = ["now", "read_file", "view_file", "list_files", "write_file", "remember", "recall",
+               "list_facts", "search_memory", "fetch_url"]
+
+[agents.main.scopes.write_file]
+paths = ["notes/*", "out/*"]
+max_calls = 30          # per run
+
+[agents.main.scopes.fetch_url]
+max_calls = 10
+
+[agents.main.scopes.fetch_url.args.url]
+allow = ["https://*"]
+deny = ["*localhost*", "*127.0.0.1*", "*169.254.169.254*"]
+max_len = 2000
+
+[agents.main.rate]
+model = "5000/hour"
+
+# Unattended jobs: read anything, write only reports/ (no person to ask, so that path is pre-allowed;
+# auto_when_tainted accepts that text injected in what a job read could write there, and only there).
+[agents.reporter]
+permissions = ["now", "read_file", "list_files", "write_file", "search_memory"]
+
+[agents.reporter.scopes.write_file]
+paths = ["reports/*"]
+auto_paths = ["reports/*"]
+auto_when_tainted = true
+max_calls = 5
+
+[agents.reporter.rate]
+model = "10000/hour"
+tools = { "*" = "500/hour", write_file = "60/hour" }
+
+# Swarm: the lead fans out to read-only workers; the editor combines their answers.
+[agents.lead]
+permissions = ["now", "list_files", "swarm", "agent__worker", "agent__editor"]
+
+[agents.lead.scopes.agent__worker]
+max_calls = 5000   # per run: every swarm task counts
+
+[agents.worker]         # read-only: safe to run many at once without approvals
+permissions = ["now", "read_file", "list_files"]
+
+[agents.editor]         # combines the workers' answers; it reads only what they returned
+permissions = []
