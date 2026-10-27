@@ -69,3 +69,39 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # Optional mirror on Cloudflare Pages (free plan), served at https://aios-registry.pages.dev/.
+  # Runs only when the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets exist; the token
+  # needs just "Account > Cloudflare Pages > Edit". It ships the exact files GitHub Pages got.
+  cloudflare:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PROJECT: aios-registry
+    steps:
+      - id: check
+        shell: bash
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no Cloudflare secrets: skipping the Cloudflare Pages mirror"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.check.outputs.enabled == 'true'
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/artifact
+      - name: Deploy to Cloudflare Pages
+        if: steps.check.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          tar -xf "$RUNNER_TEMP/artifact/artifact.tar" -C "$RUNNER_TEMP/site"
+          test -f "$RUNNER_TEMP/site/index.json"
+          npx --yes wrangler@3 pages project list | grep -qw "$PROJECT" \
+            || npx --yes wrangler@3 pages project create "$PROJECT" --production-branch main
+          npx --yes wrangler@3 pages deploy "$RUNNER_TEMP/site" --project-name "$PROJECT" --branch main --commit-dirty=true
