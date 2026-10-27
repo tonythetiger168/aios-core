@@ -477,7 +477,26 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 
-## 產品線（規劃中）
+## 產品線
+
+依硬體分成五條產品線，四條本機版本是同一份程式碼加上不同設定（模型伺服器、並行數、沙箱、代理權限），各自打包成一個 zip，用 `python start.py` 啟動。總覽、收費標準與打包方式見 [editions/README.zh-TW.md](editions/README.zh-TW.md)，每條產品線有自己的使用說明。
+
+| 產品線 | 硬體 | 收費（美金） | 使用說明 |
+|---|---|---|---|
+| **Lite** | 不需要 GPU，雲端 API 自帶 key | Core 免費 | [editions/lite](editions/lite/GUIDE.zh-TW.md) |
+| **Personal** | 16 GB VRAM，Qwen2.5 3B（Ollama） | Core 免費 | [editions/personal](editions/personal/GUIDE.zh-TW.md) |
+| **Workstation** | 32 GB VRAM，Qwen2.5 7B（vLLM） | Core 免費；超過 3 人用 Team，US$15／人／月 | [editions/workstation](editions/workstation/GUIDE.zh-TW.md) |
+| **Server** | 96 GB VRAM，Linux | Team US$15／人／月，或 Enterprise 報價 | [editions/server](editions/server/GUIDE.zh-TW.md) |
+| **Cloud** | 不用硬體 | US$25／人／月，含每人 2,000 次執行（尚未推出） | [editions/cloud](editions/cloud/GUIDE.zh-TW.md) |
+
+```bash
+python scripts/build-editions.py                    # dist/editions/aios-<產品線>-<版本>.zip
+python editions/start.py --edition personal chat    # 不打包，直接用某條產品線的設定
+```
+
+安全功能（權限、審批、污染追蹤、沙箱、審計）在所有產品線都免費。Team 與 Cloud 還在開發中。
+
+## 模組（規劃中）
 
 | 產品 | 內容 | 階段 | 模式 |
 |---|---|---|---|

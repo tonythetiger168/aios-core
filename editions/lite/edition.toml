@@ -1,0 +1,14 @@
+# AIOS Lite: no GPU, the model runs in the cloud with your own API key (BYOK).
+name = "lite"
+title = "AIOS Lite"
+plan = "Core (free, MIT)"
+hardware = "any 4-core CPU, 8 GB RAM, no GPU"
+agents = "up to ~200 agents (limited by your API provider's rate limits)"
+pip = ["anthropic", "mcp"]
+env = ["ANTHROPIC_API_KEY"]
+
+[flags]
+common = ["--provider", "anthropic", "--max-tokens", "50000"]
+chat = ["--daily-max-tokens", "2000000"]
+daemon = ["--daily-max-tokens", "2000000"]
+swarm = ["--parallel", "16", "--model-slots", "16", "--swarm-max-tokens", "1000000"]

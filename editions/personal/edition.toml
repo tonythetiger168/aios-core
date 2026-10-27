@@ -1,0 +1,15 @@
+# AIOS Personal: one 16 GB GPU, a 3B model (or 7B 4-bit) served locally by Ollama. Nothing leaves the machine.
+name = "personal"
+title = "AIOS Personal"
+plan = "Core (free, MIT)"
+hardware = "8 cores / 16 threads, 32 GB RAM, GPU with 16 GB VRAM (e.g. RTX 5060 Ti 16GB)"
+agents = "~64 waiting on an answer, ~2,000 in batch"
+pip = ["mcp"]
+env = []
+
+[flags]
+common = ["--provider", "openai", "--base-url", "http://localhost:11434/v1", "--model", "qwen2.5:3b",
+          "--max-tokens", "50000"]
+chat = ["--embed-model", "nomic-embed-text"]
+daemon = []
+swarm = ["--parallel", "64", "--model-slots", "64", "--swarm-max-tokens", "20000000"]

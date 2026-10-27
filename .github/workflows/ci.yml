@@ -212,3 +212,27 @@ jobs:
         with:
           name: microvm-evidence
           path: microvm-evidence.txt
+
+  editions:
+    # One zip per product line (editions/): build, unpack, run each one's launcher outside the checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python scripts/build-editions.py
+      - name: Unpack and start every edition
+        run: |
+          for z in dist/editions/*.zip; do
+            d="$RUNNER_TEMP/$(basename "$z" .zip)"; mkdir -p "$d"; unzip -q "$z" -d "$d"
+            cd "$d"/aios-*
+            python start.py jobs list
+            python start.py chat --help > /dev/null
+            python start.py check || true  # no model server here: only that it runs
+            cd "$GITHUB_WORKSPACE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aios-editions
+          path: dist/editions/*.zip

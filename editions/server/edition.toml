@@ -1,0 +1,15 @@
+# AIOS Server: one 96 GB GPU on a Linux server, Docker sandbox, swarms spread over CPU cores, audit copied off the box.
+name = "server"
+title = "AIOS Server"
+plan = "Team ($15/seat/month) or Enterprise (quote)"
+hardware = "32 cores / 64 threads, 256 GB RAM, GPU with 96 GB VRAM (e.g. RTX PRO 6000), Linux"
+agents = "~150-200 waiting on an answer, ~5,000 in batch"
+pip = ["mcp"]
+env = []
+
+[flags]
+common = ["--provider", "openai", "--base-url", "http://localhost:8000/v1", "--model", "Qwen/Qwen2.5-7B-Instruct",
+          "--max-tokens", "50000", "--sandbox", "docker"]
+chat = []
+daemon = ["--approvals", "console", "--anchor", "audit-anchors.txt"]
+swarm = ["--parallel", "512", "--model-slots", "192", "--workers", "0", "--swarm-max-tokens", "500000000"]
