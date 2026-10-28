@@ -14,8 +14,8 @@ python scripts/build-products.py _site
 python -m http.server --directory _site
 ```
 
-The registry workflow builds these same files on main and publishes through the existing
-GitHub Pages and Cloudflare Pages configuration. Cloudflare publication requires the existing
+The registry workflow builds these same files on main and publishes them to Cloudflare Pages
+only (GitHub Pages is no longer used). Publication requires the
 `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. PR builds validate without
 deploying. Product, runtime, guide, and packaging changes trigger a fresh download build.
 
