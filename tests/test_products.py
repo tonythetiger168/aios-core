@@ -37,7 +37,7 @@ class ProductTests(unittest.TestCase):
             self.assertNotIn("{{", page)
             for guide in (out / "guides").glob("*.html"):
                 self.assertNotIn("github.com", guide.read_text(encoding="utf-8"), guide.name)
-            for plan in ("Core", "Team", "Cloud", "Enterprise", "US$15", "US$25"):
+            for plan in ("Core", "Team", "Cloud", "Enterprise", "NT$490", "NT$790"):
                 self.assertIn(plan, page)
             links = Links()
             links.feed(page)

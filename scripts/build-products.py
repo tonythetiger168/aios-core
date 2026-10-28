@@ -16,9 +16,9 @@ PRODUCTS = [
     ("personal", "Personal", "個人本機 AI", "在自己的電腦執行模型，適合私人助理、筆記與日常工作。", "8C/16T · 32 GB RAM · 16 GB VRAM", "Ollama · Qwen2.5 3B",
      "免費", "Core 開源核心", "參考硬體約 NT$4.5–6 萬（自備）"),
     ("workstation", "Workstation", "工作站協作", "以多代理協作處理較大的任務，適合有獨立工作站的使用者。", "16C/32T · 64–128 GB RAM · 32 GB VRAM", "vLLM · Qwen2.5 7B",
-     "免費", "3 人以下；超過 3 人共用 Team US$15／人／月（規劃中）", "參考硬體約 NT$18–25 萬（自備）"),
+     "免費", "3 人以下；超過 3 人共用 Team NT$490／人／月（規劃中）", "參考硬體約 NT$18–25 萬（自備）"),
     ("server", "Server", "自架伺服器", "在自己的 Linux 伺服器部署，集中執行排程與代理任務。", "32C/64T · 256 GB RAM · 96 GB VRAM · Linux", "vLLM · Qwen2.5 7B",
-     "US$15", "／人／月 · Team 自架（規劃中，年繳、最少 5 人）；Enterprise 另行報價", "參考硬體約 NT$45–55 萬（自備）"),
+     "NT$490", "／人／月 · Team 自架（規劃中，年繳、最少 5 人）；Enterprise 另行報價", "參考硬體約 NT$45–55 萬（自備）"),
 ]
 GUIDES = [slug for slug, *_ in PRODUCTS] + ["cloud"]
 TITLES = {slug: title for slug, title, *_ in PRODUCTS} | {"cloud": "Cloud"}
