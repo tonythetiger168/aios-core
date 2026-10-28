@@ -485,9 +485,9 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|---|---|
 | **Lite** | 不需要 GPU，雲端 API 自帶 key | Core 免費 | [editions/lite](editions/lite/GUIDE.zh-TW.md) |
 | **Personal** | 16 GB VRAM，Qwen2.5 3B（Ollama） | Core 免費 | [editions/personal](editions/personal/GUIDE.zh-TW.md) |
-| **Workstation** | 32 GB VRAM，Qwen2.5 7B（vLLM） | Core 免費；超過 3 人用 Team，US$15／人／月 | [editions/workstation](editions/workstation/GUIDE.zh-TW.md) |
-| **Server** | 96 GB VRAM，Linux | Team US$15／人／月，或 Enterprise 報價 | [editions/server](editions/server/GUIDE.zh-TW.md) |
-| **Cloud** | 不用硬體 | US$25／人／月，含每人 2,000 次執行（尚未推出） | [editions/cloud](editions/cloud/GUIDE.zh-TW.md) |
+| **Workstation** | 32 GB VRAM，Qwen2.5 7B（vLLM） | Core 免費；超過 3 人用 Team，NT$490／人／月 | [editions/workstation](editions/workstation/GUIDE.zh-TW.md) |
+| **Server** | 96 GB VRAM，Linux | Team NT$490／人／月，或 Enterprise 報價 | [editions/server](editions/server/GUIDE.zh-TW.md) |
+| **Cloud** | 不用硬體 | NT$790／人／月，含每人 2,000 次執行（尚未推出） | [editions/cloud](editions/cloud/GUIDE.zh-TW.md) |
 
 ```bash
 python scripts/build-editions.py                    # dist/editions/aios-<產品線>-<版本>.zip
