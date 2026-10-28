@@ -5,9 +5,9 @@ name: skill registry
 on:
   push:
     branches: [main]
-    paths: ["registry/**", "aios_skills.py", "scripts/build-registry.py", ".github/workflows/registry.yml"]
+    paths: ["registry/**", "aios*.py", "scripts/build-*.py", "web/**", "editions/**", "docs/**", "examples/**", "pyproject.toml", "requirements.txt", "policy.example.toml", "demo_mcp_server.py", "README*", "LICENSE", ".github/workflows/registry.yml"]
   pull_request:
-    paths: ["registry/**", "aios_skills.py", "scripts/build-registry.py", ".github/workflows/registry.yml"]
+    paths: ["registry/**", "aios*.py", "scripts/build-*.py", "web/**", "editions/**", "docs/**", "examples/**", "pyproject.toml", "requirements.txt", "policy.example.toml", "demo_mcp_server.py", "README*", "LICENSE", ".github/workflows/registry.yml"]
   workflow_dispatch:
 
 permissions:
@@ -40,6 +40,11 @@ jobs:
           fi
           python scripts/build-registry.py registry _site --live "$SITE_URL" --url "$SITE_URL" "${args[@]}"
           rm -f "$RUNNER_TEMP/signing_key"
+      - name: Build product homepage and direct edition downloads
+        run: |
+          mv _site/index.html _site/skills.html
+          python scripts/build-products.py _site
+          python -m unittest discover -s tests -p 'test_products.py' -v
       - name: Search and install every skill from the built site, as a user would
         shell: bash
         run: |

@@ -70,7 +70,7 @@ def page(entries: list[dict], url: str) -> str:
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ccc;padding:.4rem;text-align:left;vertical-align:top}}
 code{{font-size:13px}}</style></head><body>
 <h1>AIOS skill registry</h1>
-<p>Skills for <a href="https://github.com/tonythetiger168/aios-core">aios-core</a>: instruction packs an agent
+<p><a href="./">AIOS products and downloads</a> · Skills for aios-core: instruction packs an agent
 loads into its prompt. aios never runs anything inside a skill, and installing one still shows you a scan
 and asks you to confirm before it is pinned. A listing here is not an endorsement: read the skill.</p>
 <p>Machine-readable index: <a href="{sk.INDEX_FILE}">{sk.INDEX_FILE}</a>. To add a skill, open a pull request
