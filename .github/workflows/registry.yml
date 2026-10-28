@@ -1,6 +1,6 @@
 name: skill registry
-# Builds the public skill registry from registry/ and deploys it to GitHub Pages
-# (https://<owner>.github.io/<repo>/, the default for `aios skills search/install`).
+# Builds the public site (product homepage, edition downloads, skill registry) and deploys it to
+# Cloudflare Pages at https://aios-registry.pages.dev/, the default for `aios skills search/install`.
 # Pull requests build it and install every skill from the built site, without deploying.
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+      SITE_URL: https://aios-registry.pages.dev/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,28 +56,14 @@ jobs:
             python aios.py skills install "$name" --registry http://127.0.0.1:8000 --home "$home" --yes
           done
           python aios.py skills list --home "$home"
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:
+          name: site
           path: _site
 
-  deploy:
-    if: github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
-
-  # Optional mirror on Cloudflare Pages (free plan), served at https://aios-registry.pages.dev/.
-  # Runs only when the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets exist; the token
-  # needs just "Account > Cloudflare Pages > Edit". It ships the exact files GitHub Pages got.
+  # Cloudflare Pages (free plan). Needs the CLOUDFLARE_API_TOKEN ("Account > Cloudflare Pages > Edit")
+  # and CLOUDFLARE_ACCOUNT_ID secrets.
   cloudflare:
     if: github.event_name != 'pull_request'
     needs: build
@@ -87,25 +73,16 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       PROJECT: aios-registry
     steps:
-      - id: check
-        shell: bash
-        run: |
-          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::no Cloudflare secrets: skipping the Cloudflare Pages mirror"
-          fi
       - uses: actions/download-artifact@v4
-        if: steps.check.outputs.enabled == 'true'
         with:
-          name: github-pages
-          path: ${{ runner.temp }}/artifact
+          name: site
+          path: ${{ runner.temp }}/site
       - name: Deploy to Cloudflare Pages
-        if: steps.check.outputs.enabled == 'true'
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/site"
-          tar -xf "$RUNNER_TEMP/artifact/artifact.tar" -C "$RUNNER_TEMP/site"
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets are required"; exit 1
+          fi
           test -f "$RUNNER_TEMP/site/index.json"
           npx --yes wrangler@3 pages project list | grep -qw "$PROJECT" \
             || npx --yes wrangler@3 pages project create "$PROJECT" --production-branch main
