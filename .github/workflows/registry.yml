@@ -1,6 +1,6 @@
 name: skill registry
 # Builds the public site (product homepage, edition downloads, skill registry) and deploys it to
-# Cloudflare Pages at https://aios-registry.pages.dev/, the default for `aios skills search/install`.
+# Cloudflare Pages at https://aios-registry-47b.pages.dev/, the default for `aios skills search/install`.
 # Pull requests build it and install every skill from the built site, without deploying.
 on:
   push:
@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # the pages.dev name Cloudflare gave project aios-registry ("aios-registry" itself belongs to someone else)
+  SITE_URL: https://aios-registry-47b.pages.dev/
+
 concurrency:
   group: skill-registry-${{ github.event_name == 'pull_request' && github.ref || 'pages' }}
   cancel-in-progress: false
@@ -20,8 +24,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      SITE_URL: https://aios-registry.pages.dev/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,6 +86,23 @@ jobs:
             echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets are required"; exit 1
           fi
           test -f "$RUNNER_TEMP/site/index.json"
-          npx --yes wrangler@3 pages project list | grep -qw "$PROJECT" \
+          # Explain a rejected token before wrangler's bare "Authentication error"
+          api() { curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$1"; }
+          api user/tokens/verify | jq -e '.success' > /dev/null \
+            || { echo "::error::Cloudflare rejected CLOUDFLARE_API_TOKEN itself (wrong, expired or revoked token)"; exit 1; }
+          accounts=$(api accounts)
+          echo "Accounts this token can use: $(echo "$accounts" | jq -r '[.result[].name] | join(", ")')"
+          echo "$accounts" | jq -e '.result | length > 0' > /dev/null \
+            || { echo "::error::the token reaches no Cloudflare account: set its Account Resources to Include your account, with Account > Cloudflare Pages > Edit (the \"Edit Cloudflare Workers\" template works)"; exit 1; }
+          echo "$accounts" | jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result | any(.id == $id)' > /dev/null \
+            || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not one of the accounts this token can use (the 32-character ID after dash.cloudflare.com/, not a Zone ID); or the token's Account Resources leave that account out"; exit 1; }
+          npx --yes wrangler@3 pages project list > "$RUNNER_TEMP/projects.txt" \
+            || { echo "::error::the token cannot read Cloudflare Pages: give it Account > Cloudflare Pages > Edit"; exit 1; }
+          grep -qw "$PROJECT" "$RUNNER_TEMP/projects.txt" \
             || npx --yes wrangler@3 pages project create "$PROJECT" --production-branch main
-          npx --yes wrangler@3 pages deploy "$RUNNER_TEMP/site" --project-name "$PROJECT" --branch main --commit-dirty=true
+          npx --yes wrangler@3 pages deploy "$RUNNER_TEMP/site" --project-name "$PROJECT" --branch main --commit-dirty=true \
+            | tee "$RUNNER_TEMP/deploy.txt"
+          # pages.dev names are global: a taken name gets a suffix, and the default registry must be ours
+          host=${SITE_URL#https://}; host=${host%/}
+          grep -q "\.$host" "$RUNNER_TEMP/deploy.txt" \
+            || { echo "::error::deployed somewhere other than $SITE_URL: update SITE_URL and aios_skills.PUBLIC_REGISTRY"; exit 1; }

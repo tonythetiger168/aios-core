@@ -8,7 +8,7 @@ at `/skills.html`.
 Build locally with Python 3.11+:
 
 ```sh
-python scripts/build-registry.py registry _site --url https://aios-registry.pages.dev/
+python scripts/build-registry.py registry _site --url https://aios-registry-47b.pages.dev/
 mv _site/index.html _site/skills.html
 python scripts/build-products.py _site
 python -m http.server --directory _site
