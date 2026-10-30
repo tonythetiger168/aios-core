@@ -90,6 +90,8 @@ jobs:
             || { echo "::error::Cloudflare rejected CLOUDFLARE_API_TOKEN itself (wrong, expired or revoked token)"; exit 1; }
           accounts=$(api accounts)
           echo "Accounts this token can use: $(echo "$accounts" | jq -r '[.result[].name] | join(", ")')"
+          echo "$accounts" | jq -e '.result | length > 0' > /dev/null \
+            || { echo "::error::the token reaches no Cloudflare account: set its Account Resources to Include your account, with Account > Cloudflare Pages > Edit (the \"Edit Cloudflare Workers\" template works)"; exit 1; }
           echo "$accounts" | jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result | any(.id == $id)' > /dev/null \
             || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not one of the accounts this token can use (the 32-character ID after dash.cloudflare.com/, not a Zone ID); or the token's Account Resources leave that account out"; exit 1; }
           npx --yes wrangler@3 pages project list > "$RUNNER_TEMP/projects.txt" \
