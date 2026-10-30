@@ -84,6 +84,16 @@ jobs:
             echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets are required"; exit 1
           fi
           test -f "$RUNNER_TEMP/site/index.json"
-          npx --yes wrangler@3 pages project list | grep -qw "$PROJECT" \
+          # Explain a rejected token before wrangler's bare "Authentication error"
+          api() { curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$1"; }
+          api user/tokens/verify | jq -e '.success' > /dev/null \
+            || { echo "::error::Cloudflare rejected CLOUDFLARE_API_TOKEN itself (wrong, expired or revoked token)"; exit 1; }
+          accounts=$(api accounts)
+          echo "Accounts this token can use: $(echo "$accounts" | jq -r '[.result[].name] | join(", ")')"
+          echo "$accounts" | jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result | any(.id == $id)' > /dev/null \
+            || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not one of the accounts this token can use (the 32-character ID after dash.cloudflare.com/, not a Zone ID); or the token's Account Resources leave that account out"; exit 1; }
+          npx --yes wrangler@3 pages project list > "$RUNNER_TEMP/projects.txt" \
+            || { echo "::error::the token cannot read Cloudflare Pages: give it Account > Cloudflare Pages > Edit"; exit 1; }
+          grep -qw "$PROJECT" "$RUNNER_TEMP/projects.txt" \
             || npx --yes wrangler@3 pages project create "$PROJECT" --production-branch main
           npx --yes wrangler@3 pages deploy "$RUNNER_TEMP/site" --project-name "$PROJECT" --branch main --commit-dirty=true
