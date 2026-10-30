@@ -379,7 +379,7 @@ def verify(skill: Skill, signers, keygen: str | None = None) -> tuple[str, str]:
 
 # ---- registry: a static index.json plus archives, served from a folder or over HTTPS ----
 REGISTRY_FORMAT = "aios-skill-registry-1"
-PUBLIC_REGISTRY = "https://aios-registry.pages.dev/"  # built from registry/ in this repo, served by Cloudflare Pages
+PUBLIC_REGISTRY = "https://aios-registry-47b.pages.dev/"  # built from registry/ in this repo, served by Cloudflare Pages
 INDEX_FILE = "index.json"
 MAX_ARCHIVE = 8_000_000
 MAX_INDEX = 4_000_000

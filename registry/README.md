@@ -2,7 +2,7 @@
 
 Each folder here is one skill (`SKILL.md`, optionally `skill.toml` and reference files). On every
 change to `main`, the `skill registry` workflow publishes them to
-https://aios-registry.pages.dev/ (Cloudflare Pages), which is the default registry for
+https://aios-registry-47b.pages.dev/ (Cloudflare Pages), which is the default registry for
 `aios skills search` and `aios skills install`.
 
 To add a skill, open a pull request with a new folder. To change one, edit it **and bump its

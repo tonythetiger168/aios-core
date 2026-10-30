@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the public skill registry site from the skill folders in a source directory.
 
-    python scripts/build-registry.py registry _site --live https://aios-registry.pages.dev/ [--key KEY]
+    python scripts/build-registry.py registry _site --live https://aios-registry-47b.pages.dev/ [--key KEY]
 
 The site is the registry format `aios skills search/install` read (index.json plus one .tar.gz per
 version), with an index.html for people. What is already published stays published: the build
