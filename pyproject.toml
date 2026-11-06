@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aios-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Secure-by-default, local-first runtime for AI agents: scheduler, permissions, memory, sandboxed tools and MCP"
 readme = "README.md"
 license = { text = "MIT" }

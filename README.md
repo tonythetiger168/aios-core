@@ -395,6 +395,8 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 
 ## Security status
 
+For a subsystem-by-subsystem check of AIOS against classical OS mechanisms (scheduling, memory, protection, information flow, isolation, audit...), see [docs/os-mechanisms.md](docs/os-mechanisms.md).
+
 Honest list of what this does **not** do yet:
 
 - **Prompt-injection defense is partial.** Tagging only asks the model to behave; the real protection is the taint policy plus scopes, which stop a *hijacked* model from acting without a person. It does **not** stop a person who types `y` without reading the prompt, content that merely misleads the answer (no tool involved), or a malicious tool that lies. Our suite models the worst case (a model that obeys every injected instruction). CI also measures one small local model (below); larger and hosted models are not measured yet.
