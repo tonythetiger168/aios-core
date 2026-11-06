@@ -28,6 +28,9 @@ class PackagingTests(unittest.TestCase):
         for readme in ("README.md", "README.zh-TW.md"):
             self.assertIn(f"Python {minimum}", (ROOT / readme).read_text(encoding="utf-8"), readme)
 
+    def test_the_version_matches_the_package(self):
+        self.assertEqual(aios.AIOS_VERSION, self.meta["project"]["version"])
+
 
 if __name__ == "__main__":
     unittest.main()
