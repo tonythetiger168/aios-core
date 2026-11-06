@@ -339,6 +339,95 @@ class SwarmCliTests(SwarmCase):
         self.assertEqual(len(out.read_text(encoding="utf-8").splitlines()), 3000)
         self.assertEqual(p.peak, 150)  # the model slots were full, and never more than full
 
+    async def test_reduce_spills_answers_to_disk_and_still_combines(self):
+        home = Path(self._tmp.name)
+        (home / "t.txt").write_text("".join(f"task {i}\n" for i in range(40)), encoding="utf-8")
+        out = home / "o.jsonl"
+        p = Router()
+        with mock.patch.object(sw, "KEEP_IN_MEMORY", 5), mock.patch.object(sw, "REDUCE_GROUP_CHARS", 200), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            code = await aios.swarm_cmd(POLICY, str(home / "t.txt"), "worker", str(out), str(home), p,
+                                        aios.Budget(), "reducer", "Combine all.")
+        self.assertEqual(code, 0)
+        first = sum(t.count("<untrusted") for t in p.reducer_tasks[:-1] if "answer to" in t)
+        self.assertEqual(first, 40)  # every answer reached a reducer, the spilled ones too
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8").splitlines()[-1])["status"], "ok")
+
+    async def test_low_memory_lowers_parallel(self):
+        p = Router({"helper": "worker", "task": "{item}", "items": [str(i) for i in range(6)], "parallel": 8})
+        free = sw.min_free_bytes() + 3 * sw.AGENT_MEM_EST  # room for 3 helpers above the floor
+        with mock.patch.object(sw, "available_memory", return_value=free), \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            await self.kernel(p)._run(self.lead(), "go")
+        self.assertIn("parallel lowered from 8 to 3", err.getvalue())
+        self.assertLessEqual(p.peak, 1 + 3)  # the lead + 3 helpers
+        self.assertIn("ok 6", p.lead_results[0])
+
+
+class MemoryGuardTests(unittest.IsolatedAsyncioTestCase):
+    def test_safe_parallel(self):
+        floor = sw.min_free_bytes()
+        self.assertEqual(sw.safe_parallel(8, avail=1 << 40), (8, None))
+        n, note = sw.safe_parallel(100_000, avail=floor + 10 * sw.AGENT_MEM_EST)
+        self.assertEqual(n, 10)
+        self.assertIn("lowered from 100000 to 10", note)
+        self.assertEqual(sw.safe_parallel(50, avail=0)[0], 1)  # always at least one helper
+        self.assertEqual(sw.safe_parallel(8, avail=None)[0], 8)  # unknown: unchanged
+        with mock.patch.dict("os.environ", {"AIOS_SWARM_MIN_FREE_MB": "0"}):
+            self.assertEqual(sw.safe_parallel(100_000, avail=0), (100_000, None))  # turned off
+
+    def test_free_memory_is_known_here(self):
+        if sys.platform.startswith(("linux", "win32", "darwin")):
+            free = sw.available_memory()
+            self.assertIsInstance(free, int)
+            self.assertGreater(free, 0)
+
+    async def test_low_memory_waits_for_running_helpers_and_never_hangs(self):
+        state = {"free": 0}
+        guard = sw.MemoryGuard(floor=100, probe=lambda: state["free"], every=0, poll=0.001)
+        running, starts = 0, []
+
+        async def work(i):
+            nonlocal running
+            starts.append(running)
+            running += 1
+            await asyncio.sleep(0.01)
+            running -= 1
+            return "ok", str(i)
+
+        done = []
+
+        async def on(i, item, status, text):
+            done.append(status)
+
+        await sw.fan_out(range(5), work, 4, on, guard=guard)
+        self.assertEqual(done, ["ok"] * 5)  # memory never came back, yet nothing hung
+        self.assertEqual(max(starts), 0)  # each helper waited until the one before had finished
+        self.assertGreater(guard.pauses, 0)
+        state["free"], starts[:] = 1000, []
+        await sw.fan_out(range(8), work, 4, on, guard=sw.MemoryGuard(floor=100, probe=lambda: state["free"]))
+        self.assertEqual(max(starts), 3)  # enough memory: all four at once
+
+    def test_kept_spills_past_its_limit(self):
+        k = sw.Kept(limit=3)
+        for i in reversed(range(10)):
+            k.append((i, "t", "ok", f"answer {i}"))
+        self.assertTrue(k.spilled)
+        self.assertEqual(len(k), 10)
+        self.assertEqual(sorted(e[0] for e in k), list(range(10)))
+        self.assertEqual(sorted(e[0] for e in k), list(range(10)))  # can be read twice
+        k.close()
+        small = sw.Kept(limit=5)
+        for i in (2, 0, 1):
+            small.append((i, "t", "ok", "x"))
+        self.assertEqual([e[0] for e in small.list()], [0, 1, 2])
+        self.assertFalse(small.spilled)
+
+    def test_pack_iter_matches_pack(self):
+        texts = ["aa", "bb", "cc", "d", "x" * 10, "y"]
+        self.assertEqual(list(sw.pack_iter(iter(texts), 4)), sw.pack(texts, 4))
+
+
     def test_flags_reach_the_kernel(self):
         argv = ["aios", "swarm", "--policy", "p.toml", "--tasks", "t", "--parallel", "0"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stderr", io.StringIO()), \
