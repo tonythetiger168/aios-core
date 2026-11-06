@@ -4,6 +4,12 @@
 
 Follows the November 2026 research round-up (MCP 2026-07-28, agent-OS security and scheduling papers).
 
+- **Swarms over many machines** (`aios_node`): `aios swarm --nodes [HOST:]PORT` runs the swarm as the
+  head of a cluster and `aios node --head URL` joins a machine as a worker. Workers pull tasks by their
+  free slots, send heartbeats, and lose their tasks to other nodes after 30 s of silence (at most 3
+  tries, first answer wins). Every call needs `$AIOS_NODE_TOKEN`; a head on a non-local address needs
+  TLS (`--node-cert`/`--node-key`, `--head-ca` on nodes). Each node runs tasks as its own policy agent
+  and audits them; the head's swarm budget covers the whole cluster.
 - **MCP 2026-07-28**: aios connects to MCP servers with the stateless `server/discover` when the SDK
   supports it (mcp 2.3+) and falls back to the `initialize` handshake for older servers; the revision
   each server got is audited; `aios serve` works with 2026-07-28 clients and reports its version.

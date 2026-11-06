@@ -12,6 +12,16 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 
 "Model-agnostic" means Anthropic or any OpenAI-compatible server, local models included (see Model providers below).
 
+## What's new in 0.2.0
+
+- **Swarms over many machines**: `aios swarm --nodes` makes this machine the head of a cluster and `aios node --head URL` adds other machines as workers. Workers pull tasks, so they need no open port; a silent worker's tasks go to another one; every call needs `$AIOS_NODE_TOKEN`, and a head reachable from other machines needs TLS. See [Agent swarms](#agent-swarms).
+- **Sandbox admission control**: Docker and microVM sandboxes wait for free memory instead of overloading the machine.
+- **Argument provenance**: a risky call whose arguments copy untrusted text needs a person, with an `untrusted-args` alert.
+- **Delegation caps**: `narrow` / `delegate` let helpers' permissions only shrink down the chain.
+- **`recall_on`**, **`aios export`** (OpenAI-format chat JSON for outside scanners) and **MCP 2026-07-28** (with fallback for older servers).
+
+Full list in [CHANGELOG.md](CHANGELOG.md); a self-audit against classical OS mechanisms in [docs/os-mechanisms.md](docs/os-mechanisms.md).
+
 ## What works today
 
 - **Kernel**: async task queue with a worker pool; each agent is a "process" with its own permissions, history and memory.

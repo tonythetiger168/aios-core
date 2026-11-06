@@ -12,6 +12,16 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 
 「不綁特定模型」：可用 Anthropic，或任何相容 OpenAI 的伺服器，包括本機模型（見下方「模型供應商」）。
 
+## 0.2.0 新功能
+
+- **代理群可分散到多台機器**：`aios swarm --nodes` 讓這台機器成為叢集的 head，其他機器執行 `aios node --head URL` 加入成為 worker。worker 主動拉任務，不必開 port；沉默的 worker 手上的任務會改派給別台；每次呼叫都要 `$AIOS_NODE_TOKEN`，head 對其他機器開放時必須用 TLS。見[代理群（Swarm）](#代理群swarm)。
+- **沙箱准入控制**：Docker 與 microVM 沙箱在記憶體不足時排隊等候，不會把機器撐爆。
+- **參數來源追蹤**：高風險呼叫的參數照抄了不可信文字時，必須由人核准，並發出 `untrusted-args` 警示。
+- **委派權限只會縮小**：`narrow`／`delegate` 讓幫手的權限沿委派鏈只減不增。
+- **`recall_on`**、**`aios export`**（OpenAI 格式的對話 JSON，給外部掃描工具）與 **MCP 2026-07-28**（相容舊版伺服器）。
+
+完整清單見 [CHANGELOG.md](CHANGELOG.md)；與傳統作業系統機制的對照自我檢核見 [docs/os-mechanisms.zh-TW.md](docs/os-mechanisms.zh-TW.md)。
+
 ## 目前可用的功能
 
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
