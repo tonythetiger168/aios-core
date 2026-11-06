@@ -64,6 +64,11 @@ class ResponseTests(Case):
         self.st.log_audit("job-inbox", "write_file", {"path": "x"}, TAINTED, "denied")
         self.assertEqual([(a["action"], a["target"]) for a in self.cycle()], [("pause-job", "inbox")])
 
+    def test_a_job_copying_untrusted_arguments_is_paused(self):
+        self.job("fetcher")
+        wd.alert(self.db, "untrusted-args", "job-fetcher", "copied a URL from a fetched page")
+        self.assertEqual([(a["action"], a["target"]) for a in sup.tick(self.db)], [("pause-job", "fetcher")])
+
     def test_a_non_job_agent_is_held_not_stopped(self):
         for _ in range(wd.DENIED_SPIKE):
             self.st.log_audit("a2a-guest", "read_file", {"path": "../x"}, "permission denied: path", "denied")

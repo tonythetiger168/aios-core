@@ -14,6 +14,8 @@ Rules (over the last WINDOW_MINUTES):
   refusal-spike     one agent was refused DENIED_SPIKE or more times
   budget-stop       a run stopped on its token or cost budget
   loop-stop         the loop guard stopped a run that kept repeating the same tool call
+  untrusted-args    a risky call repeated text from untrusted content in its arguments (a URL
+                    host, a payload): injected text may have chosen them, so a person had to decide
   job-failing       a job's last JOB_FAIL_RUNS runs all ended in error or timeout
   audit-tampered    the audit log's hash chain no longer checks out: an entry was edited, removed
                     or inserted outside AIOS (checked over the whole log, not just the window)
@@ -34,9 +36,10 @@ DENIED_SPIKE = 10
 JOB_FAIL_RUNS = 3
 STALE_AFTER = 120  # seconds without a heartbeat before the daemon counts as down (at least 3 ticks)
 RUN_ENTRY = "(run)"
+CARRY_ENTRY = "(provenance)"  # aios.CARRY_ENTRY
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
             "budget-stop": "info", "loop-stop": "warning", "job-failing": "warning", "audit-tampered": "critical",
-            "audit-sink-failing": "warning", "budget-runaway": "warning"}
+            "audit-sink-failing": "warning", "untrusted-args": "warning", "budget-runaway": "warning"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
@@ -145,6 +148,14 @@ def check(db: sqlite3.Connection, now=None) -> list[dict]:
                                     (RUN_ENTRY, since)).fetchall():
         found.append(("loop-stop", agent, f"a run of {agent} kept repeating the same tool call and was stopped "
                                           f"({result}). Look at its audit trail: a stuck tool or an injected loop."))
+    for agent, args in db.execute("SELECT agent, args FROM audit WHERE tool=? AND status='flagged' AND ts>=?",
+                                  (CARRY_ENTRY, since)).fetchall():
+        try:
+            info = json.loads(args or "{}")
+        except ValueError:
+            info = {}
+        found.append(("untrusted-args", agent, f"{agent} asked for {info.get('tool', '?')} with arguments copied "
+                                               f"from untrusted content ({info.get('carried', '?')})."))
     jobs = [j for (j,) in db.execute("SELECT DISTINCT job FROM job_runs").fetchall()]
     for job in jobs:
         last = db.execute("SELECT status FROM job_runs WHERE job=? AND status!='skipped' ORDER BY id DESC LIMIT ?",

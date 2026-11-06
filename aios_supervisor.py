@@ -8,7 +8,7 @@ The watchdog (aios_watchdog) only raises alerts. On every daemon tick the superv
 alerts and answers each with one fixed, rule-based action:
 
   pause-job    job-failing, budget-runaway, and tainted-refused / unattended-refused / loop-stop /
-               refusal-spike when the subject is a job: the job is disabled (enabled=0)
+               refusal-spike / untrusted-args when the subject is a job: the job is disabled (enabled=0)
   hold-agent   the same refusal rules for any other agent (chat, a2a guest, swarm helper): every risky
                call of that agent needs a person, interactively, and auto-approving scopes stop
                applying, until a person releases it. Tools that need no approval keep working
@@ -32,7 +32,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 ACTIONS = ("pause-job", "hold-agent", "safe-mode", "notify")  # all of them only reduce risk
-REFUSAL_RULES = ("tainted-refused", "unattended-refused", "loop-stop", "refusal-spike")
+REFUSAL_RULES = ("tainted-refused", "unattended-refused", "loop-stop", "refusal-spike", "untrusted-args")
 BUDGET_RUNAWAY = 3  # a job stopped on its budget this many times in a day is paused
 BUDGET_WINDOW_HOURS = 24
 FIRST_LOOK_MINUTES = 60  # on a database it never saw, act on alerts from the last hour only
