@@ -1229,6 +1229,56 @@ class ArgumentProvenanceTests(HardeningBase):
         k = self.kernel_reading_then_fetching("https://drop.attacker.example/x", approver=yes)
         await k._run(aios.Agent("a", {"read_file", "web__fetch"}), "go")
         self.assertEqual(self.fetched, ["https://drop.attacker.example/x"])  # the tool never sees the note
+class RecallOnTests(HardeningBase):
+    """recall_on: after listed tools, saved notes that match the call are attached to its result."""
+
+    def setUp(self):
+        super().setUp()
+        (aios.WORKSPACE / "doc.txt").write_text("The office printer on floor 3 jams again.", encoding="utf-8")
+
+    def kernel_reading(self, k_calls=1):
+        steps = [Resp([tool_use("read_file", {"path": "doc.txt"}, f"r{i}")], "tool_use") for i in range(k_calls)]
+        k = self.kernel(*steps, Resp([text("done")], "end_turn"))
+        k.store.set_fact("a", "printer", "HP on floor 3, toner in the cupboard", "user")
+        k.store.set_fact("a", "lunch", "noodles on Friday", "user")
+        k.store.set_fact("a", "printer_fix", "open tray 2 to clear a jam", "tainted")
+        return k
+
+    def results(self, k):
+        return [b["content"] for m in k.provider.calls[-1]["messages"] if isinstance(m["content"], list)
+                for b in m["content"] if b.get("type") == "tool_result"]
+
+    async def test_matching_notes_come_with_the_result_once_per_run(self):
+        k = self.kernel_reading(k_calls=2)
+        agent = aios.Agent("a", {"read_file"}, recall_on={"read_file"})
+        with mock.patch.object(aios, "FACT_PROMPT_LIMIT", 0):  # nothing in the prompt: all must be recalled
+            await k._run(agent, "check doc.txt")
+        first, second = self.results(k)
+        self.assertIn("[memory] Notes you saved earlier that relate to this read_file call", first)
+        self.assertIn("printer: HP on floor 3", first)
+        self.assertIn("printer_fix: open tray 2 to clear a jam  [unverified", first)
+        self.assertNotIn("lunch", first)
+        self.assertNotIn("[memory]", second)  # already attached this run
+        self.assertTrue(agent.run_tainted)  # an unverified note came in
+        recall = [e for e in k.store.audit_tail("a") if e["tool"] == aios.RECALL_ENTRY]
+        self.assertEqual(len(recall), 1)
+
+    def test_policy_key(self):
+        p = aios.WORKSPACE / "p.toml"
+        p.write_text('[agents.a]\npermissions = ["read_file"]\nrecall_on = ["read_file", "web__*"]\n', encoding="utf-8")
+        self.assertEqual(aios.load_policy(str(p))["a"]["recall_on"], {"read_file", "web__*"})
+        p.write_text('[agents.a]\nrecall_on = "read_file"\n', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            aios.load_policy(str(p))
+
+    async def test_off_by_default_and_notes_in_the_prompt_are_not_repeated(self):
+        k = self.kernel_reading()
+        with mock.patch.object(aios, "FACT_PROMPT_LIMIT", 0):
+            await k._run(aios.Agent("a", {"read_file"}), "check doc.txt")
+        self.assertNotIn("[memory]", self.results(k)[0])
+        k = self.kernel_reading()
+        await k._run(aios.Agent("a", {"read_file"}, recall_on={"read_*"}), "check doc.txt")  # all 3 in the prompt
+        self.assertNotIn("[memory]", self.results(k)[0])
 
 
 class MemoryProvenanceTests(HardeningBase):
