@@ -758,6 +758,9 @@ class ToolRegistry:
         """Exact match, or a 'prefix*' wildcard such as 'demo__*'."""
         return name in perms or any(p.endswith("*") and name.startswith(p[:-1]) for p in perms)
 
+    def names(self) -> list[str]:
+        return list(self._fns)
+
     def schemas_for(self, perms: set[str]) -> list[dict]:
         return [s for n, s in self._schemas.items() if self.permits(perms, n)]
 
@@ -820,6 +823,7 @@ class Agent:
     scopes: dict = field(default_factory=dict)
     session_tainted: bool = False  # set by the MCP gateway once the client has read untrusted data
     run_tainted: bool = False  # the prompt of the run in progress shows unverified memory notes
+    caps: tuple = ()  # delegation caps from the callers above (each a set of tool patterns): only narrow
     ephemeral: bool = False  # history kept in memory only (delegated sub-tasks)
     chain: tuple = ()  # delegating agents above this one, outermost first
     run_budget: object = None  # the Budget of the run in progress (delegated sub-tasks reuse it)
@@ -1016,8 +1020,17 @@ class Kernel:
             raise PermissionError(f"delegation deeper than {MAX_DELEGATION_DEPTH} levels")
         pol = policy[name]
         perms = set(pol["permissions"]) if pol["permissions"] is not None else set(DEFAULT_TOOLS)
+        caps = parent.caps  # what callers higher up allowed the chain: a helper never widens it
+        ppol = policy.get(parent.name) or {}
+        if ppol.get("narrow"):
+            caps += (frozenset(parent.permissions),)
+        if name in (ppol.get("delegate") or {}):
+            caps += (frozenset(ppol["delegate"][name]),)
+        if caps:  # the helper's own permissions, cut down to tools every cap allows
+            perms = {t for t in self.tools.names() if ToolRegistry.permits(perms, t)
+                     and all(ToolRegistry.permits(c, t) for c in caps)}
         child = Agent(name, perms, scopes=pol["scopes"], loaded=True, ephemeral=True, chain=chain,
-                      rate=pol.get("rate") or {})
+                      rate=pol.get("rate") or {}, caps=caps)
         child.system += (f" You are doing a sub-task for the agent '{parent.name}'. Its request is in the "
                          "user turn. Reply with the result; nobody else reads your answer.")
         child.session_tainted = self._is_tainted(parent)
@@ -2962,7 +2975,18 @@ def load_policy(path: str) -> dict:
             Agent(name, set(), scopes=scopes, rate=rate)
         except ValueError as e:
             raise ValueError(f"agents.{name}: {e}") from None
-        out[name] = {"permissions": set(perms) if perms is not None else None, "scopes": scopes, "rate": rate}
+        narrow, delegate = cfg.get("narrow", False), dict(cfg.get("delegate") or {})
+        if not isinstance(narrow, bool):
+            raise ValueError(f"agents.{name}.narrow must be true or false")
+        for helper, tools in delegate.items():
+            if not (isinstance(tools, list) and all(isinstance(x, str) for x in tools)):
+                raise ValueError(f"agents.{name}.delegate.{helper} must be a list of tool names or patterns")
+        unknown = set(cfg) - {"permissions", "scopes", "rate", "narrow", "delegate"}
+        if unknown:
+            raise ValueError(f"agents.{name}: unknown option(s) {', '.join(sorted(unknown))} (permissions, "
+                             "scopes, rate, narrow, delegate)")
+        out[name] = {"permissions": set(perms) if perms is not None else None, "scopes": scopes, "rate": rate,
+                     "narrow": narrow, "delegate": {h: set(t) for h, t in delegate.items()}}
     return out
 
 

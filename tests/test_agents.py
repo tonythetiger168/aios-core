@@ -64,6 +64,48 @@ class DelegationCase(unittest.IsolatedAsyncioTestCase):
                 if e["tool"] != aios.RUN_ENTRY]
 
 
+class NarrowingTests(DelegationCase):
+    """narrow / delegate: a caller can cut down what its helpers may use; caps carry down the chain."""
+
+    def policy(self, **main):
+        return {"main": {"permissions": {"read_file", "remember", "agent__writer"}, "scopes": {}, **main},
+                "writer": {"permissions": {"write_file", "remember", "read_file", "agent__sub"}, "scopes": {}},
+                "sub": {"permissions": {"write_file", "list_files", "now"}, "scopes": {}}}
+
+    async def tools_seen(self, policy, depth=1):
+        script = [call("agent__writer", {"task": "go"})]
+        if depth == 2:
+            script.append(call("agent__sub", {"task": "deeper"}, "c2"))
+        k = self.kernel(*script, policy=policy)
+        await k._run(self.agent(policy=policy), "start")
+        return [sorted(c["tools"]) for c in k.provider.calls[1:1 + depth]]
+
+    async def test_by_default_a_helper_keeps_its_own_permissions(self):
+        self.assertEqual(await self.tools_seen(self.policy()),
+                         [["agent__sub", "read_file", "remember", "write_file"]])
+
+    async def test_narrow_keeps_only_what_the_caller_has(self):
+        self.assertEqual(await self.tools_seen(self.policy(narrow=True)), [["read_file", "remember"]])
+
+    async def test_a_delegate_list_caps_one_helper_and_the_cap_carries_down(self):
+        pol = self.policy(delegate={"writer": {"write_file", "agent__sub", "now"}})
+        # writer: its own tools within the cap; sub (called by writer): its own, within main's cap too
+        self.assertEqual(await self.tools_seen(pol, depth=2), [["agent__sub", "write_file"], ["now", "write_file"]])
+
+    def test_policy_files_are_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "p.toml"
+            p.write_text('[agents.main]\npermissions = ["agent__w"]\nnarrow = true\n'
+                         '[agents.main.delegate]\nw = ["read_file"]\n[agents.w]\npermissions = []\n',
+                         encoding="utf-8")
+            pol = aios.load_policy(str(p))
+            self.assertEqual((pol["main"]["narrow"], pol["main"]["delegate"]), (True, {"w": {"read_file"}}))
+            for bad in ('narrow = "yes"', '[agents.main.delegate]\nw = "read_file"', 'narow = true'):
+                p.write_text('[agents.main]\npermissions = []\n' + bad + "\n", encoding="utf-8")
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    aios.load_policy(str(p))
+
+
 class DelegationTests(DelegationCase):
     async def test_a_helper_does_the_sub_task_with_its_own_permissions(self):
         k = self.kernel(call("agent__writer", {"task": "Write 'hi' to notes/a.txt"}),
