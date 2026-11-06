@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Self-improvement, live** (`aios_improve`, `aios improve`): each policy agent has a versioned playbook
+  of lessons learned from its own audit log (refused, failing and repeated calls, runs that ran out of
+  steps). A candidate is run on your eval tasks next to the current version, on a throwaway copy of
+  aios.db and the workspace, and goes live from the next run only if it does at least as well;
+  `rollback` goes back, and a version whose runs fail more is rolled back automatically. `improve loop`
+  repeats this with no round limit; quiet rounds make no model call, evals use only a free local model
+  unless a USD cap is set, and `--daily-tokens` pauses it with an alert. Tainted or guardrail-related
+  lessons wait for a person. Agents can file code or policy patches (`propose_patch`) that only a
+  person applies (`approve-patch`), with a health check that reverses a failing patch.
+
 ## 0.2.0 (2026-11-06)
 
 Follows the November 2026 research round-up (MCP 2026-07-28, agent-OS security and scheduling papers).

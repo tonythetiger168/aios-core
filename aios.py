@@ -1213,6 +1213,11 @@ class Kernel:
                 head += (f" - {len(shown)} of {len(rows)} notes shown, picked for this task; "
                          "use the search_memory tool for the rest")
             parts.append(head + ":\n" + "\n".join(self._fact_line(r) for r in shown))
+        import aios_improve  # read on every run: an adopted playbook is live from the next one
+        lessons = aios_improve.prompt_block(self.store, agent.rate_key or agent.name,
+                                            getattr(self, "playbook_override", None))
+        if lessons:
+            parts.append(lessons)
         summary = None if agent.ephemeral else self.store.get_summary(agent.name)
         if summary:
             parts.append(f"Summary of the earlier conversation ({summary['folded']} older messages, written when "
@@ -2791,6 +2796,8 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
 
     # outside data flows in through these: results are tagged <untrusted> and taint the run
     k.tools.mark_untrusted("read_file", "view_file", "list_files", "run_python", "fetch_url")
+    import aios_improve
+    aios_improve.install_tools(k)  # suggest_lesson, propose_patch: only when a policy grants them
 
 
 DEFAULT_TOOLS = ("now", "read_file", "view_file", "write_file", "list_files", "remember", "recall",
@@ -5096,6 +5103,8 @@ def parser() -> argparse.ArgumentParser:
     add_model_flags(nd)
     for p in (c, dm, aa, sw, nd):
         add_swarm_flags(p)
+    import aios_improve
+    aios_improve.add_parser(sub, add_model_flags)
     dmo = sub.add_parser("demo", help="run the scripted demo (risky tools are refused: no approver)")
     for p in (sv, dm, sw, nd):
         p.add_argument("--approvals", choices=["none", "console"], default="none",
@@ -5230,6 +5239,9 @@ def cli():
         if a.days < 1:
             ap.error("--days must be at least 1")
         raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
+    if a.cmd == "improve":
+        import aios_improve
+        raise SystemExit(aios_improve.cli(a, ap, build_model, load_policy))
     if a.cmd == "undo":
         raise SystemExit(undo_cmd(a.home, a.run, a.agent, a.list, a.force, a.dry_run))
     if a.cmd == "service":

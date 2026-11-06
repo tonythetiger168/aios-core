@@ -29,6 +29,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **持久記憶**（SQLite）：對話歷史在重啟後保留；長期事實透過 `remember`／`recall`／`list_facts` 存取，並注入 system prompt。
 - **對話壓縮**：聊天超過 30 則訊息（或約 120,000 字元）時，較舊的回合會由模型寫成摘要並取代原文；最新約 10 則訊息保持原樣，下一次壓縮會以上一份摘要為基礎繼續累積。以前舊訊息只會直接掉出上下文。摘要呼叫計入這次執行的預算；預算不夠或呼叫失敗時就跳過（舊訊息照舊掉出上下文）；每次壓縮都以 `(compact)` 記在審計日誌。讀過不可信內容的回合所寫成的摘要會標記為受污染，聊天會一直保持受污染（不自動核准），直到 `/reset` 連同歷史一起清掉。`/summary` 顯示摘要，`chat --compact-at N` 調整門檻，`--compact-at 0` 關閉。定時任務、子代理與 A2A 對話不壓縮（它們每次從空白開始或從不保存）。
 - **工作區檔案工具**（`read_file`、`write_file`、`list_files`）：防路徑逃逸、一律 UTF-8。每次寫入都會留下檢查點：`aios undo` 可以還原一次執行改過的檔案（見[還原一次執行](#還原一次執行)）。
+- **自我改進（即時生效）**：每個代理有一份有版本的「心得手冊」，內容從它自己的執行學來（被拒、失敗、重複的工具呼叫，用完步數的執行）。新版本會和目前版本一起跑你的評測任務，至少一樣好才會從下一次執行開始生效；不需要重啟，`aios improve rollback` 可退回，上線後執行變差的版本會自動退回。它永遠不會動到政策、權限、審批、審計或程式碼：代理只能提交修補給人審核（見[自我改進](#自我改進)）。
 - **圖片與 PDF（多模態輸入）**：在對話中用 `/attach <檔案>` 把圖片或 PDF 附在下一則訊息（`/attach` 列出、`/detach` 移除），或讓 agent 用 `view_file` 查看工作區裡的檔案。MCP 工具回傳的圖片（例如瀏覽器伺服器的螢幕截圖）會以圖片交給模型，不再被丟掉。支援 PNG、JPEG、GIF、WebP（上限 5 MB）與 PDF（上限 20 MB）；檔案類型依檔案內容判斷，不看副檔名。每個 agent 的歷史只保留最新 4 個圖片／PDF（較舊的換成一行說明），長對話不會在每一步都重送所有圖片。使用 `--provider openai` 時，圖片以 `image_url` 傳送（需要支援視覺的模型），PDF 則換成一行說明。附加的檔案和 agent 讀到的檔案一樣算不可信內容：圖片或 PDF 裡也可能寫著指令。
 - **沙箱程式執行**（`run_python`），用 `--sandbox`（或 `AIOS_SANDBOX`）選擇三種後端：
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
@@ -265,6 +266,30 @@ python aios.py undo --run 20261026-101500-ab12   # 指定 --list 列出的某次
 - 每次還原都會寫進審計日誌。版本保留 30 天；原本超過 1 MB 的檔案不會保存（還原時會說明）。
 - 不涵蓋：`run_python`（它只能寫自己的暫存資料夾）與 MCP 工具（它們寫到伺服器能寫的任何地方）。
 
+## 自我改進
+
+代理會從自己的執行中學會把任務做得更好，而且 AIOS 不用停下來就會生效。每個政策代理有一份**心得手冊**（playbook）：最多 20 條簡短心得，放進它的提示裡（定時任務共用其政策代理的手冊）。
+
+```bash
+python aios.py improve propose --agent notes          # 從上一輪以來的審計日誌整理心得（不呼叫模型）
+python aios.py improve list                           # 版本：* 使用中、? 候選；評測花費；待審修補
+python aios.py improve eval --agent notes --cases evals.jsonl --provider openai --model qwen2.5:3b
+python aios.py improve adopt --agent notes 3          # 由人採用某個版本（下一次執行起生效）
+python aios.py improve rollback --agent notes         # 退回上一版（--to 0：不用手冊）
+# 無限循環：提出 -> 評測 -> 採用，每小時一輪，不限輪數，使用免費的本機模型
+python aios.py improve loop --agent notes --agent reporter --cases evals.jsonl --every 1h \
+    --provider openai --model qwen2.5:3b --policy policy.toml
+```
+
+`evals.jsonl` 每行一個任務：純文字，或 `{"task": "...", "expect": "正規表達式", "forbid": "正規表達式"}`，用來檢查回答（被中止的執行算失敗）。
+
+- **心得從哪來**：審計日誌裡的統計（哪個工具被拒、失敗或重複呼叫，執行怎麼結束），從不取用工具輸出，所以攻擊者埋的文字不會變成心得。`--use-model` 會讓模型依這些統計寫心得。被授予 `suggest_lesson` 的代理可以自己加一條；讀過不可信內容後提出的心得會標記為受污染。
+- **把關**：候選版本會和目前版本一起，在 `aios.db` 與工作區的拋棄式副本上跑你的評測任務（你的記憶、審計、速率計數和檔案都不會變；沒人回答提示，所以高風險呼叫除非政策預先允許，否則會被拒）。只有通過的案例不少於、錯誤工具呼叫不多於目前版本，才會採用。目前版本的分數按評測檔快取，不會重複花錢。
+- **一定要人決定的**：受污染的候選，以及提到權限、政策、審批、沙箱、審計、範圍等的心得。它們會等 `aios improve adopt`。
+- **健康檢查**：新版本跑了 5 次之後，如果失敗率明顯高於之前，就會自動退回並發出 `improve-rollback` 警示（`aios improve check` 可手動執行；循環每輪都會做）。
+- **花費**：自上一輪以來沒有新狀況的那一輪不呼叫模型。評測只用免費模型（本機的模型伺服器，例如 Ollama），除非你用 `--daily-cost` 和 `--price-in/--price-out` 設了美元上限；用付費模型又沒設上限時，該輪只從審計日誌提出候選、跳過評測。`--daily-tokens`（預設每 24 小時 50,000，0 = 不限）用完時循環會暫停並發出 `improve-paused` 警示。
+- **永遠改不了的**：心得手冊只是提示文字，不授予任何工具、路徑或參數，不管它寫什麼，AIOS 都照樣執行政策、範圍、審批與審計。被授予 `propose_patch` 的代理可以對一個 AIOS 程式碼或政策檔提交 unified diff；`aios improve patches` 列出它們，只有人能用 `aios improve approve-patch N` 套用（`--check "python -m unittest discover -s tests"` 指定自己的健康檢查；預設：編譯或解析該檔並 import aios）。檢查失敗就立刻撤回修補。正在執行的 AIOS 程序要重新啟動才會載入套用後的程式碼。每次採用、退回與修補決定都以代理 `improve` 記在審計日誌。
+
 ## 技能（Skills）
 
 技能是一個資料夾，採用開放的 [Agent Skills](https://agentskills.io) 格式：`SKILL.md` 開頭的前置欄位寫 `name` 與 `description`，後面是給代理的指令。因此為 Claude、Codex、Gemini CLI、Copilot 寫的技能（例如 [anthropics/skills](https://github.com/anthropics/skills)）可以直接使用。`skill.toml`（名稱、版本、說明）改為選用；有的話以它為準，前置欄位的 `name` 與它不同會被拒絕。只有前置欄位之後的內容會進入提示詞。aios **絕不執行技能裡的程式碼**，只會讀取 `SKILL.md`。因為這些指令會進入系統提示詞，技能本身就是提示注入的管道，所以要先審查並**固定它的摘要（digest）**：
@@ -437,6 +462,7 @@ AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head
 | `remember`／`recall`／`list_facts` | 每個 agent 各自的長期記憶 |
 | `run_python` | 沙箱化 Python（`--sandbox process`、`docker` 或 `microvm`） |
 | `fetch_url` | 以純文字抓取公開網頁（GET）。policy 沒列出就不會授權；每次抓取都要有人核准，或符合 `auto_args` 的網址樣式。不會自動跟隨轉址（回應會寫出新網址，抓它是另一次、會再檢查的呼叫），拒絕本機與私有網路位址，最多讀 1 MB。抓回的內容視為不可信，會讓這次執行受污染 |
+| `suggest_lesson` / `propose_patch` | 自我改進（政策沒列出就不授予）：在代理的候選心得手冊加一條心得，使用前會先評測；提交程式碼或政策修補，只有人能套用（[自我改進](#自我改進)） |
 
 ## 安全現況
 
@@ -518,7 +544,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
