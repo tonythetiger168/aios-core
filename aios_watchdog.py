@@ -34,7 +34,7 @@ STALE_AFTER = 120  # seconds without a heartbeat before the daemon counts as dow
 RUN_ENTRY = "(run)"
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
             "budget-stop": "info", "loop-stop": "warning", "job-failing": "warning", "audit-tampered": "critical",
-            "audit-sink-failing": "warning"}
+            "audit-sink-failing": "warning", "improve-paused": "info", "improve-rollback": "warning"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
