@@ -4638,6 +4638,13 @@ def parser() -> argparse.ArgumentParser:
                     help="chat to send requests to (your user id for a private chat; default $AIOS_TELEGRAM_CHAT)")
     tg.add_argument("--allow-user", type=int, action="append", default=[], metavar="USER_ID",
                     help="Telegram user allowed to answer (repeatable; default: the chat id, i.e. you in a private chat)")
+    ex = sub.add_parser("export", help="write an agent's conversation as OpenAI-format chat JSON (for scanners)")
+    ex.add_argument("--agent", required=True, help="the agent (as in aios audit)")
+    ex.add_argument("--from-audit", action="store_true",
+                    help="rebuild runs from the audit log (also covers jobs, helpers and A2A, which keep no history)")
+    ex.add_argument("-n", type=int, default=10, help="with --from-audit: the newest N runs (default 10)")
+    ex.add_argument("--out", metavar="FILE", help="write here instead of stdout")
+    ex.add_argument("--home", default=".", help="folder holding aios.db")
     au = sub.add_parser("audit", help="print the audit log")
     au.add_argument("--agent", help="only this agent (default: all)")
     au.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
@@ -4801,6 +4808,11 @@ def cli():
         if a.anchors and not a.verify:
             ap.error("--anchors goes with --verify (to write an anchor, use --anchor FILE)")
         raise SystemExit(audit_cmd(a.agent, a.n, a.home, a.verify, a.head, a.anchors, a.anchor))
+    if a.cmd == "export":
+        import aios_export
+        if a.n < 1:
+            ap.error("-n must be at least 1")
+        raise SystemExit(aios_export.run(a.home, a.agent, a.from_audit, a.n, a.out))
     if a.cmd == "doctor":
         raise SystemExit(doctor_cmd(a.home))
     if a.cmd == "status":
