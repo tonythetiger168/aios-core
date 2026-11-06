@@ -657,6 +657,83 @@ def tag_untrusted(source: str, content):
     return f'{UNTRUSTED_OPEN}{src}">\n{defuse(content)}\n</untrusted>'
 
 
+CARRY_MIN = 20  # characters an argument must share with untrusted text to count as copied from it
+CARRY_STEP = 10  # window stride: any shared run of CARRY_MIN + CARRY_STEP - 1 characters is caught
+CARRY_SCAN = 8192  # characters of one argument value that are checked
+UNTRUSTED_SEEN_MAX = 50  # untrusted results an MCP-gateway session remembers for carried_args
+CARRY_ENTRY = "(provenance)"  # audit entry written when a risky call repeats untrusted text
+CARRIED_KEY = "!! copied from untrusted content"  # shown to the person approving, never sent to the tool
+_UNTRUSTED_RE = re.compile(r'<untrusted source="([^"]*)">\n?(.*?)\n?</untrusted>', re.S)
+_HOST_RE = re.compile(r"^[a-z][a-z0-9+.-]*://(?:[^/@?#]*@)?([^/:?#]+)", re.I)
+
+
+def untrusted_segments(history: list[dict]) -> list[tuple[str, str]]:
+    """(source tool, text) for every <untrusted> block still in the context."""
+    def texts(c):
+        if isinstance(c, str):
+            yield c
+        elif isinstance(c, list):
+            yield "".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    yield from texts(b.get("content", ""))
+
+    out = []
+    for m in history:
+        if m.get("role") == "user":
+            for t in texts(m.get("content")):
+                out += _UNTRUSTED_RE.findall(t)
+    return out
+
+
+def _trusted_text(history: list[dict]) -> str:
+    """What the person typed: plain user messages (tasks), without anything tagged untrusted."""
+    parts = []
+    for m in history:
+        c = m.get("content")
+        if m.get("role") == "user" and isinstance(c, str) and UNTRUSTED_OPEN not in c:
+            parts.append(c)
+        elif m.get("role") == "user" and isinstance(c, list):
+            parts += [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"
+                      and UNTRUSTED_OPEN not in b.get("text", "")]
+    return "\n".join(parts)
+
+
+def _string_args(value, where: str = ""):
+    if isinstance(value, str):
+        yield where, value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _string_args(v, f"{where}.{k}" if where else str(k))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            yield from _string_args(v, f"{where}[{i}]")
+
+
+def carried_args(args: dict, segments: list[tuple[str, str]], trusted: str = "") -> list[tuple[str, str]]:
+    """(argument, source tool) for each argument that repeats untrusted text: a run of at least
+    CARRY_MIN + CARRY_STEP - 1 characters, or the host of a URL, that appears in a tool result
+    but not in what the person typed. This is provenance, not meaning: it tells the person
+    approving that injected text may have chosen this value (a destination, a payload)."""
+    if not segments:
+        return []
+    low = [(src, " ".join(t.split()).lower()) for src, t in segments]
+    trusted = " ".join(trusted.split()).lower()
+    found = []
+    for where, value in _string_args(args):
+        v = " ".join(value[:CARRY_SCAN].split()).lower()
+        probes = [v[i:i + CARRY_MIN] for i in range(0, max(len(v) - CARRY_MIN, 0) + 1, CARRY_STEP)
+                  if len(v) >= CARRY_MIN]
+        host = _HOST_RE.match(v)
+        if host and "." in host.group(1):
+            probes.append(host.group(1))
+        for src, text in low:
+            if any(p in text and p not in trusted for p in probes):
+                found.append((where, src))
+                break
+    return found
+
+
 def _call_path(args: dict):
     return args.get("path", args.get("folder", ""))
 
@@ -820,6 +897,7 @@ class Agent:
     scopes: dict = field(default_factory=dict)
     session_tainted: bool = False  # set by the MCP gateway once the client has read untrusted data
     run_tainted: bool = False  # the prompt of the run in progress shows unverified memory notes
+    untrusted_seen: list = field(default_factory=list)  # (source, text) outside history (MCP gateway)
     ephemeral: bool = False  # history kept in memory only (delegated sub-tasks)
     chain: tuple = ()  # delegating agents above this one, outermost first
     run_budget: object = None  # the Budget of the run in progress (delegated sub-tasks reuse it)
@@ -1158,10 +1236,21 @@ class Kernel:
                          or ((p := _norm_path(_call_path(args))) is not None
                              and _path_matches(p, scope["auto_paths"])))
                     and ("auto_args" not in scope or _args_match(scope["auto_args"], args)))
+        carried = []
+        if needs and tainted:  # 5. provenance: did untrusted text pick these arguments?
+            carried = carried_args(args, untrusted_segments(agent.history) + agent.untrusted_seen,
+                                   _trusted_text(agent.history))
+        if carried:
+            auto = False  # no auto_args / auto_paths / auto_when_tainted for a copied value
+            where = ", ".join(f"{w} <- {src}" for w, src in carried)
+            self.store.log_audit(agent.name, CARRY_ENTRY, {"tool": name, "carried": where},
+                                 "arguments repeat untrusted content: a person must approve", "flagged")
         if needs and not auto:
-            refused = await self._approved(agent, name, args, tainted)
+            shown = {**args, CARRIED_KEY: where} if carried else args
+            refused = await self._approved(agent, name, shown, tainted)
             if refused:
-                return refused, True, "denied"
+                return refused + (f" (arguments copied from untrusted content: {where})" if carried else ""), \
+                    True, "denied"
         try:
             return await self.tools.call(name, agent, **args), False, "ok"
         except Exception as e:
@@ -3249,6 +3338,9 @@ class Gateway:
         elif self.k.harden and self.k.tools.is_untrusted(name):
             self.agent.session_tainted = True  # from now on: no pre-allowed risky calls
             out = tag_untrusted(name, out)
+            seen = self.agent.untrusted_seen  # the client keeps the context: remember what it read
+            seen += untrusted_segments([{"role": "user", "content": out}])
+            del seen[:-UNTRUSTED_SEEN_MAX]
         elif self.k.harden and UNTRUSTED_OPEN in out:  # e.g. recall returned an unverified note
             self.agent.session_tainted = True
         return out, err
