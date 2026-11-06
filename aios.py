@@ -2531,7 +2531,12 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
                           f"{box.timeout}s timeout. Print results to stdout.",
                           {"code": {"type": "string"}}, required=["code"])
         async def run_python(code: str):
-            return await box.run_python(code)
+            if box.name not in ("docker", "microvm"):
+                return await box.run_python(code)
+            import aios_admit  # a swarm's sandboxes start only while their memory fits (see there)
+            need = box.mem_mb + (MicroVMSandbox.JAIL_OVERHEAD_MB if box.name == "microvm" else 0)
+            async with aios_admit.gate().admit(need):
+                return await box.run_python(code)
     @k.tools.register("now", "Get the current local date and time.", {})
     async def now():
         return datetime.now().isoformat(timespec="seconds")
@@ -4374,6 +4379,13 @@ def doctor_cmd(home: str) -> int:
     why = MicroVMSandbox.unavailable()
     row("--" if why else "ok", "microvm", why or "Firecracker with KVM" +
         (" (jailer)" if MicroVMSandbox.jailer_wanted() else ""))
+    import aios_admit
+    g = aios_admit.MemoryGate()
+    free, fits = aios_admit.available_mb(), g.capacity(256)
+    row("ok" if free is not None else "--", "admission",
+        (f"{free} MiB free: about {fits} docker/microvm sandboxes of 256 MiB at once "
+         f"({g.reserve_mb} MiB kept in reserve)") if free is not None else
+        "free memory unknown here: only AIOS_SANDBOX_MAX limits how many start at once")
     with contextlib.redirect_stderr(quiet):
         try:
             picked = make_sandbox()
