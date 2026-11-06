@@ -30,6 +30,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`view_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出，以及你用 `/attach` 附加的檔案，都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
+- **參數來源追蹤**：被污染的執行裡，AIOS 還會檢查高風險呼叫的*每個參數是從哪裡來的*。如果某個參數重複了不可信內容（工具結果裡出現過、但你從沒打過的約 30 個字元，或網址的主機名稱），這次呼叫就不適用任何 `auto_args`、`auto_paths` 或 `auto_when_tainted` 規則：必須由人核准，而且提示（終端機、控制台或 Telegram）會顯示 `!! copied from untrusted content: url <- fetch_url`。這項檢查會以 `(provenance)` 寫進審計日誌，並發出 `untrusted-args` 警示。它看的是來源而不是語意，所以結果是確定的：模型改寫過的值抓不到，這也是被污染的執行預設仍要有人核准高風險呼叫的原因。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
 - **速率限制**（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)）：政策中的代理可以在滑動時間窗內限制模型呼叫與工具呼叫次數，例如 `[agents.reporter.rate]` 底下寫 `model = "30/min"` 與 `tools = { "*" = "200/hour", fetch_url = "10/min" }`（單位為 `s`、`min`、`hour`、`day`，可加倍數如 `5/30s`；符合的工具限制全部都要遵守）。和 `max_calls` 不同，它跨越多次執行：次數記在 `aios.db`，所以同一代理的所有對話、定時任務、協作代理與 `serve`/`a2a-serve` 連線共用同一額度，跨程序、重新啟動後也不會歸零。超過限制的工具呼叫會被拒絕（狀態 `denied`，並告知多久後可重試）；超過限制的模型呼叫最多等 60 秒，等不到就停止這次執行，狀態為 `rate`。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
@@ -176,6 +177,7 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
 | `loop-stop` | warning | 迴圈保護停止了一次不斷重複同一個工具呼叫的執行 |
+| `untrusted-args` | warning | 有風險的呼叫在參數裡重複了不可信內容（網址主機、要送出的內容），因此必須由人決定 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
 | `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘），或與 `--anchor` 檔案不符 |
 | `audit-sink-failing` | warning | `--audit-sink` 已連續失敗 15 分鐘以上 |
