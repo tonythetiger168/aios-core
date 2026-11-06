@@ -355,6 +355,7 @@ AIOS_NODE_TOKEN=<secret> python aios.py swarm --policy p.toml --agent worker --t
 AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head-ca head.pem --policy p.toml \
     --provider openai --base-url http://localhost:8000/v1 --model Qwen/Qwen2.5-3B-Instruct --parallel 16
 ```
+- *把執行中的任務搬到另一台節點*：policy 的 `[agents.<名稱>]` 設了 `transfer = true` 的代理，執行到一半可以搬到同一個代理群的另一台節點繼續，不必從頭再來。節點會在兩個步驟之間（絕不在工具呼叫進行中）存下這次執行的對話、步數、已用 token 與每次執行的呼叫次數，把這個檢查點交給 head，head 再把任務交給另一台節點；那台節點的 policy 也設了 `transfer = true` 時就從那一點接著做，否則從頭開始。會搬走的情況：節點要停止時（SIGTERM 或第一次 Ctrl+C：不再接新任務，在 `--drain-wait`（預設 60 秒）內盡量搬走，搬不走的立刻交還 head，不必等 30 秒租約到期；第二次 Ctrl+C 立即停止）、可用記憶體低於 `aios node --move-below-mem PCT` 時（Linux、Windows；恢復前不接新任務），或代理自己呼叫 `move_to_another_node` 時（權限裡要列出這個工具）。執行只會在用 token 加入這個 head 的節點之間搬動，不會複製或安裝到任何其他機器。工作區檔案留在寫入它的節點上，搬走的只有對話。兩邊都有審計（head：`node.move`；搬出的節點：狀態 `moved`；接手的節點：`resumed_from`），搬走前用掉的 token 也算進 head 的預算；一個任務最多搬 5 次，60 秒內不會回到剛離開的節點（只有一台節點時，之後就在原地接著做）。
 - *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
@@ -477,7 +478,7 @@ AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
