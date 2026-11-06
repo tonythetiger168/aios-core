@@ -99,3 +99,10 @@ permissions = ["now", "read_file", "list_files"]
 
 [agents.editor]         # combines the workers' answers; it reads only what they returned
 permissions = []
+
+# Multi-machine swarms (`aios swarm --nodes` + `aios node`): transfer = true lets a run of this agent
+# move to another node of the swarm and carry on there (when its node stops, runs low on memory, or
+# the agent calls move_to_another_node, which it may only if its permissions list it). Off by default.
+[agents.mover]
+permissions = ["now", "move_to_another_node"]
+transfer = true

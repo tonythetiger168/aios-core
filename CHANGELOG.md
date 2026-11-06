@@ -10,6 +10,11 @@ Follows the November 2026 research round-up (MCP 2026-07-28, agent-OS security a
   tries, first answer wins). Every call needs `$AIOS_NODE_TOKEN`; a head on a non-local address needs
   TLS (`--node-cert`/`--node-key`, `--head-ca` on nodes). Each node runs tasks as its own policy agent
   and audits them; the head's swarm budget covers the whole cluster.
+- **Moving a run between nodes**: an agent with `transfer = true` can hand a run in progress to
+  another node of the same swarm instead of starting over.
+- **Swarm memory guard**: `--parallel` is lowered to what free memory holds, new helpers wait while
+  free memory is under `AIOS_SWARM_MIN_FREE_MB` (256), and answers kept for `--reduce` spill to disk,
+  so memory stays flat for any task count.
 - **MCP 2026-07-28**: aios connects to MCP servers with the stateless `server/discover` when the SDK
   supports it (mcp 2.3+) and falls back to the `initialize` handshake for older servers; the revision
   each server got is audited; `aios serve` works with 2026-07-28 clients and reports its version.

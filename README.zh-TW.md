@@ -356,6 +356,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 
 **超高並發，但有硬性上限。**
 - *Worker 池與背壓*：固定 `--parallel` 個 worker（預設 8）從任務清單取工作，所以 10 萬個任務也不會在記憶體裡同時有 10 萬個執行；任務檔只有在有 worker 空出來時才會往下讀。
+- *記憶體防護*：記憶體隨 `--parallel` 增加，而不是隨任務數（幫手一跑完記憶體就釋放）。代理群開始前，`--parallel` 會降到可用記憶體容得下的數量（每個執行中的幫手預留 256 KB）；執行中若可用記憶體低於 256 MB，就先暫停啟動新幫手，等執行中的跑完再繼續（不會停掉或殺掉任何幫手，至少一個一直在跑）。可用記憶體會算進容器的 cgroup 上限。`--reduce` 要保留的答案超過 2,000 筆後改存暫存檔，所以幾百萬行的彙整記憶體也不會長大。`AIOS_SWARM_MIN_FREE_MB` 設定門檻（`0` 關閉）。在 1.5 GB 的 cgroup 裡同時跑 300,000 個幫手：沒有防護會被 OOM 殺掉；有防護 300,000 個全部完成，只用 95 MB（parallel 自動降到 4,856）。
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
 - *多核心*：`aios swarm --workers N` 把幫手放到 N 個行程裡跑，每個用一顆 CPU 核心（`--workers 0` = 保留一顆，其餘全用）。`--parallel` 與 `--model-slots` 由各行程分攤，預算仍然共用，所有審計紀錄由主行程寫進同一條雜湊鏈。代理內的 `swarm` 工具仍在單一行程中執行。
@@ -369,6 +370,7 @@ AIOS_NODE_TOKEN=<secret> python aios.py swarm --policy p.toml --agent worker --t
 AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head-ca head.pem --policy p.toml \
     --provider openai --base-url http://localhost:8000/v1 --model Qwen/Qwen2.5-3B-Instruct --parallel 16
 ```
+- *把執行中的任務搬到另一台節點*：policy 的 `[agents.<名稱>]` 設了 `transfer = true` 的代理，執行到一半可以搬到同一個代理群的另一台節點繼續，不必從頭再來。節點會在兩個步驟之間（絕不在工具呼叫進行中）存下這次執行的對話、步數、已用 token 與每次執行的呼叫次數，把這個檢查點交給 head，head 再把任務交給另一台節點；那台節點的 policy 也設了 `transfer = true` 時就從那一點接著做，否則從頭開始。會搬走的情況：節點要停止時（SIGTERM 或第一次 Ctrl+C：不再接新任務，在 `--drain-wait`（預設 60 秒）內盡量搬走，搬不走的立刻交還 head，不必等 30 秒租約到期；第二次 Ctrl+C 立即停止）、可用記憶體低於 `aios node --move-below-mem PCT` 時（Linux、Windows；恢復前不接新任務），或代理自己呼叫 `move_to_another_node` 時（權限裡要列出這個工具）。執行只會在用 token 加入這個 head 的節點之間搬動，不會複製或安裝到任何其他機器。工作區檔案留在寫入它的節點上，搬走的只有對話。兩邊都有審計（head：`node.move`；搬出的節點：狀態 `moved`；接手的節點：`resumed_from`），搬走前用掉的 token 也算進 head 的預算；一個任務最多搬 5 次，60 秒內不會回到剛離開的節點（只有一台節點時，之後就在原地接著做）。
 - *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
@@ -493,7 +495,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

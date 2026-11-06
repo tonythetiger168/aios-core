@@ -56,6 +56,17 @@ model's 1 s, so **adding agents makes the batch faster almost linearly** (10 age
 one wait longer (10,000: 3.4 s, 131,072: 57 s) while throughput stays flat. Memory is ~8 KB per
 agent (111 MB at 10,000, 1.1 GB at 131,072).
 
+### Memory: when too many agents run at once (2026-11-06)
+
+Memory grows with agents *running at once*, not with tasks: 200,000 tasks through 100 helpers at a time stayed at 47 MB the whole run. Running helpers cost ~8 KB each with the fake model (100,000 at once: 840 MB; 300,000: 2.4 GB) and ~70 KB with a real HTTP model.
+
+| 300,000 at once, 1.5 GB cgroup | result | peak RSS |
+|---|---|---|
+| no guard (`AIOS_SWARM_MIN_FREE_MB=0`) | killed by the kernel OOM killer | 1.5 GB |
+| memory guard (default) | 300,000 ok, 0 failed, 64 s (parallel lowered to 4,856) | 95 MB |
+
+The guard lowers `--parallel` to what free memory holds (256 KB per helper) and pauses new helpers while free memory is under `AIOS_SWARM_MIN_FREE_MB` (256), without stopping running ones. Run a level past the guard with `AIOS_SWARM_MIN_FREE_MB=0`.
+
 ### Many cores (`--workers`)
 
 One Python process runs every agent on one core (the GIL), so the ceiling above is one core's.
