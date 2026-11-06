@@ -1,5 +1,4 @@
 """Self-improvement: playbooks learned from runs, eval gate, live swap, rollback, patches by a person."""
-import asyncio
 import json
 import shutil
 import sys
