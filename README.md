@@ -34,6 +34,7 @@ Agents need an operating-system-like layer: who may call which tool, what is rem
 - **Rate limits** (ported from [agent-bastion](https://github.com/tonythetiger168/agent-bastion)): a policy agent can cap its model calls and tool calls over a sliding window, for example `[agents.reporter.rate]` with `model = "30/min"` and `tools = { "*" = "200/hour", fetch_url = "10/min" }` (units `s`, `min`, `hour`, `day`, optionally with a count such as `5/30s`; every matching tool limit applies). Unlike `max_calls` they span runs: they are counted in `aios.db`, so all of that agent's chats, jobs, helpers and `serve`/`a2a-serve` sessions share them, also across processes and restarts. A tool call over the limit is refused (status `denied`, with when to try again); a model call over it waits up to 60 seconds for room, otherwise the run stops with status `rate`.
 - **Memory provenance**: every fact records who wrote it (`user`, `model`, or `tainted` = saved while the run had read untrusted content) and when. Tainted facts are shown to the model as *unverified*, and a run that sees one (in its prompt or through `recall`, `list_facts` or `search_memory`) counts as tainted itself: no pre-allowed risky calls until you check the note with `aios memory confirm`; facts you set yourself with `/remember` cannot be overwritten by the model; newlines in a fact cannot forge extra lines in the system prompt. Older `aios.db` files are upgraded automatically.
 - **Scheduled jobs**: `aios jobs ...` and `aios daemon` run tasks unattended with caps and the same policy, with a heartbeat and a rule-based watchdog (`aios status`, `aios alerts`; see below).
+- **Supervises itself**: the daemon answers its own alerts. A job that keeps failing, burns its budget or acts like it was injected is paused; any other agent that does is put on hold (every risky call needs a person); a tampered audit log puts everything in safe mode. Rule-based, no model, no cost. It can only reduce risk, and only you undo it (`aios supervisor --release`). Actions also go to Telegram.
 - **Agents working together**: every agent in the policy file can be handed a sub-task through a tool named `agent__<name>`, granted like any tool (`permissions = ["agent__notes"]`). The helper works with its **own** permissions, scopes and memory, starts each sub-task fresh (not saved), and runs under the caller's budget. Delegation cannot be used to launder an injection: if the caller has read untrusted content, the helper starts tainted (no auto-approval, no `auto_paths`), and the helper's answer comes back tagged untrusted. Loops are refused and depth is capped at 2. Works in `chat` and in `daemon` jobs.
 - **Agent swarms**: hand hundreds of sub-tasks to helper agents at once with the `swarm` tool or `aios swarm`, under a worker pool, a process-wide limit on model calls in flight, a shared token/cost budget and per-task timeouts, optionally combined by a reducer agent. Same permissions, approvals, taint and audit as one delegation (see below).
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
@@ -180,8 +181,30 @@ python aios.py alerts --home ~/aios-data     # open alerts; --ack <id>|all, --al
 | `audit-tampered` | critical | the audit log's hash chain no longer checks out (whole log, not just 15 minutes), or no longer matches the `--anchor` file |
 | `audit-sink-failing` | warning | `--audit-sink` has been failing for 15 minutes or more |
 
-- Alerts go to the daemon's stderr, `aios status`, `aios alerts` and the console's overview. The same rule for the same agent is not repeated within an hour. Alerts only report; they never stop, block or change anything.
+- Alerts go to the daemon's stderr, `aios status`, `aios alerts` and the console's overview. The same rule for the same agent is not repeated within an hour. The watchdog itself only reports; the supervisor (below) is what acts on its alerts.
 - "Down" means no heartbeat for longer than 3 ticks plus one job timeout (at least 2 minutes), so a long job does not look like a dead daemon. Put `aios status` in cron or a monitoring check to be told when the daemon dies.
+
+### The supervisor
+
+AIOS supervises itself: on every tick, after the watchdog, the daemon answers each new alert with one fixed action. No model is involved and nothing is spent.
+
+| Alert | What the supervisor does |
+|---|---|
+| `job-failing`, `budget-runaway` (a job stopped on its budget 3 times in a day) | pauses the job |
+| `tainted-refused`, `unattended-refused`, `loop-stop`, `refusal-spike` on a job | pauses the job |
+| the same on any other agent (chat, A2A guest, swarm helper) | puts the agent **on hold**: every risky call needs a person, interactively, and auto-approving scopes stop applying. Safe tools keep working |
+| `audit-tampered` | **safe mode**: every job paused, every agent on hold |
+| anything else (`budget-stop`, `audit-sink-failing`, ...) | records it and tells you |
+
+```bash
+python aios.py supervisor --home ~/aios-data              # what it did, newest first
+python aios.py supervisor --release 7 --home ~/aios-data  # you undo one action (or: all)
+python aios.py daemon ... --no-supervise                  # alerts only, nothing paused or held
+```
+
+- It can only reduce risk. Its only writes are: disable a job, add a hold, record an action. It never enables a job, lifts a hold, grants a permission, changes a policy, answers an approval or edits the audit log. Undoing is `aios supervisor --release`, which a person runs; no agent tool reaches it, and an agent cannot switch the supervisor off.
+- Every action is an audit entry (agent `supervisor`), shows in `aios status` (which exits 1 while something is paused or held), and is sent to your Telegram chat as plain text when `aios telegram` runs.
+- Alerts you acknowledge before the next tick are not acted on. On a database it has never seen, it leaves alerts older than an hour to you.
 
 ### Copies outside aios.db
 
@@ -467,7 +490,7 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) · ✅ loop guard (`--max-repeats`) · ✅ workspace undo (`aios undo`) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits, multi-core with `--workers`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits, multi-core with `--workers`) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) · ✅ self-supervision (`aios supervisor`: pauses / holds on its own, released only by a person) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`) · ✅ public registry on Cloudflare Pages, built from `registry/` · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 

@@ -3,7 +3,8 @@
     export AIOS_TELEGRAM_TOKEN=123456:ABC...        # from @BotFather; never put it on the command line
     python aios.py telegram --home ~/aios-data --chat-id 987654321
 
-Every pending request in aios.db (from `daemon`, `serve` or `swarm` with `--approvals console`) is
+What the supervisor does on its own (pauses a job, holds an agent; see aios_supervisor) is sent
+to the same chat as plain text. Every pending request in aios.db (from `daemon`, `serve` or `swarm` with `--approvals console`) is
 sent to your chat with Approve / Deny buttons. A press is answered exactly like the web console does
 it (aios_console.decide): only a request that is still pending and not expired changes. The message
 is then edited to show the outcome, also when the request expired or was answered in the console.
@@ -89,6 +90,7 @@ class Bridge:
         self.reader = aios_console.Reader(self.db)
         self.sent: dict[int, dict] = {}  # approval id -> {"message_id", "text"} of requests shown and open
         self.offset = 0
+        self.last_action = None  # supervisor actions newer than this are sent (set on the first step)
 
     def pending(self) -> list[tuple]:
         return self.reader.query("SELECT id, ts, agent, tool, args, tainted, expires FROM approvals "
@@ -112,6 +114,21 @@ class Bridge:
                 "reply_markup": {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"a:{aid}"},
                                                       {"text": "❌ Deny", "callback_data": f"d:{aid}"}]]}})
             self.sent[aid] = {"message_id": msg["message_id"], "text": text}
+
+    def send_actions(self):
+        """What the supervisor paused or held on its own, as plain text (no buttons: undoing it is
+        `aios supervisor --release`, on the machine). Only actions newer than the bot's start."""
+        rows = self.reader.query("SELECT id, action, target, detail FROM supervisor_actions WHERE id>? "
+                                 "ORDER BY id", (self.last_action or 0,))
+        if self.last_action is None:
+            self.last_action = rows[-1][0] if rows else 0
+            return
+        import aios_supervisor
+        for aid, action, target, detail in rows:
+            self.api("sendMessage", {"chat_id": self.chat_id, "disable_web_page_preview": True,
+                                     "text": aios_supervisor.text({"id": aid, "action": action,
+                                                                   "target": target, "detail": detail})})
+            self.last_action = aid
 
     def close_finished(self):
         """Requests answered elsewhere (console) or expired: show it and drop the buttons."""
@@ -163,6 +180,7 @@ class Bridge:
 
     def step(self, poll: float = POLL):
         self.send_new()
+        self.send_actions()
         updates = self.api("getUpdates", {"offset": self.offset, "timeout": int(poll),
                                           "allowed_updates": ["callback_query", "message"]})
         for u in updates or []:

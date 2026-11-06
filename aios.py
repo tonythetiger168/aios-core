@@ -1150,17 +1150,23 @@ class Kernel:
             return (f"permission denied: rate limit for {agent.rate_key}: {full['rule'][5:]} at most "
                     f"{full['calls']} per {fmt_window(full['seconds'])}; try again in {full['retry']:.0f}s",
                     True, "denied")
+        import aios_supervisor
+        hold = aios_supervisor.held(self.store.db, agent.name, agent.rate_key)  # the supervisor's hold:
+        strict = tainted or hold is not None  # risky calls need a person, auto scopes stop applying
         needs = (ToolRegistry.permits(self.needs_approval, name)  # 4. human approval
-                 or (tainted and ToolRegistry.permits(self.approval_when_tainted, name)))
+                 or (strict and ToolRegistry.permits(self.approval_when_tainted, name)))
         auto = bool(scope and ("auto_paths" in scope or "auto_args" in scope)
-                    and (not tainted or scope.get("auto_when_tainted"))
+                    and hold is None and (not tainted or scope.get("auto_when_tainted"))
                     and ("auto_paths" not in scope
                          or ((p := _norm_path(_call_path(args))) is not None
                              and _path_matches(p, scope["auto_paths"])))
                     and ("auto_args" not in scope or _args_match(scope["auto_args"], args)))
         if needs and not auto:
-            refused = await self._approved(agent, name, args, tainted)
+            refused = await self._approved(agent, name, args, strict)
             if refused:
+                if hold is not None and not tainted:  # not an injection sign: say why instead
+                    refused = (f"not approved by a human: {name} (the supervisor put this agent on hold, "
+                               f"so a person must approve each risky call interactively: {hold[:200]})")
                 return refused, True, "denied"
         try:
             return await self.tools.call(name, agent, **args), False, "ok"
@@ -3586,7 +3592,7 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                  daily_tokens: int | None = None, daily_cost: float | None = None,
                  mcp_specs: list[str] | None = None, confine_mcp=frozenset(), offline_mcp=frozenset(),
                  egress_mcp: dict | None = None, audit_sink: str | None = None,
-                 anchor_path: str | None = None, anchor_every: float = 3600):
+                 anchor_path: str | None = None, anchor_every: float = 3600, supervise: bool = True):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -3629,6 +3635,9 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
         print("[aios] risky calls wait for a person in `aios console --approve`", file=sys.stderr)
     import aios_auditout
     import aios_watchdog as wd
+    import aios_supervisor as sup
+    if not supervise:
+        print("[aios] --no-supervise: alerts are raised but nothing is paused or held", file=sys.stderr)
     sink = None
     if audit_sink and not once:  # --once sends what it can at the end instead
         sink = aios_auditout.Sink(str(base / "aios.db"), audit_sink).start()
@@ -3651,6 +3660,10 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
             wd.beat(k.store.db, "daemon", beat_info)
             for al in wd.check(k.store.db):  # watchdog: rules over the audit log, no model involved
                 print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
+            if supervise:  # supervisor: answers the alerts by pausing jobs / holding agents, never more
+                for act in sup.tick(k.store.db):
+                    print(f"[aios] SUPERVISOR #{act['id']} {act['action']} {act['target']}: {act['detail']}",
+                          file=sys.stderr)
             if anchor_path and not once and time.monotonic() >= next_anchor:
                 anchor_now()
                 next_anchor = time.monotonic() + anchor_every
@@ -4199,6 +4212,11 @@ def status_cmd(home: str, now=None) -> int:
         pending = store.db.execute("SELECT COUNT(*) FROM approvals WHERE status='pending' AND expires>?",
                                    (datetime.now().isoformat(timespec="seconds"),)).fetchone()[0]
         print(f"open alerts: {len(alerts)}   waiting for approval: {pending}")
+        import aios_supervisor as sup
+        sv = sup.summary(store.db)
+        if sv["paused_jobs"] or sv["holds"]:
+            print(f"supervisor: {sv['paused_jobs']} job(s) paused, on hold: {', '.join(sv['holds']) or '-'} "
+                  "(aios supervisor; --release ID to undo)")
         import aios_auditout
         for s in aios_auditout.status(store.db):
             print(f"audit sink {s['url']}: {s['behind']} entries not sent yet"
@@ -4206,7 +4224,8 @@ def status_cmd(home: str, now=None) -> int:
                      f", last sent {s['ok_ts']}" if s["ok_ts"] else ""))
         for al in alerts[:10]:
             print(f"  #{al['id']} {al['ts']} [{al['severity']}] {al['rule']}: {al['detail']}")
-        return 0 if hb["state"] != "down" and not alerts and not pending else 1
+        return 0 if hb["state"] != "down" and not alerts and not pending and not sv["holds"] \
+            and not sv["paused_jobs"] else 1
     finally:
         store.db.close()
 
@@ -4330,6 +4349,33 @@ def alerts_cmd(home: str, show_all: bool = False, ack: str | None = None, run_ch
             print(f"#{al['id']} {al['ts']} [{al['severity']}] {al['rule']} {al['subject']}: {al['detail']}{done}")
         if not rows:
             print("(no open alerts)" if not show_all else "(no alerts)")
+        return 0
+    finally:
+        store.db.close()
+
+
+def supervisor_cmd(home: str, release: str | None = None, only_open: bool = False, n: int = 50) -> int:
+    """What the supervisor did on its own, and the one way to undo it: a person runs --release."""
+    import aios_supervisor as sup
+    db = Path(home).resolve() / "aios.db"
+    if not db.exists():
+        print("(the supervisor has done nothing here)")
+        return 0
+    store = Store(str(db))
+    try:
+        if release:
+            done = sup.release(store.db, release)
+            print("\n".join(done) if done else "nothing to release (already released, or no such action)")
+            return 0
+        rows = sup.actions(store.db, not only_open, n)
+        for r in rows:
+            state = f"  (released {r['released_ts']})" if r["released_ts"] else ""
+            print(f"#{r['id']} {r['ts']} {r['action']} {r['target']}: {r['detail']}{state}")
+        if not rows:
+            print("(the supervisor has done nothing here)")
+        s = sup.summary(store.db)
+        if s["paused_jobs"] or s["holds"]:
+            print(f"now: {s['paused_jobs']} job(s) paused by the supervisor, on hold: {', '.join(s['holds']) or '-'}")
         return 0
     finally:
         store.db.close()
@@ -4491,6 +4537,8 @@ def parser() -> argparse.ArgumentParser:
                     "seconds and at stop; keep FILE on another disk or machine")
     dm.add_argument("--anchor-every", type=float, default=3600, metavar="SECONDS",
                     help="seconds between anchors (default 3600)")
+    dm.add_argument("--no-supervise", action="store_true", help="raise alerts only: do not let the supervisor "
+                    "pause jobs or hold agents (see `aios supervisor`)")
     jb = sub.add_parser("jobs", help="manage scheduled jobs")
     jb.add_argument("action", choices=["add", "list", "remove", "enable", "disable", "run", "history", "secret"])
     jb.add_argument("args", nargs="*", help='add: <name> "<task>"   others: <name>')
@@ -4526,6 +4574,11 @@ def parser() -> argparse.ArgumentParser:
     al.add_argument("--ack", metavar="ID|all", help="acknowledge one alert, or all open ones")
     al.add_argument("--check", action="store_true", help="run the watchdog rules now (the daemon does this every tick)")
     al.add_argument("-n", type=int, default=50, help="how many alerts (default 50)")
+    su = sub.add_parser("supervisor", help="what the supervisor paused or held on its own; --release undoes it")
+    su.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
+    su.add_argument("--release", metavar="ID|all", help="undo one action (resume the job / lift the hold), or all")
+    su.add_argument("--open", action="store_true", help="only actions not released yet")
+    su.add_argument("-n", type=int, default=50, help="how many actions (default 50)")
     sw = sub.add_parser("swarm", help="run a file of tasks across policy agents, many at once (JSON lines out)")
     sw.add_argument("--policy", required=True, help="TOML policy: each task runs with its agent's permissions")
     sw.add_argument("--tasks", required=True, metavar="FILE",
@@ -4610,6 +4663,10 @@ def cli():
         raise SystemExit(status_cmd(a.home))
     if a.cmd == "alerts":
         raise SystemExit(alerts_cmd(a.home, a.all, a.ack, a.check, a.n))
+    if a.cmd == "supervisor":
+        if a.release and a.release != "all" and not a.release.isdigit():
+            ap.error("--release takes an action number or 'all'")
+        raise SystemExit(supervisor_cmd(a.home, a.release, a.open, a.n))
     if a.cmd == "telegram":
         import aios_telegram
         chat = a.chat_id
@@ -4660,7 +4717,8 @@ def cli():
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
                                   a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
                                   a.mcp, set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress,
-                                  audit_sink=a.audit_sink, anchor_path=a.anchor, anchor_every=a.anchor_every))
+                                  audit_sink=a.audit_sink, anchor_path=a.anchor, anchor_every=a.anchor_every,
+                                  supervise=not a.no_supervise))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         check_daily_flags(a, ap)
