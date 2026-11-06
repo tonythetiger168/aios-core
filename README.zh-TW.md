@@ -35,7 +35,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策，並有心跳與規則式看門狗（`aios status`、`aios alerts`；見下）。
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
-- **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果。權限、審批、污染標記與審計和單次委派完全相同（見下方）。
+- **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
@@ -345,6 +345,16 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 - *限流*：行程內每個代理的每次模型呼叫都要先取得 `--model-slots` 個槽位之一（預設 16）。巢狀代理群與並行的排程任務共用這些槽位，所以不管展開多大，模型供應商同時收到的請求都不會超過這個數。
 - *共享預算*：同一個代理群的所有 worker 共用一本帳：`--swarm-max-tokens`（預設 1,000,000）與 `--swarm-max-cost`（需提供價格）。用完後不再啟動新任務（其餘標記為 `skipped`），執行中的 worker 在下一次模型呼叫前停止。代理群裡的代理群也會記到上層的帳上。每個 worker 仍有自己的單次執行預算。
 - *多核心*：`aios swarm --workers N` 把幫手放到 N 個行程裡跑，每個用一顆 CPU 核心（`--workers 0` = 保留一顆，其餘全用）。`--parallel` 與 `--model-slots` 由各行程分攤，預算仍然共用，所有審計紀錄由主行程寫進同一條雜湊鏈。代理內的 `swarm` 工具仍在單一行程中執行。
+- *多台機器*：`aios swarm --nodes PORT` 讓這台機器成為叢集的 head，其他機器執行 `aios node --head URL` 成為它的 worker，就像 vLLM／Ray 的 head 與 worker。節點採「拉」的方式：每台依自己的空位（`--parallel`）向 head 要任務，所以不必開 port，比較大的機器自然拿得多。節點以自己的 policy 代理執行每個任務（自己的權限、範圍、沙箱、審批、模型與 `aios.db` 審計）；policy 裡沒有的代理一律拒絕。任務執行中節點每 10 秒送一次心跳；沉默 30 秒的節點，手上的任務會改派給其他節點（最多 3 次，先回答者為準），任務被改派或不再需要時，原節點會收到通知並停止。節點會回報每個任務用掉的 token，所以 head 的 `--swarm-max-tokens`／`--swarm-max-cost` 管得到整個叢集；head 會把每個任務連同執行的節點寫進審計，`--reduce` 也在 head 上跑。每次呼叫都要帶 `$AIOS_NODE_TOKEN`（沒設定時 head 會產生一個並印出；只在自己的機器之間共用）。head 預設只聽 127.0.0.1；給 `HOST:PORT` 時必須加 `--node-cert`／`--node-key`（TLS，節點會驗證，自簽憑證用 `--head-ca`），或放在 https 反向代理或 tunnel 後面；節點絕不會用明文 http 把 token 送到別台機器。`aios node` 預設會繼續服務 head 之後的代理群；加 `--once` 則在這個代理群結束時退出。
+
+```bash
+# head（放任務檔的機器）
+AIOS_NODE_TOKEN=<secret> python aios.py swarm --policy p.toml --agent worker --tasks tasks.txt --out results.jsonl \
+    --nodes 0.0.0.0:8780 --node-cert head.pem --node-key head-key.pem --parallel 64
+# 每台 worker：同一份 policy、各自的模型
+AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head-ca head.pem --policy p.toml \
+    --provider openai --base-url http://localhost:8000/v1 --model Qwen/Qwen2.5-3B-Instruct --parallel 16
+```
 - *能撐多大*：單一行程用假模型同時跑過 131,072 個代理（0 失敗，每個約 8 KB），經 HTTP 跑過 10,000 個；單一核心每秒最多幾千個代理，4 核機器上 3 個 worker 約為其 2.8 倍（每秒約 11,700 個）；接真模型時瓶頸是 GPU（一張 RTX 3090：同時 10,000 個，128 秒跑完，每秒 55–80 個）。`scripts/stress-swarm.py` 負責量測，`scripts/runpod-stress.py` 在一張租來的 GPU 上跑；詳見 [docs/stress-test.md](docs/stress-test.md)。
 - *失敗隔離*：每個任務都有逾時（`--timeout`，預設 600 秒）；一個任務出錯或逾時不會影響其他任務，取消代理群會取消所有 worker。
 - *彙整大量結果*：`reduce` 會把答案分成大小有上限的群組，由彙整代理分輪合併到只剩一份，所以一千個答案不會塞進同一個提示。沒有 `reduce` 時，領頭代理收到的每個答案都會截短（每個 1,500 字元，總共 20,000）。
@@ -467,7 +477,7 @@ python aios.py swarm --policy policy.example.toml --agent worker --tasks tasks.t
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
