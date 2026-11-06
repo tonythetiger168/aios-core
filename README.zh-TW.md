@@ -47,6 +47,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **需要時自動帶入的記憶**（`recall_on`）：在代理的政策裡設定 `recall_on = ["read_file", "web__*"]` 後，每次呼叫這些工具，AIOS 會在結果後面附上最多 3 條和這次呼叫相關（依參數與結果開頭比對）、而且還不在提示詞裡的記憶，記憶很多的代理不必自己想到要搜尋。每條記憶在一次執行中只附一次，標示方式與提示詞相同（未驗證的記憶會讓這次執行受污染），每次附加都以 `(recall)` 寫入審計日誌。預設關閉。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策，並有心跳與規則式看門狗（`aios status`、`aios alerts`；見下）。
+- **自己監督自己**：守護程式會自己處理自己的告警。一直失敗、一直燒光預算、或看起來被注入的定時任務會被暫停；其他代理出現同樣狀況則被「扣住」（每個高風險呼叫都要有人批准）；審計日誌被竄改時全部進入安全模式。全是規則，不用模型、不花錢。它只能降低風險，也只有你能解除（`aios supervisor --release`）。每個動作也會送到 Telegram。
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。呼叫者也可以縮小幫手拿到的權限：在呼叫者設定 `narrow = true`，幫手只保留呼叫者自己也有的工具；`[agents.lead.delegate] writer = ["write_file"]` 則把某個幫手限制在清單內。這些上限會沿著委派鏈往下傳（幫手再找的幫手也受限），所以委派只會縮小一個請求能做的事，不會擴大。
 - **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。`run_python` 的 Docker 與 microVM 沙箱只有在記憶體上限放得進主機的可用記憶體時才會啟動（Linux 讀 `MemAvailable`，Windows 讀可用實體記憶體；保留 512 MiB，`AIOS_SANDBOX_RESERVE_MB` 可調），其餘的會排隊等候，而不是把主機推進 swap 或觸發 OOM killer（`AIOS_SANDBOX_MAX` 限制同時數量，`AIOS_SANDBOX_WAIT` 是最長等待秒數，預設 300）。`aios doctor` 會顯示能同時放幾個。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
@@ -195,8 +196,30 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘），或與 `--anchor` 檔案不符 |
 | `audit-sink-failing` | warning | `--audit-sink` 已連續失敗 15 分鐘以上 |
 
-- 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。告警只負責回報，絕不停止、阻擋或更改任何東西。
+- 告警會出現在守護程式的 stderr、`aios status`、`aios alerts` 與控制台總覽。同一規則對同一代理一小時內不重複。看門狗本身只負責回報；真正處理告警的是監督者（見下）。
 - 「down」代表超過 3 次 tick 加上一次任務逾時（至少 2 分鐘）沒有心跳，所以長時間的任務不會被誤判成守護程式掛掉。把 `aios status` 放進 cron 或監控檢查，守護程式掛掉時就會收到通知。
+
+### 監督者
+
+AIOS 會自己監督自己：每次 tick 在看門狗之後，守護程式會對每個新告警採取一個固定動作。不用模型，不花任何錢。
+
+| 告警 | 監督者的動作 |
+|---|---|
+| `job-failing`、`budget-runaway`（某任務一天內 3 次因預算而停止） | 暫停該任務 |
+| 定時任務出現 `tainted-refused`、`unattended-refused`、`loop-stop`、`refusal-spike`、`untrusted-args` | 暫停該任務 |
+| 其他代理（chat、A2A 訪客、swarm 幫手）出現同樣狀況 | 把代理**扣住**：每個高風險呼叫都必須由人即時批准，自動批准的範圍也不再生效；安全的工具照常可用 |
+| `audit-tampered` | **安全模式**：暫停所有任務，扣住所有代理 |
+| 其他（`budget-stop`、`audit-sink-failing` 等） | 記錄下來並通知你 |
+
+```bash
+python aios.py supervisor --home ~/aios-data              # 它做了什麼，新的在前
+python aios.py supervisor --release 7 --home ~/aios-data  # 由你解除某個動作（或 all）
+python aios.py daemon ... --no-supervise                  # 只發告警，不暫停也不扣住
+```
+
+- 它只能降低風險。它唯一會寫的東西是：停用任務、加上扣住、記錄動作。它絕不會啟用任務、解除扣住、給予權限、修改政策、回答批准請求或修改審計日誌。解除只能用 `aios supervisor --release`，由人執行；沒有任何代理工具碰得到它，代理也無法關掉監督者。
+- 每個動作都是一筆審計紀錄（代理為 `supervisor`），會出現在 `aios status`（有東西被暫停或扣住時結束碼為 1），並在 `aios telegram` 執行時以純文字送到你的 Telegram。
+- 在下一次 tick 前就被你確認（ack）的告警不會被處理。第一次看到的資料庫，超過一小時的舊告警留給你處理。
 
 ### aios.db 以外的副本
 
@@ -521,7 +544,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

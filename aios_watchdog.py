@@ -21,6 +21,8 @@ Rules (over the last WINDOW_MINUTES):
                     or inserted outside AIOS (checked over the whole log, not just the window)
   audit-sink-failing  the daemon's --audit-sink has been failing for 15 minutes or more (entries
                     wait in aios.db and go out once it is back; see aios_auditout)
+  budget-runaway  (raised by aios_supervisor) a job stopped on its budget 3 times in a day
+The supervisor (aios_supervisor) answers these alerts in the daemon: it pauses jobs and holds agents.
 The same rule for the same subject is not raised again within COOLDOWN_MINUTES.
 """
 import hashlib
@@ -38,7 +40,7 @@ CARRY_ENTRY = "(provenance)"  # aios.CARRY_ENTRY
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
             "budget-stop": "info", "loop-stop": "warning", "job-failing": "warning", "audit-tampered": "critical",
             "audit-sink-failing": "warning", "untrusted-args": "warning",
-            "improve-paused": "info", "improve-rollback": "warning"}
+            "improve-paused": "info", "improve-rollback": "warning", "budget-runaway": "warning"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
