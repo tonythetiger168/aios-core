@@ -12,6 +12,16 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 
 「不綁特定模型」：可用 Anthropic，或任何相容 OpenAI 的伺服器，包括本機模型（見下方「模型供應商」）。
 
+## 0.2.0 新功能
+
+- **代理群可分散到多台機器**：`aios swarm --nodes` 讓這台機器成為叢集的 head，其他機器執行 `aios node --head URL` 加入成為 worker。worker 主動拉任務，不必開 port；沉默的 worker 手上的任務會改派給別台；每次呼叫都要 `$AIOS_NODE_TOKEN`，head 對其他機器開放時必須用 TLS。見[代理群（Swarm）](#代理群swarm)。
+- **沙箱准入控制**：Docker 與 microVM 沙箱在記憶體不足時排隊等候，不會把機器撐爆。
+- **參數來源追蹤**：高風險呼叫的參數照抄了不可信文字時，必須由人核准，並發出 `untrusted-args` 警示。
+- **委派權限只會縮小**：`narrow`／`delegate` 讓幫手的權限沿委派鏈只減不增。
+- **`recall_on`**、**`aios export`**（OpenAI 格式的對話 JSON，給外部掃描工具）與 **MCP 2026-07-28**（相容舊版伺服器）。
+
+完整清單見 [CHANGELOG.md](CHANGELOG.md)；與傳統作業系統機制的對照自我檢核見 [docs/os-mechanisms.zh-TW.md](docs/os-mechanisms.zh-TW.md)。
+
 ## 目前可用的功能
 
 - **內核**：非同步任務佇列加 worker 池；每個 agent 是一個「行程」，有自己的權限、歷史與記憶。
@@ -25,18 +35,20 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
   - `process`（預設）：獨立行程、CPU／記憶體／檔案大小限制、限制新開行程數（Linux，非 root）、無網路（Linux 且支援非特權 user namespace；否則至少用 Landlock 擋下 TCP），並在 Linux 5.13+ 用 [Landlock](https://docs.kernel.org/userspace-api/landlock.html) 限制檔案：只能讀 Python、系統函式庫與工作區，只能寫自己的暫存資料夾。在 macOS 上則用 `sandbox-exec`：不能使用網路，也讀不到家目錄與暫存資料夾。在 Windows 上則放進 job object 裡的 [AppContainer](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation) 執行：完全沒有網路（連本機也連不到），碰不到你的使用者資料夾（只能讀 Windows、Program Files、Python 與工作區，只能寫自己的資料夾），並限制每個行程的記憶體、CPU 時間與行程數，結束時它開的所有行程都會被砍掉。AIOS 會讓它的容器（`aios.sandbox`，SID 可用 `aios doctor` 查看）讀取 Python 所在資料夾，只授權一次；要撤銷請執行 `icacls <資料夾> /remove *<SID>`。
   - `docker`：每次呼叫用一個用完即丟的容器，無網路、**不掛載你電腦上的任何東西**、根目錄唯讀、非特權使用者、移除所有 capabilities，並限制記憶體／CPU／行程數。設計支援 Linux 容器，包括 macOS／Windows 的 Docker Desktop；實際限制取決於 daemon 與平台；如果 daemon 回報它無法執行這些限制（例如沒有委派 cgroup 的 rootless Docker，會默默忽略限制），AIOS 會拒絕使用它，見 [rootless Docker](docs/docker-sandbox-validation.md#rootless-docker)。real-Docker CI 涵蓋 Ubuntu 的一般與 rootless Docker。映像檔不會自動下載：請先執行一次 `docker pull python:3.12-slim`。建議用 `AIOS_DOCKER_IMAGE=python@sha256:<digest>` 鎖定映像檔，標籤被改掉也不會換掉實際執行的內容（啟動訊息會印出要用的那一行，見[鎖定說明](docs/docker-sandbox-validation.md#image-pinning-and-trust)）。在 Windows 上，`auto` 會在 Docker 可用時優先選用，否則改用 AppContainer。
   - `microvm`（實驗性，需 Linux 與 KVM）：每次呼叫啟動一台全新的 [Firecracker](https://firecracker-microvm.github.io/) microVM，有自己的核心、沒有網路裝置、除了程式碼之外不帶入你電腦上的任何東西、根目錄唯讀、非特權使用者。只在明確指定時使用，`auto` 永遠不會選它；KVM、Firecracker 或映像檔缺少時 AIOS 會拒絕啟動。每次呼叫會還原一台只開機一次的 VM 快照，不必每次重新開機（每次仍是獨立的 VM，亂數也各自重新產生；設定 `AIOS_MICROVM_SNAPSHOT=0` 可關閉）。AIOS 以 root 執行時，設定 `AIOS_MICROVM_JAILER=1` 還會用 Firecracker 的 jailer 把 VMM 本身也關起來（chroot、非特權 uid、有記憶體上限的 cgroup）。設定方式與威脅模型見 [docs/microvm-sandbox.md](docs/microvm-sandbox.md)。
-- **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`--mcp-egress '名稱=api.github.com,*.example.com'` 適合只呼叫某個 API 的伺服器：一樣沒有網路，只能用 HTTPS 連到列出的主機（`host`、`*.domain` 代表其子網域、`host:port` 代表 443 以外的連接埠），經由 AIOS 執行的代理：它會確認名稱只解析到公開位址，並把每次連線（允許或拒絕）寫進審計日誌（需要獨立的網路 namespace 或 `sandbox-exec`；伺服器必須遵守 `HTTPS_PROXY`，Python、Go 與 curl 都會，Node 24+ 則靠 AIOS 設定的 `NODE_USE_ENV_PROXY=1`）。`aios doctor` 會顯示你的機器是哪一種。
+- **MCP 客戶端**：可接 stdio MCP 伺服器；工具以 `<伺服器>__<工具>` 註冊，且除非你明確授權，agent 不會取得。AIOS 會用雙方都支援的最新 MCP 版本：裝了 `mcp` 2.3+ 時，先嘗試無狀態的 MCP 2026-07-28（`server/discover`，不需要 `initialize` 握手），舊伺服器則在同一條連線上改用握手；每個伺服器用了哪個版本會寫進審計日誌（`connect`），`AIOS_MCP_PROTOCOL=legacy` 可跳過嘗試。`--confine-mcp 名稱` 讓該伺服器碰不到你的檔案：只能讀 Python、系統函式庫、它自己的程式與命令裡指定的檔案，只能寫一個用完即丟的家目錄，網路照常可用（Linux 5.13+ 用 Landlock，macOS 用 `sandbox-exec`；其他平台會拒絕）。`--offline-mcp 名稱` 做同樣的限制，並且拿掉網路，適合不需要網路的伺服器（計算機、本機資料庫工具等）：有獨立的網路 namespace（或 `sandbox-exec`）時完全送不出任何東西；只有 Landlock 時只擋得住 TCP，AIOS 啟動時會註明。`--mcp-egress '名稱=api.github.com,*.example.com'` 適合只呼叫某個 API 的伺服器：一樣沒有網路，只能用 HTTPS 連到列出的主機（`host`、`*.domain` 代表其子網域、`host:port` 代表 443 以外的連接埠），經由 AIOS 執行的代理：它會確認名稱只解析到公開位址，並把每次連線（允許或拒絕）寫進審計日誌（需要獨立的網路 namespace 或 `sandbox-exec`；伺服器必須遵守 `HTTPS_PROXY`，Python、Go 與 curl 都會，Node 24+ 則靠 AIOS 設定的 `NODE_USE_ENV_PROXY=1`）。`aios doctor` 會顯示你的機器是哪一種。
 - **模型供應商**：預設 Anthropic，也可用 `--provider openai --model <名稱>` 連接任何 OpenAI 相容伺服器（Ollama、LM Studio、vLLM、llama.cpp）。openai 供應商只用標準函式庫；只有使用 Anthropic 時才會載入 `anthropic` 套件。
 - **預算**：每次執行可限制模型呼叫數（`--max-steps`）、token（`--max-tokens`）與費用（`--max-cost`，需搭配 `--price-in/--price-out`）。達到上限時會在執行更多工具**之前**停止並說明原因，每次執行的用量都會寫進審計日誌。
 - **迴圈保護**：模型在同一次執行中，用完全相同的參數呼叫同一個工具超過 3 次（`--max-repeats`，0＝關閉）時，會收到錯誤而不是再執行一次；如果下一個回覆仍然只要求這類呼叫，這次執行就會停止（審計日誌記為 `stop=loop`，並發出 `loop-stop` 警示）。卡住的模型或被注入的迴圈因此只會浪費幾次呼叫，而不是整個預算。
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`view_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出，以及你用 `/attach` 附加的檔案，都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
+- **參數來源追蹤**：被污染的執行裡，AIOS 還會檢查高風險呼叫的*每個參數是從哪裡來的*。如果某個參數重複了不可信內容（工具結果裡出現過、但你從沒打過的約 30 個字元，或網址的主機名稱），這次呼叫就不適用任何 `auto_args`、`auto_paths` 或 `auto_when_tainted` 規則：必須由人核准，而且提示（終端機、控制台或 Telegram）會顯示 `!! copied from untrusted content: url <- fetch_url`。這項檢查會以 `(provenance)` 寫進審計日誌，並發出 `untrusted-args` 警示。它看的是來源而不是語意，所以結果是確定的：模型改寫過的值抓不到，這也是被污染的執行預設仍要有人核准高風險呼叫的原因。
 - **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
 - **速率限制**（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)）：政策中的代理可以在滑動時間窗內限制模型呼叫與工具呼叫次數，例如 `[agents.reporter.rate]` 底下寫 `model = "30/min"` 與 `tools = { "*" = "200/hour", fetch_url = "10/min" }`（單位為 `s`、`min`、`hour`、`day`，可加倍數如 `5/30s`；符合的工具限制全部都要遵守）。和 `max_calls` 不同，它跨越多次執行：次數記在 `aios.db`，所以同一代理的所有對話、定時任務、協作代理與 `serve`/`a2a-serve` 連線共用同一額度，跨程序、重新啟動後也不會歸零。超過限制的工具呼叫會被拒絕（狀態 `denied`，並告知多久後可重試）；超過限制的模型呼叫最多等 60 秒，等不到就停止這次執行，狀態為 `rate`。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
+- **需要時自動帶入的記憶**（`recall_on`）：在代理的政策裡設定 `recall_on = ["read_file", "web__*"]` 後，每次呼叫這些工具，AIOS 會在結果後面附上最多 3 條和這次呼叫相關（依參數與結果開頭比對）、而且還不在提示詞裡的記憶，記憶很多的代理不必自己想到要搜尋。每條記憶在一次執行中只附一次，標示方式與提示詞相同（未驗證的記憶會讓這次執行受污染），每次附加都以 `(recall)` 寫入審計日誌。預設關閉。
 - **定時任務**：`aios jobs ...` 與 `aios daemon` 在無人值守下執行任務，有上限且套用同一套政策，並有心跳與規則式看門狗（`aios status`、`aios alerts`；見下）。
-- **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。
-- **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。
+- **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。呼叫者也可以縮小幫手拿到的權限：在呼叫者設定 `narrow = true`，幫手只保留呼叫者自己也有的工具；`[agents.lead.delegate] writer = ["write_file"]` 則把某個幫手限制在清單內。這些上限會沿著委派鏈往下傳（幫手再找的幫手也受限），所以委派只會縮小一個請求能做的事，不會擴大。
+- **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。`run_python` 的 Docker 與 microVM 沙箱只有在記憶體上限放得進主機的可用記憶體時才會啟動（Linux 讀 `MemAvailable`，Windows 讀可用實體記憶體；保留 512 MiB，`AIOS_SANDBOX_RESERVE_MB` 可調），其餘的會排隊等候，而不是把主機推進 swap 或觸發 OOM killer（`AIOS_SANDBOX_MAX` 限制同時數量，`AIOS_SANDBOX_WAIT` 是最長等待秒數，預設 300）。`aios doctor` 會顯示能同時放幾個。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
@@ -45,6 +57,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
+- **匯出給外部掃描器**：`python aios.py export --agent main > main.json` 會把代理保存的對話寫成 OpenAI 格式的聊天 JSON（含 `tool_calls` 的 user／assistant、工具結果，不可信輸出仍保留標籤，圖片略過），這是代理安全掃描器與 LLM 評審常讀的格式（例如 Cisco 開源的 Project Quarry）。改用 `--from-audit -n 5` 則從審計日誌重建最近幾次執行，不保存歷史的定時任務、幫手與 A2A 執行也能檢查（被拒絕的呼叫也在內，並附狀態）。完全離線，不會送出任何東西。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
 - **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
 
@@ -177,6 +190,7 @@ python aios.py alerts --home ~/aios-data     # 未處理的告警；--ack <編�
 | `refusal-spike` | warning | 同一個代理被拒絕 10 次以上 |
 | `budget-stop` | info | 某次執行因 token 或費用預算而停止 |
 | `loop-stop` | warning | 迴圈保護停止了一次不斷重複同一個工具呼叫的執行 |
+| `untrusted-args` | warning | 有風險的呼叫在參數裡重複了不可信內容（網址主機、要送出的內容），因此必須由人決定 |
 | `job-failing` | warning | 某任務最近 3 次執行都以錯誤或逾時結束 |
 | `audit-tampered` | critical | 審計日誌的雜湊鏈對不上了（檢查整份日誌，不只最近 15 分鐘），或與 `--anchor` 檔案不符 |
 | `audit-sink-failing` | warning | `--audit-sink` 已連續失敗 15 分鐘以上 |
@@ -322,7 +336,7 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 - 沒有政策檔時只提供唯讀工具（`now`、`read_file`、`view_file`、`list_files`、`recall`、`list_facts`）。`view_file` 以 MCP 圖片內容回傳（PDF 則是內嵌資源）。
 - stdio 上沒有人能回答 `[y/N]`，所以高風險工具（`write_file`、`run_python`、被污染後的 `remember`）一律**拒絕**，除非政策用 `auto_paths` 預先允許某些路徑。只要這次連線讀過檔案，連這些也會被拒絕，直到伺服器重啟。
 - `max_calls` 以伺服器連線為單位計算。所有資料都放在 `--home` 底下（`aios.db`、`workspace/`）。
-- **狀態**：支援官方 `mcp` SDK 1.x 與 2.x。CI 會用 SDK 自己的 stdio 客戶端驅動 `aios serve`（初始化、列出、呼叫、拒絕、稽核），兩個版本都測，也會讓 aios 連上真正的 SDK 伺服器。尚未用 Claude Desktop 或其他圖形介面客戶端試過：如果你的客戶端連不上或列不出工具，請開 issue 並附上 stderr 輸出。
+- **狀態**：支援官方 `mcp` SDK 1.x 與 2.x，也支援 MCP 2026-07-28 客戶端（無狀態：以 `server/discover` 取代 `initialize`；AIOS 這邊需要 `mcp` 2.3+）。CI 會用 SDK 自己的 stdio 客戶端驅動 `aios serve`（初始化、列出、呼叫、拒絕、稽核），兩個版本都測，最新 SDK 上另外用 2026-07-28 客戶端測，也會讓 aios 連上真正的 SDK 伺服器。尚未用 Claude Desktop 或其他圖形介面客戶端試過：如果你的客戶端連不上或列不出工具，請開 issue 並附上 stderr 輸出。
 
 ## 與其他代理對話（A2A）
 
@@ -428,6 +442,8 @@ AIOS_NODE_TOKEN=<secret> python aios.py node --head https://head.lan:8780 --head
 | `suggest_lesson` / `propose_patch` | 自我改進（政策沒列出就不授予）：在代理的候選心得手冊加一條心得，使用前會先評測；提交程式碼或政策修補，只有人能套用（[自我改進](#自我改進)） |
 
 ## 安全現況
+
+AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔離、審計……）的逐項對照，見 [docs/os-mechanisms.zh-TW.md](docs/os-mechanisms.zh-TW.md)。
 
 目前**尚未**做到的事，如實列出：
 

@@ -23,14 +23,44 @@ try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     HAVE_MCP = True
+    HAVE_DISCOVER = hasattr(ClientSession, "discover")  # mcp 2.3+: MCP 2026-07-28 (stateless)
 except ImportError:
-    HAVE_MCP = False
+    HAVE_MCP = HAVE_DISCOVER = False
 
 field = aios._sdk_field
 
 
 def texts(res) -> str:
     return "\n".join(c.text for c in res.content if getattr(c, "type", "") == "text")
+
+
+class HandshakeFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """mcp_handshake without a real server: an older server that refuses server/discover still connects."""
+    class FakeSession:
+        def __init__(self, discover_ok):
+            self.discover_ok, self.calls, self.protocol_version = discover_ok, [], None
+
+        async def discover(self):
+            self.calls.append("discover")
+            if not self.discover_ok:
+                raise RuntimeError("Invalid request parameters")  # what a 1.x server answers
+            self.protocol_version = aios.MCP_MODERN
+
+        async def initialize(self):
+            self.calls.append("initialize")
+            self.protocol_version = "2025-11-25"
+
+    async def test_modern_servers_skip_initialize_and_old_ones_fall_back(self):
+        s = self.FakeSession(True)
+        self.assertEqual(await aios.mcp_handshake(s), aios.MCP_MODERN)
+        self.assertEqual(s.calls, ["discover"])
+        s = self.FakeSession(False)
+        self.assertEqual(await aios.mcp_handshake(s), "2025-11-25")
+        self.assertEqual(s.calls, ["discover", "initialize"])
+        with mock.patch.dict(os.environ, {"AIOS_MCP_PROTOCOL": "legacy"}):
+            s = self.FakeSession(True)
+            self.assertEqual(await aios.mcp_handshake(s), "2025-11-25")
+            self.assertEqual(s.calls, ["initialize"])
 
 
 @unittest.skipUnless(HAVE_MCP, "needs the mcp SDK (pip install mcp)")
@@ -50,6 +80,29 @@ class ServeWithTheSdkClientTests(unittest.IsolatedAsyncioTestCase):
             async with ClientSession(read, write) as s:
                 init = await s.initialize()
                 await check(s, init)
+
+    @unittest.skipUnless(HAVE_DISCOVER, "needs an mcp SDK that speaks MCP 2026-07-28")
+    async def test_a_2026_07_28_client_needs_no_initialize_handshake(self):
+        params = StdioServerParameters(command=sys.executable,
+                                       args=[str(ROOT / "aios.py"), "serve", "--home", str(self.home)],
+                                       env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+
+        async def run():
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as s:
+                    found = await s.discover()
+                    self.assertIn(aios.MCP_MODERN, found.supported_versions)
+                    self.assertEqual(s.protocol_version, aios.MCP_MODERN)
+                    self.assertEqual((s.server_info.name, s.server_info.version), ("aios", aios.AIOS_VERSION))
+                    names = {t.name for t in (await s.list_tools()).tools}
+                    self.assertEqual(names, set(aios.SERVE_DEFAULT_TOOLS))
+                    res = await s.call_tool("read_file", {"path": "notes.txt"})
+                    self.assertIn('<untrusted source="read_file">', texts(res))
+                    res = await s.call_tool("write_file", {"path": "x.txt", "content": "no"})
+                    self.assertTrue(field(res, "is_error", "isError"))
+
+        await asyncio.wait_for(run(), 60)
+        self.assertFalse((self.home / "workspace" / "x.txt").exists())
 
     async def test_a_real_client_lists_and_calls_the_governed_tools(self):
         async def check(s, init):
@@ -109,6 +162,26 @@ class ClientOfARealServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await k.close()
             k.store.db.close()
+
+    async def test_the_newest_protocol_both_sides_speak_is_used_and_logged(self):
+        for forced in ("", "legacy"):
+            with self.subTest(AIOS_MCP_PROTOCOL=forced), mock.patch.dict(os.environ, {"AIOS_MCP_PROTOCOL": forced}):
+                k = aios.Kernel(store=aios.Store(":memory:"))
+                try:
+                    await k.connect_mcp("demo", sys.executable, [str(ROOT / "demo_mcp_server.py")])
+                    agent = aios.Agent("t", {"demo__*"})
+                    self.assertEqual(str(await k.tools.call("demo__add", agent, a=1, b=1)), "2")
+                    want = aios.MCP_MODERN if HAVE_DISCOVER and not forced else None
+                    got = k.mcp_protocols["demo"]
+                    if want:
+                        self.assertEqual(got, want)
+                    else:
+                        self.assertNotEqual(got, aios.MCP_MODERN)
+                    log = k.store.audit_tail("mcp:demo", 5)
+                    self.assertIn(got, str([e["args"] for e in log if e["tool"] == "connect"]))
+                finally:
+                    await k.close()
+                    k.store.db.close()
 
     @unittest.skipUnless(aios.landlock_abi() >= 1 or aios.seatbelt_ok(), "needs Landlock or sandbox-exec")
     async def test_a_confined_server_still_works_and_its_state_folder_goes_away(self):

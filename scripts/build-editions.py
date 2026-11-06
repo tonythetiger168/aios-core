@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EDITIONS = ("lite", "personal", "workstation", "server")  # cloud is a hosted service: guide only, no bundle
-SHARED = ["LICENSE", "README.md", "README.zh-TW.md", "requirements.txt", "policy.example.toml", "demo_mcp_server.py"]
+SHARED = ["LICENSE", "CHANGELOG.md", "README.md", "README.zh-TW.md", "requirements.txt", "policy.example.toml", "demo_mcp_server.py"]
 STAMP = (2026, 1, 1, 0, 0, 0)
 
 

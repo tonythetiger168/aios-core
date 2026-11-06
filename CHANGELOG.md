@@ -1,0 +1,49 @@
+# Changelog
+
+## Unreleased
+
+- **Self-improvement, live** (`aios_improve`, `aios improve`): each policy agent has a versioned playbook
+  of lessons learned from its own audit log (refused, failing and repeated calls, runs that ran out of
+  steps). A candidate is run on your eval tasks next to the current version, on a throwaway copy of
+  aios.db and the workspace, and goes live from the next run only if it does at least as well;
+  `rollback` goes back, and a version whose runs fail more is rolled back automatically. `improve loop`
+  repeats this with no round limit; quiet rounds make no model call, evals use only a free local model
+  unless a USD cap is set, and `--daily-tokens` pauses it with an alert. Tainted or guardrail-related
+  lessons wait for a person. Agents can file code or policy patches (`propose_patch`) that only a
+  person applies (`approve-patch`), with a health check that reverses a failing patch.
+
+## 0.2.0 (2026-11-06)
+
+Follows the November 2026 research round-up (MCP 2026-07-28, agent-OS security and scheduling papers).
+
+- **Swarms over many machines** (`aios_node`): `aios swarm --nodes [HOST:]PORT` runs the swarm as the
+  head of a cluster and `aios node --head URL` joins a machine as a worker. Workers pull tasks by their
+  free slots, send heartbeats, and lose their tasks to other nodes after 30 s of silence (at most 3
+  tries, first answer wins). Every call needs `$AIOS_NODE_TOKEN`; a head on a non-local address needs
+  TLS (`--node-cert`/`--node-key`, `--head-ca` on nodes). Each node runs tasks as its own policy agent
+  and audits them; the head's swarm budget covers the whole cluster.
+- **Moving a run between nodes**: an agent with `transfer = true` can hand a run in progress to
+  another node of the same swarm instead of starting over.
+- **Swarm memory guard**: `--parallel` is lowered to what free memory holds, new helpers wait while
+  free memory is under `AIOS_SWARM_MIN_FREE_MB` (256), and answers kept for `--reduce` spill to disk,
+  so memory stays flat for any task count.
+- **MCP 2026-07-28**: aios connects to MCP servers with the stateless `server/discover` when the SDK
+  supports it (mcp 2.3+) and falls back to the `initialize` handshake for older servers; the revision
+  each server got is audited; `aios serve` works with 2026-07-28 clients and reports its version.
+- **Argument provenance**: in a tainted run, a risky call whose arguments repeat untrusted text (or a
+  URL host from it) loses every auto rule and needs a person; audited as `(provenance)`, alert
+  `untrusted-args`.
+- **Sandbox admission control**: Docker and microVM sandboxes start only while their memory limits fit
+  in the host's free memory (`AIOS_SANDBOX_RESERVE_MB`, `AIOS_SANDBOX_MAX`, `AIOS_SANDBOX_WAIT`).
+- **Delegation caps**: `narrow = true` and `[agents.X.delegate]` let a caller cut down what its helpers
+  may use, down the whole chain. Agent sections now reject unknown keys.
+- **`recall_on`**: attach matching memory notes after chosen tool calls, once per run, audited as
+  `(recall)`.
+- **`aios export`**: an agent's conversation, or runs rebuilt from the audit log, as OpenAI-format chat
+  JSON for outside scanners.
+- **Docs**: `docs/os-mechanisms.md` (and zh-TW), a self-audit against classical OS mechanisms.
+
+## 0.1.0
+
+First packaged release: kernel, policy and scopes, taint, sandboxes, MCP, A2A, swarms, schedules,
+console, skills registry, editions.
