@@ -58,6 +58,10 @@ tools = { "*" = "100/hour", write_file = "10/hour" }   # over it a call is refus
 # and inherits the caller's taint: if `lead` has read an untrusted file, `notes` gets no auto_paths.
 [agents.lead]
 permissions = ["now", "read_file", "list_files", "agent__notes"]
+# Optional: cut down what helpers get when THIS agent calls them (caps also apply to their helpers).
+# narrow = true                      # helpers keep only tools lead has itself
+# [agents.lead.delegate]
+# notes = ["write_file", "recall"]   # notes, when called by lead, may use at most these
 
 # Argument rules: limit the VALUES a tool may be called with, here the built-in fetch_url (the same
 # works for MCP tools, which have no workspace path, e.g. "web__fetch").
