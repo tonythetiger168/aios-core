@@ -44,6 +44,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
+- **匯出給外部掃描器**：`python aios.py export --agent main > main.json` 會把代理保存的對話寫成 OpenAI 格式的聊天 JSON（含 `tool_calls` 的 user／assistant、工具結果，不可信輸出仍保留標籤，圖片略過），這是代理安全掃描器與 LLM 評審常讀的格式（例如 Cisco 開源的 Project Quarry）。改用 `--from-audit -n 5` 則從審計日誌重建最近幾次執行，不保存歷史的定時任務、幫手與 A2A 執行也能檢查（被拒絕的呼叫也在內，並附狀態）。完全離線，不會送出任何東西。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
 - **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
 
