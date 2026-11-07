@@ -243,7 +243,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         rc = await aios.bot_cmd("main", None, self.home, provider, None, {GROUP}, api=stopping)
         self.assertEqual(rc, 0)
         self.assertEqual([p["text"] for p in api.sent()], ["Hello Alice!"])
-        self.assertTrue(any(e["agent"] == "main" for e in aios.Store(os.path.join(self.home, "aios.db")).audit_tail()))
+        store = aios.Store(os.path.join(self.home, "aios.db"))
+        self.addCleanup(store.db.close)  # Windows cannot delete an open aios.db
+        self.assertTrue(any(e["agent"] == "main" for e in store.audit_tail()))
 
 
 if __name__ == "__main__":
