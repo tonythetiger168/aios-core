@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
+  room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or
+  more), lobby (reception, approval counter, waiting area), security office and break room according
+  to their live state. Dependency-free canvas renderer; the page's own CSP allows only its fixed script.
 - **Agents as chat bots** (`aios_bot`, `aios bot`): a policy agent answers in Telegram chats when it is
   @mentioned, asked with `/ask` or replied to, and replies in the thread. It sees the message it was
   tagged under, the earlier exchange of a reply thread and, with `--context N`, recent chat messages.
