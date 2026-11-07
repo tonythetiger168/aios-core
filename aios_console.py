@@ -12,12 +12,15 @@ Standard library only. Security model:
   created). With --approve, exactly one write exists: POST /approvals sets a pending request to
   approved/denied. It needs the cookie, a per-start form token (CSRF), and a same-origin Origin header.
 - Everything shown is HTML-escaped. The audit log holds attacker-controlled text (file contents, tool
-  output), so the page carries no JavaScript at all and a CSP that forbids scripts.
+  output), so the pages carry no JavaScript at all and a CSP that forbids scripts. The one exception is
+  the 3D Office page (aios_office.py): its CSP allows only the console's own fixed script, which reads
+  /office.json and draws text with canvas/textContent, never as HTML.
 """
 import hashlib
 import hmac
 import html
 import http.server
+import json
 import secrets
 import sqlite3
 import sys
@@ -25,6 +28,8 @@ import threading
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
+
+import aios_office
 
 COOKIE = "aios_console"
 SHOW_MAX = 400  # chars of one audit argument/result cell
@@ -54,7 +59,8 @@ max-height:24em;overflow:auto;background:var(--chip);padding:8px;border-radius:6
 input,select,button{font:inherit;color:inherit;background:var(--chip);border:1px solid var(--line);
 border-radius:6px;padding:4px 8px}.scroll{overflow-x:auto}td:first-child{white-space:nowrap}
 """
-PAGES = (("/", "Overview"), ("/approvals", "Approvals"), ("/audit", "Audit"), ("/jobs", "Jobs"), ("/memory", "Memory"), ("/skills", "Skills"))
+PAGES = (("/", "Overview"), ("/approvals", "Approvals"), ("/audit", "Audit"), ("/jobs", "Jobs"), ("/memory", "Memory"), ("/skills", "Skills"),
+         ("/office", "Office"))
 
 
 def esc(v) -> str:
@@ -255,7 +261,7 @@ def page_skills(r: Reader, q: dict) -> str:
 
 
 ROUTES = {"/": page_overview, "/audit": page_audit, "/jobs": page_jobs, "/memory": page_memory,
-          "/skills": page_skills}
+          "/skills": page_skills, "/office": lambda r, q: aios_office.page(r.query, esc)}
 
 
 def render(path: str, body: str, home: Path, mode: str = "read-only", refresh: bool = False) -> bytes:
@@ -283,10 +289,10 @@ def make_handler(home: Path, token: str, port_ref: dict, approve: bool = False):
         def log_message(self, *a):  # keep the terminal quiet; requests are not interesting to log
             pass
 
-        def send(self, code: int, body: bytes = b"", ctype="text/html; charset=utf-8", extra=()):
+        def send(self, code: int, body: bytes = b"", ctype="text/html; charset=utf-8", extra=(), csp=CSP):
             self.send_response(code)
             for k, v in (("Content-Type", ctype), ("Content-Length", str(len(body))),
-                         ("Content-Security-Policy", CSP), ("X-Content-Type-Options", "nosniff"),
+                         ("Content-Security-Policy", csp), ("X-Content-Type-Options", "nosniff"),
                          ("X-Frame-Options", "DENY"), ("Referrer-Policy", "same-origin"),  # no-referrer would make browsers send "Origin: null" on our own forms
                          ("Cache-Control", "no-store"), *extra):
                 self.send_header(k, v)
@@ -319,6 +325,12 @@ def make_handler(home: Path, token: str, port_ref: dict, approve: bool = False):
             if not self.authed():
                 return self.send(403, b"open the URL that `aios console` printed (it carries the access token)",
                                  "text/plain")
+            if url.path == "/office.js":  # fixed code, no data in it
+                return self.send(200, aios_office.JS.encode(), "text/javascript; charset=utf-8")
+            if url.path == "/office.json":
+                data = aios_office.state(reader.query) if reader.db.exists() else {"ts": now_iso(), "agents": [],
+                                                                                  "places": aios_office.PLACE_NAMES}
+                return self.send(200, json.dumps(data, ensure_ascii=False).encode(), "application/json; charset=utf-8")
             fn = routes.get(url.path)
             if fn is None:
                 return self.send(404, b"not found", "text/plain")
@@ -327,7 +339,8 @@ def make_handler(home: Path, token: str, port_ref: dict, approve: bool = False):
             else:
                 body = fn(reader, q)
             refresh = url.path == "/approvals" and "Nothing is waiting." in body
-            self.send(200, render(url.path, body, home, mode, refresh))
+            self.send(200, render(url.path, body, home, mode, refresh),
+                      csp=aios_office.CSP if url.path == "/office" else CSP)
 
         do_HEAD = do_GET
 

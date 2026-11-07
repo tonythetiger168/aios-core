@@ -54,7 +54,8 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
-- **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面完全不執行 JavaScript，所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
+- **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面不執行 JavaScript（下面的 3D 辦公室除外，它從不把日誌文字當成 HTML），所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
+- **3D 辦公室**（控制台 → Office）：每個代理都是辦公室裡的一個人，會依照它此刻在做的事（從審計日誌、審批、暫停與任務讀出）走到對應的地方：工作時坐在自己的辦公桌，用記憶或上網時在圖書室，跑程式碼或 MCP 工具時在機房；**兩個代理互相對話**（`agent__<name>`／`a2a__<name>`）時一起到**洽談區**，頭上會有對話泡泡顯示說了什麼；**三個以上一起討論**（`swarm`，或一連串的轉交）時到**會議室**；**大廳**有接待櫃台、代理排隊等你核准的審批櫃台，以及即將執行的任務坐的等候區；被監督者暫停或剛被規則拒絕時在保全室，閒置時在茶水間。可拖曳旋轉、滾輪縮放、點一個人看它正在做什麼。這是控制台唯一有 JavaScript 的頁面：它的 CSP 只允許控制台自己固定的腳本，腳本只讀 `/office.json`，所有名字與訊息都以文字繪製（canvas／`textContent`），從不當成 HTML。沒有 JavaScript 時，頁面會以表格顯示同樣的內容。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
 - **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
@@ -544,7 +545,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批與 3D 辦公室）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 

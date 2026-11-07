@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
+  room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or
+  more), lobby (reception, approval counter, waiting area), security office and break room according
+  to their live state. Dependency-free canvas renderer; the page's own CSP allows only its fixed script.
+
 - **Self-improvement, live** (`aios_improve`, `aios improve`): each policy agent has a versioned playbook
   of lessons learned from its own audit log (refused, failing and repeated calls, runs that ran out of
   steps). A candidate is run on your eval tasks next to the current version, on a throwaway copy of
