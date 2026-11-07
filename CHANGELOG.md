@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Agents as chat bots** (`aios_bot`, `aios bot`): a policy agent answers in Telegram chats when it is
+  @mentioned, asked with `/ask` or replied to, and replies in the thread. It sees the message it was
+  tagged under, the earlier exchange of a reply thread and, with `--context N`, recent chat messages.
+  Chat members are strangers: each question is a fresh tainted run (read-only without a policy, nobody
+  can approve), only `--allow-chat` chats (or `--public`), `--per-user` answers an hour, a 20k-token
+  cap per answer and a 200k-token daily budget by default.
 - **Self-improvement, live** (`aios_improve`, `aios improve`): each policy agent has a versioned playbook
   of lessons learned from its own audit log (refused, failing and repeated calls, runs that ran out of
   steps). A candidate is run on your eval tasks next to the current version, on a throwaway copy of
