@@ -39,6 +39,12 @@ class ProductTests(unittest.TestCase):
                 self.assertNotIn("github.com", guide.read_text(encoding="utf-8"), guide.name)
             for plan in ("Core", "Team", "Cloud", "Enterprise", "NT$490", "NT$790"):
                 self.assertIn(plan, page)
+            self.assertIn("自我進化的 AIOS", page)
+            for anchor in ("evolve", "bot", "office", "multi", "new"):
+                self.assertIn(f'id="{anchor}"', page)
+            for src in ("img/office-3d.webp",):
+                self.assertIn(f'src="{src}"', page)
+                self.assertTrue((out / src).is_file(), src)
             links = Links()
             links.feed(page)
             for href in links.hrefs:

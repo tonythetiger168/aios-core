@@ -22,6 +22,13 @@
   lessons wait for a person. Agents can file code or policy patches (`propose_patch`) that only a
   person applies (`approve-patch`), with a health check that reverses a failing patch.
 
+- **Self-supervision** (`aios_supervisor`, `aios supervisor`): the daemon answers its own watchdog alerts.
+  Failing, budget-burning or injected-looking jobs are paused, other agents are held (every risky call
+  needs a person), and a broken audit chain puts everything in safe mode. Rule-based, no model calls; it
+  only ever tightens, and only `aios supervisor --release` (a person) undoes an action.
+- **Site**: the homepage leads with self-improvement and has sections for self-supervision, the chat
+  bot and the 3D office (with a screenshot).
+
 ## 0.2.0 (2026-11-06)
 
 Follows the November 2026 research round-up (MCP 2026-07-28, agent-OS security and scheduling papers).
