@@ -234,7 +234,7 @@ python aios.py audit --home ~/aios-data --anchor /mnt/backup/aios-anchors.jsonl 
 python aios.py audit --home ~/aios-data --verify --anchors /mnt/backup/aios-anchors.jsonl
 ```
 
-- `--audit-sink URL` 把該 `aios.db` 上任何 AIOS 程序（chat、`serve`、`a2a-serve`、定時任務）寫入的每筆新紀錄，以 JSON 批次 POST 出去：`{"source": "aios", "host": ..., "entries": [{"id", "ts", "agent", "tool", "args", "result", "status", "hash"}]}`。由背景執行緒傳送，收集端再慢也不會拖慢任務。送到哪一筆記錄在 `aios.db` 裡：收集端掛掉時紀錄會等著，恢復後（包括重新啟動後）再送出。至少送達一次（可用 `hash` 去掉重複的批次）。只接受 HTTPS，送到本機除外；遇到轉址算失敗；`AIOS_AUDIT_SINK_TOKEN` 會以 `Authorization: Bearer` 送出。參數中名稱像密鑰的欄位（`password`、`token`、`api_key`、`authorization` 等）在副本中會換成 `[redacted]`，但結果照原樣送出，所以只送給你信得過、可以看整份日誌的收集端。`aios status` 會顯示落後多少筆；連續失敗 15 分鐘後看門狗會發出 `audit-sink-failing`。搭配 `--once` 時，會在那一輪結束時盡量送出。
+- `--audit-sink URL` 把該 `aios.db` 上任何 AIOS 程序（chat、`serve`、`a2a-serve`、定時任務）寫入的每筆新紀錄，以 JSON 批次 POST 出去：`{"source": "aios", "host": ..., "entries": [{"id", "ts", "agent", "tool", "args", "result", "status", "hash"}]}`。由背景執行緒傳送，收集端再慢也不會拖慢任務。送到哪一筆記錄在 `aios.db` 裡：收集端掛掉時紀錄會等著，恢復後（包括重新啟動後）再送出。至少送達一次（可用 `hash` 去掉重複的批次）。只接受 HTTPS，送到本機除外；遇到轉址算失敗；`AIOS_AUDIT_SINK_TOKEN` 會以 `Authorization: Bearer` 送出。參數中名稱像密鑰的欄位（`password`、`token`、`api_key`、`authorization` 等）在寫入審計日誌前就換成 `[redacted]`，本機日誌和這份副本都不會留下明文；結果仍照原樣儲存與送出，所以只送給你信得過、可以看整份日誌的收集端。`aios status` 會顯示落後多少筆；連續失敗 15 分鐘後看門狗會發出 `audit-sink-failing`。搭配 `--once` 時，會在那一輪結束時盡量送出。
 - `--anchor FILE` 每 `--anchor-every` 秒（預設 3600）以及守護程式停止時，若日誌有新增，就在 FILE 附加一行 `{"ts", "id", "head"}`。每一行把第 `id` 筆紀錄綁定到它的雜湊：之後若日誌在那一筆之前被改寫，或被截短到那一筆之前，`aios audit --verify --anchors FILE` 就會失敗，守護程式下次錨定時也會發出 `audit-tampered`。驗證不過的鏈絕不會被錨定。請把 FILE 放在另一顆磁碟、掛載的共享資料夾或代理所用帳號寫不到的機器上；跟 `aios.db` 放在一起只能防手誤。
 
 ## 照顧記憶

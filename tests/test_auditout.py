@@ -58,6 +58,9 @@ class ShipTests(Case):
     def test_batches_go_out_in_order_with_secrets_redacted_and_the_position_is_kept(self):
         self.st.log_audit("main", "fetch", {"url": "https://x", "api_key": "sk-1", "opts": {"Password": "p"}},
                           "ok", "ok")
+        stored = json.loads(self.st.audit_tail()[0]["args"])
+        self.assertEqual(stored, {"url": "https://x", "api_key": "[redacted]", "opts": {"Password": "[redacted]"}})
+        self.assertNotIn("sk-1", self.st.db.execute("SELECT args FROM audit").fetchone()[0])
         self.log(4)
         sent = []
         post = lambda url, body, timeout: sent.append(json.loads(body))
