@@ -36,6 +36,7 @@ SHOW_MAX = 400  # chars of one audit argument/result cell
 AUDIT_MAX = 500  # rows per audit page
 ARGS_MAX = 20_000  # chars of arguments shown on an approval request (a person must see what they allow)
 POST_MAX = 2048  # bytes of a form submission
+DRAIN_MAX = 1 << 20  # bytes of a refused body read before closing
 CSP = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; "
        "frame-ancestors 'none'")
 STYLE = """
@@ -344,24 +345,46 @@ def make_handler(home: Path, token: str, port_ref: dict, approve: bool = False):
 
         do_HEAD = do_GET
 
+        def drain(self):
+            # Read (and drop) a body we refuse before looking at it. Closing with unread data makes
+            # Windows reset the connection, so the caller sees "connection aborted", not the answer.
+            try:
+                left = min(max(int(self.headers.get("Content-Length", "0")), 0), DRAIN_MAX)
+            except ValueError:
+                return
+            self.connection.settimeout(1)
+            try:
+                while left > 0:
+                    chunk = self.rfile.read1(min(left, 65536))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+            except OSError:
+                pass
+
         def refuse_write(self):
+            self.drain()
             self.send(405, b"read-only", "text/plain", extra=(("Allow", "GET, HEAD"),))
 
         def do_POST(self):
             if not approve or urllib.parse.urlsplit(self.path).path != "/approvals":
                 return self.refuse_write()
             if not self.host_ok():
+                self.drain()
                 return self.send(403, b"forbidden host", "text/plain")
             if not self.authed():
+                self.drain()
                 return self.send(403, b"not signed in", "text/plain")
             port = port_ref["port"]
             if self.headers.get("Origin") not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+                self.drain()
                 return self.send(403, b"cross-origin request refused", "text/plain")
             try:
                 n = int(self.headers.get("Content-Length", ""))
             except ValueError:
                 return self.send(411, b"length required", "text/plain")
             if not 0 < n <= POST_MAX:
+                self.drain()
                 return self.send(413, b"too large", "text/plain")
             form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
             if not hmac.compare_digest(form.get("csrf", ""), csrf):
