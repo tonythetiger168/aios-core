@@ -80,6 +80,12 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.step()
         await self.bot.drain()
 
+    def prompt_with(self, text):
+        """The one prompt whose quoted message contains text."""
+        found = [t for t, _ in self.ans.prompts if text in t.split("Their message")[1]]
+        self.assertEqual(len(found), 1, self.ans.prompts)
+        return found[0]
+
     async def test_answers_only_when_addressed_in_a_group(self):
         self.make()
         self.api.post("lunch at noon?")
@@ -89,10 +95,10 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.api.post("email me at x@aios_botnet.com", mid=23)  # not a mention: a longer name
         await self.step()
         self.assertEqual(len(self.ans.prompts), 3)
-        self.assertIn("what is 2+2?", self.ans.prompts[0][0])
-        self.assertNotIn("@aios_bot", self.ans.prompts[0][0].split("Their message")[1])
+        task = self.prompt_with("what is 2+2?")  # each message is answered in its own task: any order
+        self.assertNotIn("@aios_bot", task.split("Their message")[1])
         replies = self.api.sent()
-        self.assertEqual([r["reply_parameters"]["message_id"] for r in replies], [20, 21, 22])
+        self.assertEqual(sorted(r["reply_parameters"]["message_id"] for r in replies), [20, 21, 22])
         self.assertTrue(all("parse_mode" not in r for r in replies))
 
     async def test_tag_under_a_post_quotes_that_post(self):
@@ -135,7 +141,8 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.api.post("@aios_bot hi", chat=-100999)
         await self.step()
         self.assertEqual(len(self.ans.prompts), 2)
-        self.assertIn("a private chat", self.ans.prompts[0][0])
+        self.assertIn("a private chat", self.prompt_with("hello there"))
+        self.assertNotIn("a private chat", self.prompt_with("hi"))
 
     async def test_per_user_limit(self):
         self.make(per_user=2)
@@ -144,7 +151,9 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.api.post("@aios_bot from bob", user=BOB, mid=70)
         await self.step()
         self.assertEqual(len(self.ans.prompts), 3)
-        self.assertIn("2 questions this hour", self.api.sent()[2]["text"])
+        refused = [r for r in self.api.sent() if "2 questions this hour" in r["text"]]
+        self.assertEqual(len(refused), 1)  # one of Alice's three, whichever was answered last
+        self.assertIn(refused[0]["reply_parameters"]["message_id"], (60, 61, 62))
 
     async def test_context_window(self):
         self.make(context=2)

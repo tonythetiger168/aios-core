@@ -5281,14 +5281,14 @@ def cli():
         raise SystemExit(supervisor_cmd(a.home, a.release, a.open, a.n))
     if a.cmd == "telegram":
         import aios_telegram
-        chat = a.chat_id
-        if chat is None:
+        chat_id = a.chat_id  # not `chat`: any assignment to that name here hides the chat() coroutine from `aios chat`
+        if chat_id is None:
             env = os.environ.get("AIOS_TELEGRAM_CHAT", "").strip()
             if not env.lstrip("-").isdigit():
                 ap.error("--chat-id (or $AIOS_TELEGRAM_CHAT) is required: message your bot, then open "
                          "https://api.telegram.org/bot<TOKEN>/getUpdates to see your chat id")
-            chat = int(env)
-        raise SystemExit(aios_telegram.run(a.home, chat, set(a.allow_user) or None))
+            chat_id = int(env)
+        raise SystemExit(aios_telegram.run(a.home, chat_id, set(a.allow_user) or None))
     if a.cmd == "bot":
         provider, budget = build_model(a, ap, default_tokens=20_000)  # strangers' questions: always capped
         check_daily_flags(a, ap)

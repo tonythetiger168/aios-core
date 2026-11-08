@@ -1487,6 +1487,21 @@ class ChatDailyLimitTests(unittest.TestCase):
             c.assert_not_called()
             self.assertIn(why, err.getvalue())
 
+    def test_aios_chat_reaches_chat(self):
+        async def fake_chat(*a, **kw):
+            called.append(a)
+        called = []
+        with mock.patch.object(sys, "argv", ["aios", "chat"]), mock.patch.object(aios, "chat", fake_chat), \
+                mock.patch.object(aios, "build_model", return_value=(None, None)):
+            aios.cli()
+        self.assertEqual(len(called), 1)
+
+    def test_cli_locals_never_hide_module_functions(self):
+        # `chat = a.chat_id` in the telegram branch once made `aios chat` an UnboundLocalError
+        import inspect
+        functions = {n for n, v in vars(aios).items() if inspect.isfunction(v) or inspect.isclass(v)}
+        self.assertEqual(set(aios.cli.__code__.co_varnames) & functions, set())
+
 
 @unittest.skipUnless(sys.version_info >= (3, 11), "tomllib needs Python 3.11+")
 class PolicyFileTests(unittest.TestCase):
