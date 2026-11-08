@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Audit log**: argument values whose keys look like secrets (`password`, `token`, `api_key`, ...) are stored as `[redacted]` before the hash is computed. The tool still receives the real arguments. Tool results are stored as returned.
 - **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
   room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or
   more), lobby (reception, approval counter, waiting area), security office and break room according

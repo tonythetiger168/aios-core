@@ -407,6 +407,47 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"write_file", "run_python"} <= k.needs_approval)
 
 
+class AuditSecretTests(unittest.IsolatedAsyncioTestCase):
+    """Secret-like argument keys are refused a place in the audit log. The tool still sees them."""
+
+    async def test_denied_and_allowed_calls_keep_secrets_out_of_the_audit_log(self):
+        secret, password = "sk-live-AUDIT-SECRET-9f3c", "pw-AUDIT-SECRET-9f3c"
+        args = {"url": "https://docs.example/x", "api_key": secret, "note": "keep-me",
+                "opts": {"Password": password}, "headers": [{"token": secret}]}
+        seen = []
+        k = make_kernel(Resp([tool_use("fetch", args)], "tool_use"), Resp([text("no")], "end_turn"),
+                        Resp([tool_use("fetch", args)], "tool_use"), Resp([text("yes")], "end_turn"))
+
+        @k.tools.register("fetch", "fetch", {"url": {"type": "string"}, "api_key": {"type": "string"}})
+        async def fetch(url, api_key, note, opts, headers):
+            seen.append((url, api_key, note, opts, headers))
+            return "page " + url
+
+        await k._run(aios.Agent("denied", set()), "go")  # not granted: refused, and not run
+        await k._run(aios.Agent("allowed", {"fetch"}), "go")
+        self.assertEqual(seen, [("https://docs.example/x", secret, "keep-me",
+                                 {"Password": password}, [{"token": secret}])])
+
+        rows = [e for e in k.store.audit_tail() if e["tool"] == "fetch"]
+        self.assertEqual([e["status"] for e in rows], ["denied", "ok"])
+        self.assertEqual(rows[0]["result"], "permission denied: fetch")
+        self.assertEqual(rows[1]["result"], "page https://docs.example/x")  # results stay as returned
+        for e in rows:
+            got = json.loads(e["args"])
+            self.assertEqual(got["url"], "https://docs.example/x")
+            self.assertEqual(got["note"], "keep-me")
+            self.assertEqual(got["api_key"], "[redacted]")
+            self.assertEqual(got["opts"], {"Password": "[redacted]"})
+            self.assertEqual(got["headers"], [{"token": "[redacted]"}])
+            self.assertNotIn(secret, e["args"] + e["result"])
+            self.assertNotIn(password, e["args"] + e["result"])
+        blob = " ".join(e["args"] + e["result"] for e in k.store.audit_tail())
+        self.assertNotIn(secret, blob)
+        self.assertNotIn(password, blob)
+        self.assertTrue(k.store.verify_audit()["ok"])
+        k.store.db.close()
+
+
 class BudgetTests(unittest.TestCase):
     def test_validation(self):
         with self.assertRaises(ValueError):

@@ -575,10 +575,15 @@ class Store:
 
     @staticmethod
     def audit_row(agent: str, tool: str, args: dict, result: str, status: str) -> tuple:
+        """One chained audit entry. Values of argument keys that look like secrets are stored as
+        "[redacted]", and the hash covers that text. A secret under an ordinary key, or inside a
+        tool result, is still stored: results are the evidence of what the tool returned."""
         clip = lambda t: t if len(t) <= AUDIT_MAX else t[:AUDIT_MAX] + "...(truncated)"
         if isinstance(result, list):  # content blocks: describe images/PDFs, never store their data
             import aios_media
             result = aios_media.summary(result)
+        import aios_auditout
+        args = aios_auditout.redact_args(args)  # copy; the tool already ran with the real arguments
         return (datetime.now().isoformat(timespec="seconds"), agent, tool,
                 clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status)
 

@@ -12,7 +12,8 @@ can rebuild the whole chain. Both features put evidence where that person cannot
   delays a job. Its position is kept in aios.db, so nothing is dropped: entries wait while the
   collector is down and go out when it is back (at least once; a batch may repeat after a failure,
   use each entry's `hash` to drop duplicates). Values of argument keys that look like secrets
-  (password, token, api_key, ...) are replaced by "[redacted]" in the copy; results are sent as stored.
+  (password, token, api_key, ...) are stored as "[redacted]" (Store.audit_row); the copy redacts
+  them again, so a row written by an older process is still covered. Results are sent as stored.
   HTTPS only, except to this machine. AIOS_AUDIT_SINK_TOKEN, when set, goes in `Authorization: Bearer`.
 * Anchors: a JSON line {"ts", "id", "head"} appended to a file whenever the chain has grown. An anchor
   binds entry `id` to its hash: if the log is later rewritten up to that point, or cut back before it,
@@ -65,17 +66,23 @@ def check_url(url: str) -> str | None:
     return None
 
 
-def _redact(v):
+def redact_args(v):
+    """Copy of an arguments object with secret-like keys replaced by "[redacted]".
+
+    A key matches when its name looks like a password, token, api key, cookie or similar
+    (SECRET_KEY). Nested dicts and lists are walked; a matching key's whole value is replaced,
+    so the plaintext is not kept underneath it. A string is returned as-is: this matches keys,
+    not free text, and a tool result is not scanned."""
     if isinstance(v, dict):
-        return {k: "[redacted]" if SECRET_KEY.search(str(k)) else _redact(x) for k, x in v.items()}
+        return {k: "[redacted]" if SECRET_KEY.search(str(k)) else redact_args(x) for k, x in v.items()}
     if isinstance(v, list):
-        return [_redact(x) for x in v]
+        return [redact_args(x) for x in v]
     return v
 
 
 def _args_copy(args: str):
     try:
-        return _redact(json.loads(args))
+        return redact_args(json.loads(args))
     except (ValueError, TypeError):  # clipped at AUDIT_MAX: not JSON any more, keep it out
         return "[unparsed: clipped]"
 
