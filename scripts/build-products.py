@@ -3,6 +3,7 @@ import hashlib
 import html
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +53,7 @@ def build(out: Path) -> None:
             f'<a href="../">← 返回產品中心</a><h1>AIOS {title} 使用說明</h1><pre>{html.escape(guide)}</pre></html>', encoding="utf-8")
     (downloads / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
     (out / "products.json").write_text(json.dumps({"products": manifest}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    shutil.copytree(ROOT / "web/img", out / "img", dirs_exist_ok=True)
     template = (ROOT / "web/product.html").read_text(encoding="utf-8")
     (out / "index.html").write_text(template.replace("{{PRODUCTS}}", "\n".join(cards)).replace("{{VERSION}}", html.escape(editions.version())), encoding="utf-8")
 
