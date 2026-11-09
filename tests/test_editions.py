@@ -66,6 +66,27 @@ class EditionTests(unittest.TestCase):
             guide = (ROOT / "editions" / name / "GUIDE.zh-TW.md").read_text(encoding="utf-8")
             self.assertIn("## 收費", guide, name)
 
+    def test_prices_are_the_same_everywhere(self):
+        """Plans are priced in NT$ (Tony, 2026-10-28): every edition doc, config and the site say the same."""
+        prices = {"Team": "NT$490", "Cloud": "NT$790", "Cloud overage": "NT$320", "Enterprise": "NT$650,000"}
+        docs = ["README.md", "README.zh-TW.md", "editions/README.md", "editions/README.zh-TW.md", "web/product.html"]
+        for doc in docs:
+            text = (ROOT / doc).read_text(encoding="utf-8")
+            pricing = text[text.index("## Editions" if doc == "README.md" else "## 產品線"):] if doc.startswith("README") else text
+            with self.subTest(doc=doc):
+                self.assertNotIn("US$15", pricing)
+                self.assertNotIn("US$25", pricing)
+                self.assertNotIn("美金", pricing)
+                for plan, price in prices.items():
+                    if doc.startswith("README") and plan in ("Cloud overage", "Enterprise"):
+                        continue  # the top-level READMEs only list the edition table
+                    self.assertIn(price, pricing, plan)
+        for name in start.EDITIONS:
+            plan = start.load(ROOT / "editions" / name)["plan"]
+            self.assertNotIn("$15", plan, name)
+            if "Team" in plan:
+                self.assertIn("NT$490", plan, name)
+
     def test_bundle_has_the_whole_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = build.build("server", Path(tmp))
