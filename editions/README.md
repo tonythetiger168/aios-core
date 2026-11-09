@@ -18,14 +18,14 @@ Agent counts are scaled from a measured run (one 24 GB card, vLLM, Qwen2.5 3B: 4
 with no failures, timeouts past ~5,500; see [docs/stress-test.md](../docs/stress-test.md)); the 32 GB and
 96 GB cards are not measured yet.
 
-## Pricing (USD)
+## Pricing (New Taiwan dollars, NT$)
 
 | Plan | Price | Status |
 |---|---|---|
 | **Core** | free (MIT), every safety feature included | available |
-| **Team** (self-hosted) | US$15/seat/month, billed yearly, 5 seats minimum; free up to 3 users | in development |
-| **Cloud** (hosted) | US$25/seat/month incl. 2,000 runs/seat/month (pooled); US$10 per 1,000 extra runs; bring your own model key | not launched |
-| **Enterprise** | quote, from about US$20,000/year | on request |
+| **Team** (self-hosted) | NT$490/seat/month, billed yearly, 5 seats minimum; free up to 3 users | in development |
+| **Cloud** (hosted) | NT$790/seat/month incl. 2,000 runs/seat/month (pooled); NT$320 per 1,000 extra runs; bring your own model key | not launched |
+| **Enterprise** | quote, from about NT$650,000/year | on request |
 
 Safety features are never paywalled. A run is one task end to end; a task over 20 model calls counts
 once more per 20; runs refused by policy are free.

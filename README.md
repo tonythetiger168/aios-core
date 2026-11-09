@@ -577,13 +577,13 @@ Detailed tracking (gap analysis, per-item status, Gantt chart): [`docs/landscape
 
 Five editions by hardware. The four local ones are the same code with different settings (model server, concurrency, sandbox, agent permissions), each packaged as a zip that starts with `python start.py`. Overview, pricing and packaging: [editions/README.md](editions/README.md); each edition has its own guide (Traditional Chinese).
 
-| Edition | Hardware | Price (USD) | Guide |
+| Edition | Hardware | Price (NT$) | Guide |
 |---|---|---|---|
 | **Lite** | no GPU, cloud API with your own key | Core, free | [editions/lite](editions/lite/GUIDE.zh-TW.md) |
 | **Personal** | 16 GB VRAM, Qwen2.5 3B (Ollama) | Core, free | [editions/personal](editions/personal/GUIDE.zh-TW.md) |
-| **Workstation** | 32 GB VRAM, Qwen2.5 7B (vLLM) | Core, free; Team above 3 people, US$15/seat/month | [editions/workstation](editions/workstation/GUIDE.zh-TW.md) |
-| **Server** | 96 GB VRAM, Linux | Team US$15/seat/month, or Enterprise (quote) | [editions/server](editions/server/GUIDE.zh-TW.md) |
-| **Cloud** | none | US$25/seat/month incl. 2,000 runs/seat (not launched) | [editions/cloud](editions/cloud/GUIDE.zh-TW.md) |
+| **Workstation** | 32 GB VRAM, Qwen2.5 7B (vLLM) | Core, free; Team above 3 people, NT$490/seat/month | [editions/workstation](editions/workstation/GUIDE.zh-TW.md) |
+| **Server** | 96 GB VRAM, Linux | Team NT$490/seat/month, or Enterprise (quote) | [editions/server](editions/server/GUIDE.zh-TW.md) |
+| **Cloud** | none | NT$790/seat/month incl. 2,000 runs/seat (not launched) | [editions/cloud](editions/cloud/GUIDE.zh-TW.md) |
 
 ```bash
 python scripts/build-editions.py                    # dist/editions/aios-<edition>-<version>.zip

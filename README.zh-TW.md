@@ -577,7 +577,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 
 依硬體分成五條產品線，四條本機版本是同一份程式碼加上不同設定（模型伺服器、並行數、沙箱、代理權限），各自打包成一個 zip，用 `python start.py` 啟動。總覽、收費標準與打包方式見 [editions/README.zh-TW.md](editions/README.zh-TW.md)，每條產品線有自己的使用說明。
 
-| 產品線 | 硬體 | 收費（美金） | 使用說明 |
+| 產品線 | 硬體 | 收費（新台幣） | 使用說明 |
 |---|---|---|---|
 | **Lite** | 不需要 GPU，雲端 API 自帶 key | Core 免費 | [editions/lite](editions/lite/GUIDE.zh-TW.md) |
 | **Personal** | 16 GB VRAM，Qwen2.5 3B（Ollama） | Core 免費 | [editions/personal](editions/personal/GUIDE.zh-TW.md) |
