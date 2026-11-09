@@ -98,6 +98,23 @@ python aios.py doctor                       # what this machine gives AIOS: sand
 
 State is stored in `./aios.db` and `./workspace/` (both git-ignored).
 
+### Local model: HeliosLM TW (optional)
+
+[HeliosLM](https://github.com/tonythetiger168/helioslm) publishes free local GGUF models tuned for Traditional Chinese (preview builds based on Google Gemma 4; downloads at https://helioslm.pages.dev/). AIOS talks to them through the same `--provider openai` path as any other local server, so nothing extra is installed and nothing is paid.
+
+- Use the **26B-A4B** packages (L24 and up: about 24 GB VRAM, or 16 GB VRAM with `--cpu-moe` and 32 GB of system RAM). The E4B packages (L-Edge, L8, L16) are base models that only continue text; they cannot chat or call tools, so AIOS can't use them.
+- These are preview builds. Their tool calling and their resistance to prompt injection have not been measured yet, so they are not a default. Run the injection test below on your own machine before you give one real work.
+
+```bash
+# in the unzipped L24 package folder; --jinja turns on tool calls from the model's chat template
+llama-server -m helioslm-tw-26b-a4b-l24-Q4_K.gguf -c 32768 -ngl 99 --reasoning-budget 0 --jinja --port 8080
+
+python aios.py chat --provider openai --base-url http://127.0.0.1:8080/v1 --model helioslm-tw-26b-a4b
+python tests/test_injection.py --report --model http://127.0.0.1:8080/v1 helioslm-tw-26b-a4b   # measure it first (free, local)
+```
+
+The same `--provider openai --base-url ... --model ...` flags work for `daemon`, `swarm` and `improve`, so a HeliosLM model can run self-improvement evals for free.
+
 ## Scheduled jobs
 
 Run a task on a schedule, without you present:

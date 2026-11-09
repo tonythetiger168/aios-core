@@ -98,6 +98,23 @@ python aios.py doctor                       # 這台機器能給 AIOS 什麼：�
 
 狀態存放在 `./aios.db` 與 `./workspace/`（兩者都已列入 .gitignore）。
 
+### 本機模型：HeliosLM TW（選用）
+
+[HeliosLM](https://github.com/tonythetiger168/helioslm)（羲和）提供免費、針對繁體中文調整的本機 GGUF 模型（以 Google Gemma 4 為基礎的預覽版，下載頁 https://helioslm.pages.dev/ ）。AIOS 用和其他本機伺服器相同的 `--provider openai` 連接它，不必多裝任何東西，也不花錢。
+
+- 請用 **26B-A4B** 套件（L24 以上：約 24 GB VRAM，或 16 GB VRAM 加 `--cpu-moe` 與 32 GB 系統記憶體）。E4B 套件（L-Edge、L8、L16）是只會接著寫的基底模型，不能對話也不能呼叫工具，AIOS 用不了。
+- 這些是預覽版，工具呼叫能力與抗注入能力都還沒量測過，所以不是預設模型。交給它真正的工作前，請先在自己的電腦上跑下面的注入測試。
+
+```bash
+# 在解壓後的 L24 套件資料夾裡；--jinja 讓模型依聊天範本呼叫工具
+llama-server -m helioslm-tw-26b-a4b-l24-Q4_K.gguf -c 32768 -ngl 99 --reasoning-budget 0 --jinja --port 8080
+
+python aios.py chat --provider openai --base-url http://127.0.0.1:8080/v1 --model helioslm-tw-26b-a4b
+python tests/test_injection.py --report --model http://127.0.0.1:8080/v1 helioslm-tw-26b-a4b   # 先量測（免費、本機）
+```
+
+`daemon`、`swarm`、`improve` 也用同樣的 `--provider openai --base-url ... --model ...`，所以自我改進的評測可以免費交給 HeliosLM 模型跑。
+
 ## 定時任務
 
 讓任務按排程執行，不需要你在場：
