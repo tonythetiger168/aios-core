@@ -54,8 +54,11 @@ def build(out: Path) -> None:
     (downloads / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
     (out / "products.json").write_text(json.dumps({"products": manifest}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     shutil.copytree(ROOT / "web/img", out / "img", dirs_exist_ok=True)
+    rows = [f'<tr><td><a href="guides/{slug}.html">AIOS {title}</a><br><small>{label}</small></td>'
+            f'<td>{price} <small>{plan}</small></td><td>{hardware}</td><td>{cost}</td></tr>'
+            for slug, title, label, desc, hardware, model, price, plan, cost in PRODUCTS]
     template = (ROOT / "web/product.html").read_text(encoding="utf-8")
-    (out / "index.html").write_text(template.replace("{{PRODUCTS}}", "\n".join(cards)).replace("{{VERSION}}", html.escape(editions.version())), encoding="utf-8")
+    (out / "index.html").write_text(template.replace("{{PRODUCTS}}", "\n".join(cards)).replace("{{PRICE_ROWS}}", "\n".join(rows)).replace("{{VERSION}}", html.escape(editions.version())), encoding="utf-8")
 
 
 if __name__ == "__main__":

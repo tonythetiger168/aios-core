@@ -40,7 +40,13 @@ class ProductTests(unittest.TestCase):
             for plan in ("Core", "Team", "Cloud", "Enterprise", "NT$490", "NT$790"):
                 self.assertIn(plan, page)
             self.assertIn("自我進化的 AIOS", page)
-            for anchor in ("evolve", "bot", "office", "multi", "new"):
+            price_list = page.split('id="pricing"', 1)[1].split("</section>", 1)[0]
+            for item in ("Core", "Team", "Cloud", "Enterprise", "免費", "NT$490", "NT$790", "NT$650,000",
+                         *(f"AIOS {title}" for title in products.TITLES.values() if title != "Cloud")):
+                self.assertIn(item, price_list)
+            self.assertLess(page.index('id="pricing"'), page.index('id="about"'))
+            self.assertIn('href="#pricing"', page.split("</header>", 1)[0])
+            for anchor in ("pricing", "evolve", "bot", "office", "multi", "new"):
                 self.assertIn(f'id="{anchor}"', page)
             for src in ("img/office-3d.webp",):
                 self.assertIn(f'src="{src}"', page)
