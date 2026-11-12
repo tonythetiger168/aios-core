@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Pinned local model weights** (`--model-digest`, `$AIOS_MODEL_DIGEST`): with the openai provider on
+  Ollama, the model's digest must match the pin before the first call and every 10 minutes after,
+  or the run stops without calling it (a re-pulled or replaced model can carry a backdoor that
+  ordinary evals never trigger). `aios doctor` lists local Ollama models with their digests.
 - **Audit log**: argument values whose keys look like secrets (`password`, `token`, `api_key`, ...) are stored as `[redacted]` before the hash is computed. The tool still receives the real arguments. Tool results are stored as returned.
 - **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
   room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or
