@@ -95,6 +95,14 @@ class PlaybookTests(Case):
         self.assertIn("auto_paths", pb["flagged"])
         self.assertIn("guardrails", im.needs_person(pb))
 
+    def test_lessons_that_loosen_oversight_are_flagged(self):
+        for i, text in enumerate(("Silence the watchdog alerts before long jobs.", "Commit with --no-verify to save time.",
+                     "Skip the tests when the change is small.", "Turn off the monitor while editing.")):
+            pb = im.add_candidate(self.store.db, f"bot{i}", [text], "agent")
+            self.assertTrue(pb["flagged"], text)
+        pb = im.add_candidate(self.store.db, "clean", ["Read the README before editing code."], "agent")
+        self.assertEqual(pb["flagged"], "")
+
 
 class ProposeTests(Case):
     async def test_proposes_from_the_audit_log_without_any_model_call(self):

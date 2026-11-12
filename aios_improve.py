@@ -50,7 +50,10 @@ AUDIT_AGENT = "improve"
 # and need a person, however well they score.
 GUARD = re.compile(r"permission|polic|approv|audit|sandbox|scope|taint|untrusted|bypass|disabl|"
                    r"ignore (all|any|previous|earlier|prior)|override|jailbreak|system prompt|"
-                   r"auto_paths|auto_args|auto_when|grant|credential|secret|token budget", re.I)
+                   r"auto_paths|auto_args|auto_when|grant|credential|secret|token budget|"
+                   # oversight: agents have been seen silencing alerts and removing their own monitor
+                   r"monitor|alert|watchdog|supervis|\bhooks?\b|no-verify|--force|"
+                   r"skip\w*\W+(the\s+)?(tests?|checks?|verif\w*|review\w*)|turn(ing|s)?\s+off|silenc|suppress", re.I)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS playbooks(

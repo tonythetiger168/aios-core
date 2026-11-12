@@ -1012,7 +1012,8 @@ class ScopeTests(HardeningBase):
         n = aios._norm_path
         self.assertEqual(n("notes//a/./b.txt"), "notes/a/b.txt")
         self.assertEqual(n("notes\\a.txt"), "notes/a.txt")
-        for bad in ("../x", "a/../../x", "/etc/passwd", "C:\\x", ".."):
+        for bad in ("../x", "a/../../x", "/etc/passwd", "C:\\x", "..",
+                    "notes/a.mcp.json.", "notes/a.txt ", "notes./a", "notes/a.txt:hidden", "a::$DATA"):
             self.assertIsNone(n(bad), bad)
         m = aios._path_matches
         self.assertTrue(m("notes/a.txt", ["notes/*"]))
@@ -1020,6 +1021,9 @@ class ScopeTests(HardeningBase):
         self.assertTrue(m("notes", ["notes/*"]))  # the directory itself
         self.assertFalse(m("notes2/a.txt", ["notes/*"]))
         self.assertFalse(m("other/a.txt", ["notes/*"]))
+        with mock.patch.object(aios.os, "name", "nt"):  # NTFS ignores case, so the rules do too
+            self.assertEqual(n("Notes/A.txt"), "notes/a.txt")
+            self.assertTrue(m("notes/a.txt", ["Notes/*"]))
 
     async def run_write(self, path, scopes, approver=None):
         k = self.kernel(Resp([tool_use("write_file", {"path": path, "content": "x"})], "tool_use"),
