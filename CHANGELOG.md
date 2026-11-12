@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Pinned local model weights** (`--model-digest`, `$AIOS_MODEL_DIGEST`): with the openai provider on
+  Ollama, the model's digest must match the pin before the first call and every 10 minutes after,
+  or the run stops without calling it (a re-pulled or replaced model can carry a backdoor that
+  ordinary evals never trigger). `aios doctor` lists local Ollama models with their digests.
 - **Per-machine node tokens** (`aios node-keys add|revoke|list --file F`, `aios swarm --nodes ...
   --node-keys F`): each worker machine gets its own token (the file keeps SHA-256 hashes only); the
   head names a node by its token instead of the name it sends, and `revoke` shuts one machine out at

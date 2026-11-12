@@ -127,9 +127,15 @@ class OpenAICompatProvider:
     LM Studio, llama.cpp server, vLLM, OpenAI. Standard library only (no extra install)."""
 
     def __init__(self, model: str, base_url: str = "http://localhost:11434/v1",
-                 api_key: str | None = None, timeout: int = 300, temperature: float | None = None):
+                 api_key: str | None = None, timeout: int = 300, temperature: float | None = None,
+                 digest: str | None = None):
         self.model, self.base_url = model, base_url.rstrip("/")
         self.api_key, self.timeout, self.temperature = api_key, timeout, temperature
+        # Pinned weights (Ollama): the model's digest must start with this before any call, checked
+        # again every DIGEST_RECHECK seconds. A re-pulled or swapped model (weights can carry a
+        # backdoor that ordinary evals never trigger) stops the run instead of answering.
+        self.digest = normalize_digest(digest) if digest else None
+        self._digest_checked: float | None = None  # monotonic time of the last good check
         # urllib blocks a thread per call: give the provider its own pool, as large as the kernel's
         # model slots (Python's shared default pool has min(32, CPUs + 4) threads, so a swarm on a
         # 4-core machine could only reach the model server 8 calls at a time).
@@ -221,6 +227,18 @@ class OpenAICompatProvider:
         except urllib.error.URLError as e:
             raise RuntimeError(f"cannot reach model server at {self.base_url}: {e.reason}") from None
 
+    def verify_digest(self):
+        """Raise unless the server's copy of self.model has the pinned digest."""
+        found = ollama_digest(self.base_url, self.model, self.timeout)
+        if not found:
+            raise RuntimeError(f"cannot check the digest of {self.model}: {self.base_url} does not list it "
+                               "(model digests need Ollama's /api/tags)")
+        if not found.startswith(self.digest):
+            raise RuntimeError(f"model {self.model} has digest {found[:12]}, not the pinned {self.digest[:12]}: "
+                               "it was re-pulled or replaced. Check where it came from, then pin the new "
+                               "digest (--model-digest / $AIOS_MODEL_DIGEST)")
+        self._digest_checked = time.monotonic()
+
     async def complete(self, system: str, messages: list[dict], tools: list[dict],
                        max_tokens: int = 1024) -> Completion:
         payload = {"model": self.model, "max_tokens": max_tokens,
@@ -233,7 +251,44 @@ class OpenAICompatProvider:
             from concurrent.futures import ThreadPoolExecutor
             self._pool = ThreadPoolExecutor(min(self.workers or MODEL_SLOTS, MODEL_THREADS_MAX),
                                             thread_name_prefix="aios-model")
+        # never compare with a zero start: monotonic() counts from boot on Windows, so a machine up
+        # for less than DIGEST_RECHECK seconds would skip the first check
+        if self.digest and (self._digest_checked is None
+                            or time.monotonic() - self._digest_checked > DIGEST_RECHECK):
+            await asyncio.get_running_loop().run_in_executor(self._pool, self.verify_digest)
         return self.from_wire(await asyncio.get_running_loop().run_in_executor(self._pool, self._post, payload))
+
+
+DIGEST_RECHECK = 600  # seconds between checks of a pinned model digest
+
+
+def normalize_digest(d: str) -> str:
+    d = d.strip().lower().removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{12,64}", d):
+        raise ValueError(f"not a model digest (12-64 hex characters, as `ollama list` shows): {d[:20]!r}")
+    return d
+
+
+def ollama_models(base_url: str, timeout: float = 5) -> dict[str, str] | None:
+    """{model name: digest} from an Ollama server (base_url may end in /v1), or None if it does not
+    answer /api/tags."""
+    root = base_url.rstrip("/").removesuffix("/v1")
+    try:
+        with urllib.request.urlopen(f"{root}/api/tags", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    out = {}
+    for m in data.get("models") or []:
+        if isinstance(m, dict) and isinstance(m.get("digest"), str):
+            for key in {m.get("name"), m.get("model")} - {None}:
+                out[key] = m["digest"].lower().removeprefix("sha256:")
+    return out
+
+
+def ollama_digest(base_url: str, model: str, timeout: float = 5) -> str | None:
+    models = ollama_models(base_url, timeout) or {}
+    return models.get(model) or (models.get(model + ":latest") if ":" not in model else None)
 
 
 # ---- Budget: hard limits per run ----
@@ -4844,6 +4899,13 @@ def doctor_cmd(home: str) -> int:
         else "unavailable: needs a network namespace or sandbox-exec")
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         row("ok" if os.environ.get(var) else "--", var, "set" if os.environ.get(var) else "not set")
+    local = ollama_models("http://127.0.0.1:11434", timeout=1)
+    if local:
+        print("local models (Ollama): pin one with --model-digest so a swapped copy is refused")
+        pin = os.environ.get("AIOS_MODEL_DIGEST", "").lower().removeprefix("sha256:")
+        for name, d in sorted(local.items()):
+            pinned = bool(pin) and d.startswith(pin)
+            row("ok" if pinned else "--", name, d[:12] + ("  (pinned)" if pinned else ""))
 
     db = Path(home).resolve() / "aios.db"
     print(f"data ({db}):")
@@ -4926,6 +4988,9 @@ def add_model_flags(p):
     p.add_argument("--model", help=f"model name (default for anthropic: {MODEL}; required for openai)")
     p.add_argument("--base-url", default="http://localhost:11434/v1",
                    help="openai provider only (default: local Ollama)")
+    p.add_argument("--model-digest", default=os.environ.get("AIOS_MODEL_DIGEST"),
+                   help="openai provider with Ollama: refuse to run unless the model's digest starts with "
+                        "this (see `ollama list` or `aios doctor`; default $AIOS_MODEL_DIGEST)")
     p.add_argument("--max-steps", type=int, default=8, help="model calls per run (default 8)")
     p.add_argument("--max-tokens", type=int, help="stop a run after this many input+output tokens")
     p.add_argument("--max-cost", type=float, help="stop a run after this many USD (needs --price-in/out)")
@@ -4968,7 +5033,14 @@ def build_model(a, ap, default_tokens: int | None = None):
     if a.provider == "openai":
         if not a.model:
             ap.error("--provider openai requires --model (e.g. --model llama3.1)")
-        return OpenAICompatProvider(a.model, a.base_url, os.environ.get("OPENAI_API_KEY")), budget
+        digest = getattr(a, "model_digest", None)
+        try:
+            return OpenAICompatProvider(a.model, a.base_url, os.environ.get("OPENAI_API_KEY"),
+                                        digest=digest), budget
+        except ValueError as e:
+            ap.error(f"--model-digest: {e}")
+    if getattr(a, "model_digest", None):
+        ap.error("--model-digest needs --provider openai (a local model server such as Ollama)")
     return AnthropicProvider(a.model or MODEL), budget
 
 
