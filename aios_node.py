@@ -13,8 +13,12 @@ MAX_ATTEMPTS times. The first answer wins; a node whose task was given away (or 
 wanted) is told on its next heartbeat and stops it.
 
 Security model
-- Every call needs the bearer token ($AIOS_NODE_TOKEN). Whoever holds it can hand this machine's
-  agents tasks as the operator: share it only between your own machines.
+- Every call needs a bearer token. With one shared token ($AIOS_NODE_TOKEN) whoever holds it can be
+  any node: share it only between your own machines. With per-node keys (`aios swarm --node-keys
+  FILE`, made with `aios node-keys add NAME --file FILE`) each machine has its own token, the head
+  takes the node's name from the token (not from what the node says), audits answers under that
+  name, and `aios node-keys revoke NAME` shuts one machine out without touching the others (the head
+  re-reads the file when it changes). The file keeps only SHA-256 hashes of the tokens.
 - The head listens on 127.0.0.1 unless told otherwise; listening on another address needs a TLS
   certificate, and a node never sends the token over plain http to another machine. (Or keep the head
   on 127.0.0.1 behind an https reverse proxy or tunnel.)
@@ -41,7 +45,9 @@ Standard library only.
 """
 import asyncio
 import collections
+import hashlib
 import hmac
+import os
 import http.server
 import json
 import re
@@ -227,6 +233,7 @@ class Hub:
                         break
                     size += j["size"] + j["ck_size"]
                     j["node"], j["deadline"] = node, now + self.ttl
+                    j.setdefault("given", set()).add(node)
                     j["attempts"] += 1
                     item = {"id": jid, "agent": j["tool"], "task": j["task"], "swarm": j["sid"]}
                     if j["checkpoint"] is not None:
@@ -253,12 +260,14 @@ class Hub:
 
     def complete(self, node: str, jid: str, status: str, answer: str, tokens_in: int = 0,
                  tokens_out: int = 0) -> bool:
-        """The first answer for a task wins (from any node it was given to). -> accepted."""
+        """The first answer for a task wins (from any node it was given to; others are refused, so a
+        node cannot answer for tasks it never had). -> accepted."""
         with self.cv:
             self._seen(node)
-            j = self.jobs.pop(jid, None)
-            if j is None:
+            j = self.jobs.get(jid)
+            if j is None or node not in j.get("given", ()):
                 return False
+            del self.jobs[jid]
             self.nodes[node]["done"] += 1
             j["on_done"](status, answer, node, tokens_in, tokens_out)
             return True
@@ -320,14 +329,91 @@ def _str(v, limit: int) -> str:
     return v
 
 
+class NodeKeys:
+    """Per-node tokens: a file of `NAME SHA256-OF-TOKEN` lines (# comments). Re-read when it changes,
+    so a revoked node is refused from its next request."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._mtime, self._keys = None, {}
+        self._lock = threading.Lock()
+        self._load()
+        if not self._keys:
+            raise ValueError(f"{path}: no node keys (add one with `aios node-keys add NAME --file {path}`)")
+
+    def _load(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            self._keys, self._mtime = {}, None  # a deleted file refuses every node
+            return
+        if (st.st_mtime_ns, st.st_size) == self._mtime:
+            return
+        self._keys, self._mtime = read_keys(self.path), (st.st_mtime_ns, st.st_size)
+
+    def identify(self, token: str) -> str | None:
+        """The node name this token belongs to, or None."""
+        h = hashlib.sha256(token.encode()).hexdigest()
+        with self._lock:
+            self._load()
+            keys = dict(self._keys)
+        found = None
+        for name, want in keys.items():  # compare every entry: the time taken says nothing
+            if hmac.compare_digest(h, want):
+                found = name
+        return found
+
+
+def read_keys(path: str) -> dict[str, str]:
+    keys = {}
+    with open(path, encoding="utf-8") as f:
+        for ln in f:
+            parts = ln.split("#", 1)[0].split()
+            if len(parts) == 2 and NAME_RE.fullmatch(parts[0]) and re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+                keys[parts[0]] = parts[1]
+    return keys
+
+
+def _write_keys(path: str, keys: dict[str, str]):
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("# aios node keys: NAME SHA256-OF-TOKEN (tokens themselves are not kept)\n")
+        f.writelines(f"{n} {h}\n" for n, h in sorted(keys.items()))
+    os.replace(tmp, path)
+
+
+def add_key(path: str, name: str) -> str:
+    """Make a token for node `name` (replacing its old one) and store its hash. -> the token, shown once."""
+    if not NAME_RE.fullmatch(name):
+        raise ValueError(f"bad node name {name!r}")
+    keys = read_keys(path) if os.path.exists(path) else {}
+    token = new_token()
+    keys[name] = hashlib.sha256(token.encode()).hexdigest()
+    _write_keys(path, keys)
+    return token
+
+
+def revoke_key(path: str, name: str) -> bool:
+    keys = read_keys(path) if os.path.exists(path) else {}
+    if keys.pop(name, None) is None:
+        return False
+    _write_keys(path, keys)
+    return True
+
+
 class HubServer:
     """The HTTP side of a Hub: POST /node/lease, /node/heartbeat, /node/result, /node/move, GET /node/status,
     each with `Authorization: Bearer <token>`. TLS when certfile is given (required off loopback)."""
 
-    def __init__(self, hub: Hub, token: str, host: str = "127.0.0.1", port: int = 0,
-                 certfile: str | None = None, keyfile: str | None = None):
-        if not token or len(token) < 16:
+    def __init__(self, hub: Hub, token: str | None, host: str = "127.0.0.1", port: int = 0,
+                 certfile: str | None = None, keyfile: str | None = None, keys: NodeKeys | None = None):
+        """keys: per-node tokens; then the shared `token` is not accepted (pass None)."""
+        if keys is not None:
+            token = None
+        elif not token or len(token) < 16:
             raise ValueError("the node token must be at least 16 characters")
+        self.keys = keys
         if not aios_a2a._is_loopback(host) and not certfile:
             raise ValueError(f"listening on {host} needs a TLS certificate (--node-cert / --node-key), so the "
                              "token never crosses the network in plain text; or keep 127.0.0.1 behind an "
@@ -386,8 +472,11 @@ class HubServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def authed(self) -> bool:
+            def authed(self) -> bool | str:
+                """False, True (the shared token) or the node name a per-node token belongs to."""
                 got = self.headers.get("Authorization", "")
+                if srv.keys is not None:
+                    return got.startswith("Bearer ") and srv.keys.identify(got[7:]) or False
                 return hmac.compare_digest(got.encode(), f"Bearer {srv.token}".encode())
 
             def do_GET(self):
@@ -406,11 +495,13 @@ class HubServer:
                     aios_a2a.drain_body(self.rfile, n, self.connection)
                     return self.reply(413, {"error": "request too large"})
                 raw = self.rfile.read(n)  # read before refusing: Windows resets unread connections
-                if not self.authed():
+                who = self.authed()
+                if not who:
                     return self.reply(401, {"error": "bad token"})
                 try:
                     req = json.loads(raw or b"{}")
-                    node = _str(req.get("node"), 64)
+                    # a per-node token names its node: what the request claims does not count
+                    node = who if isinstance(who, str) else _str(req.get("node"), 64)
                     if not NAME_RE.fullmatch(node):
                         raise ValueError("bad node name")
                     if self.path == "/node/lease":

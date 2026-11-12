@@ -185,6 +185,50 @@ class ServerTests(unittest.TestCase):
             aios_node.HubServer(aios_node.Hub(), "short", "127.0.0.1", 0)
 
 
+class NodeKeyTests(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.file = str(Path(d.name) / "nodes.keys")
+        self.ta = aios_node.add_key(self.file, "gpu-a")
+        self.tb = aios_node.add_key(self.file, "gpu-b")
+        self.hub = aios_node.Hub()
+        self.srv = aios_node.HubServer(self.hub, None, keys=aios_node.NodeKeys(self.file)).start()
+        self.addCleanup(self.srv.stop)
+
+    def test_the_file_keeps_hashes_only(self):
+        text = Path(self.file).read_text()
+        self.assertNotIn(self.ta, text)
+        self.assertEqual(sorted(aios_node.read_keys(self.file)), ["gpu-a", "gpu-b"])
+        with self.assertRaises(ValueError):
+            aios_node.add_key(self.file, "bad name!")
+        empty = str(Path(self.file).with_name("empty.keys"))
+        Path(empty).write_text("# nothing\n")
+        with self.assertRaises(ValueError):
+            aios_node.NodeKeys(empty)
+
+    def test_the_token_names_the_node_whatever_the_request_claims(self):
+        got = []
+        self.hub.submit("agent__worker", "hello", "s", lambda *r: got.append(r))
+        a = aios_node.HeadClient(self.srv.url, self.ta)
+        tasks, _ = a.lease("gpu-b", 1, 0)  # claims to be the other machine
+        b = aios_node.HeadClient(self.srv.url, self.tb)
+        self.assertFalse(b.result("gpu-b", tasks[0]["id"], "ok", "forged"))  # not gpu-b's task
+        self.assertTrue(a.result("anything", tasks[0]["id"], "ok", "hi"))
+        self.assertEqual(got, [("ok", "hi", "gpu-a", 0, 0)])
+
+    def test_shared_token_refused_and_revoke_shuts_one_node_out(self):
+        with self.assertRaises(PermissionError):
+            aios_node.HeadClient(self.srv.url, TOKEN).lease("n1", 1, 0)
+        self.assertTrue(aios_node.revoke_key(self.file, "gpu-a"))
+        self.assertFalse(aios_node.revoke_key(self.file, "gpu-a"))
+        with self.assertRaises(PermissionError):
+            aios_node.HeadClient(self.srv.url, self.ta).lease("gpu-a", 1, 0)
+        aios_node.HeadClient(self.srv.url, self.tb).lease("gpu-b", 1, 0)  # the other one still works
+        self.ta2 = aios_node.add_key(self.file, "gpu-a")  # a new token for a rebuilt machine
+        aios_node.HeadClient(self.srv.url, self.ta2).lease("gpu-a", 1, 0)
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a certificate")
 class TlsTests(unittest.TestCase):
     def test_https_head_with_a_self_signed_certificate(self):
@@ -380,6 +424,16 @@ class CliTests(unittest.TestCase):
         self.assertIn("do not mix", r.stderr)
         r = self.run_cli(*base, "--node-cert", "c.pem")
         self.assertIn("go with --nodes", r.stderr)
+        r = self.run_cli(*base, "--nodes", "8780", "--node-keys", "/nonexistent/keys")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--node-keys", r.stderr)
+        keys = str(Path(tempfile.mkdtemp()) / "k")
+        r = self.run_cli("node-keys", "add", "box1", "--file", keys)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(r.stdout.splitlines()[1], Path(keys).read_text())
+        self.assertEqual(self.run_cli("node-keys", "list", "--file", keys).stdout.strip(), "box1")
+        self.assertEqual(self.run_cli("node-keys", "revoke", "box1", "--file", keys).returncode, 0)
+        self.assertEqual(self.run_cli("node-keys", "revoke", "box1", "--file", keys).returncode, 1)
         r = self.run_cli("node", "--head", "http://10.1.2.3:8780", "--policy", pol, "--provider", "openai",
                          "--model", "m", env={"AIOS_NODE_TOKEN": TOKEN})
         self.assertEqual(r.returncode, 2)

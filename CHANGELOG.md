@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Per-machine node tokens** (`aios node-keys add|revoke|list --file F`, `aios swarm --nodes ...
+  --node-keys F`): each worker machine gets its own token (the file keeps SHA-256 hashes only); the
+  head names a node by its token instead of the name it sends, and `revoke` shuts one machine out at
+  its next request. The shared `$AIOS_NODE_TOKEN` still works without `--node-keys`. Answers are now
+  accepted only from a node the task was handed to.
 - **Audit log**: argument values whose keys look like secrets (`password`, `token`, `api_key`, ...) are stored as `[redacted]` before the hash is computed. The tool still receives the real arguments. Tool results are stored as returned.
 - **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
   room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or
