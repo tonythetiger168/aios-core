@@ -292,12 +292,12 @@ Agents get better at their tasks from their own runs, and it takes effect while 
 ```bash
 python aios.py improve propose --agent notes          # lessons from the audit log since the last round (no model call)
 python aios.py improve list                           # versions: * active, ? candidate; eval spending; patches waiting
-python aios.py improve eval --agent notes --cases evals.jsonl --provider openai --model qwen2.5:3b
+python aios.py improve eval --agent notes --cases evals.jsonl --provider openai --model gemma4:e4b
 python aios.py improve adopt --agent notes 3          # a person adopts a version (live from the next run)
 python aios.py improve rollback --agent notes         # back one version (--to 0: no playbook)
 # endless: propose -> evaluate -> adopt, a round every hour, no limit on rounds, free local model
 python aios.py improve loop --agent notes --agent reporter --cases evals.jsonl --every 1h \
-    --provider openai --model qwen2.5:3b --policy policy.toml
+    --provider openai --model gemma4:e4b --policy policy.toml
 ```
 
 `evals.jsonl` has one task per line: plain text, or `{"task": "...", "expect": "regex", "forbid": "regex"}` checked against the answer (a run that is stopped fails).
@@ -406,7 +406,7 @@ Let people talk to an agent where they already are: tag it under a post in a gro
 ```bash
 export AIOS_BOT_TOKEN=123456:ABC...   # a bot from @BotFather (use a different bot than `aios telegram`)
 python aios.py bot --policy policy.example.toml --agent researcher --allow-chat -1001234567890 \
-    --provider openai --model qwen2.5:7b    # a local model: answers cost nothing
+    --provider openai --model gemma4:12b    # a local model: answers cost nothing
 ```
 
 - **When it answers**: in a group, a message that mentions `@your_bot`, starts with `/ask`, or replies to one of its answers (follow-ups need no tag). In a private chat, every message. It replies to that message (and in forum topics, in the same topic); a long answer is split into up to 3 threaded messages.
@@ -571,6 +571,18 @@ Undefended, the model followed 9 of 27 injected instructions. Defended, none wor
 | **total** | **15/27** | **3/27** | **0/27** |
 
 A bigger model is not a safer one: qwen2.5:7b followed more injected instructions than qwen2.5:3b (15 against 9 of 27), while llama3.1:8b followed 3. Defended, no attack worked against any of them.
+
+Second run, November 2026, after the editions' default moved from Qwen to Google Gemma 4 (Apache 2.0). Totals of 27, 3 tries each:
+
+| Model | no defenses | taint + scopes |
+|---|:-:|:-:|
+| gemma4:e4b (the new default) | 20/27 | 0/27 |
+| gemma4:12b | 10/27 | 0/27 |
+| granite4.2:8b | 18/27 | 0/27 |
+| qwen2.5:7b | 18/27 | 0/27 |
+| llama3.1:8b | 2/27 | 0/27 |
+
+Undefended numbers move between runs (qwen2.5:7b went from 15 to 18), and no model is safe on its own. The defended column held at 0 for every model, which is why the choice of default model is about quality and licence, not about injection. gemma4:12b and gpt-oss:20b need more memory than a hosted runner has beside the suite; run them by hand.
 
 ## Roadmap
 

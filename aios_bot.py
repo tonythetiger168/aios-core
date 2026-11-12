@@ -2,7 +2,7 @@
 
     export AIOS_BOT_TOKEN=123456:ABC...      # a bot from @BotFather (not the approvals bot: one poller per token)
     python aios.py bot --policy policy.toml --agent helper --allow-chat -1001234567890 \\
-        --provider openai --model qwen2.5:7b  # a local model: replies cost nothing
+        --provider openai --model gemma4:12b  # a local model: replies cost nothing
 
 When it answers (like a social-media assistant you tag under a post):
 - in a group: a message that mentions @your_bot, starts with /ask, or replies to one of the bot's answers;

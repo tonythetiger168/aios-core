@@ -54,4 +54,4 @@ python start.py swarm --agent worker --tasks tasks.txt --out results.jsonl
 python start.py console     # 其他指令（console、jobs、audit、status……）原樣轉給 aios
 ```
 
-產品線的參數放在前面，你在指令後面加的參數會蓋過它們，例如 `python start.py chat --model qwen2.5:7b`。`aios.env` 裡的 `KEY=value` 會在啟動時載入（環境變數已有的不會被蓋過）。
+產品線的參數放在前面，你在指令後面加的參數會蓋過它們，例如 `python start.py chat --model gemma4:12b`。`aios.env` 裡的 `KEY=value` 會在啟動時載入（環境變數已有的不會被蓋過）。

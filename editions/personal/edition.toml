@@ -1,4 +1,4 @@
-# AIOS Personal: one 16 GB GPU, a 3B model (or 7B 4-bit) served locally by Ollama. Nothing leaves the machine.
+# AIOS Personal: one 16 GB GPU, Google Gemma 4 E4B (or 12B) served locally by Ollama. Nothing leaves the machine.
 name = "personal"
 title = "AIOS Personal"
 plan = "Core (free, MIT)"
@@ -8,7 +8,7 @@ pip = ["mcp"]
 env = []
 
 [flags]
-common = ["--provider", "openai", "--base-url", "http://localhost:11434/v1", "--model", "qwen2.5:3b",
+common = ["--provider", "openai", "--base-url", "http://localhost:11434/v1", "--model", "gemma4:e4b",
           "--max-tokens", "50000"]
 chat = ["--embed-model", "nomic-embed-text"]
 daemon = []

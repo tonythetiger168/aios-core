@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
+  Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
+  suggested step up on a 16 GB card. Injection results for five models are in the README; the
+  defended setting held at 0/27 for all of them.
 - **Pinned local model weights** (`--model-digest`, `$AIOS_MODEL_DIGEST`): with the openai provider on
   Ollama, the model's digest must match the pin before the first call and every 10 minutes after,
   or the run stops without calling it (a re-pulled or replaced model can carry a backdoor that
