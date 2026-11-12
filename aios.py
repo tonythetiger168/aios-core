@@ -4142,7 +4142,8 @@ async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | N
                     reduce_task: str = "", approve_timeout: float | None = None,
                     a2a_specs: list[str] | None = None, timeout: float | None = None,
                     workers: int = 1, worker_argv: list[str] | None = None, nodes: str | None = None,
-                    node_cert: str | None = None, node_key: str | None = None) -> int:
+                    node_cert: str | None = None, node_key: str | None = None,
+                    node_keys: str | None = None) -> int:
     """`aios swarm`: fan a task file out to policy agents, results streamed as JSON lines. The file is
     read lazily (only when a helper is free), so it can be any length. The tasks are the operator's
     own, so helpers run untainted (their auto_paths apply), audited under the name 'swarm'.
@@ -4156,9 +4157,14 @@ async def swarm_cmd(policy: dict | None, tasks_path: str, default_agent: str | N
             import aios_node
             hub = aios_node.Hub()
             host, port = aios_node.parse_listen(nodes)
-            token = os.environ.get("AIOS_NODE_TOKEN") or aios_node.new_token()
-            hub_srv = aios_node.HubServer(hub, token, host, port, node_cert, node_key).start()
-            shown = token if not os.environ.get("AIOS_NODE_TOKEN") else "$AIOS_NODE_TOKEN"
+            if node_keys:
+                keys = aios_node.NodeKeys(node_keys)
+                hub_srv = aios_node.HubServer(hub, None, host, port, node_cert, node_key, keys).start()
+                shown = "<that node's token from aios node-keys add>"
+            else:
+                token = os.environ.get("AIOS_NODE_TOKEN") or aios_node.new_token()
+                hub_srv = aios_node.HubServer(hub, token, host, port, node_cert, node_key).start()
+                shown = token if not os.environ.get("AIOS_NODE_TOKEN") else "$AIOS_NODE_TOKEN"
             print(f"[aios] waiting for nodes at {hub_srv.url}/ ; on each worker machine run:\n"
                   f"  AIOS_NODE_TOKEN={shown} aios node --head {hub_srv.url} --policy <same policy> "
                   "--parallel N", file=sys.stderr)
@@ -5154,7 +5160,15 @@ def parser() -> argparse.ArgumentParser:
                          "--node-cert). Token: $AIOS_NODE_TOKEN, else one is made and printed")
     sw.add_argument("--node-cert", metavar="PEM", help="--nodes: TLS certificate (chain) to serve https with")
     sw.add_argument("--node-key", metavar="PEM", help="--nodes: the certificate's private key")
+    sw.add_argument("--node-keys", metavar="FILE", help="--nodes: one token per machine (see `aios node-keys`) "
+                    "instead of the shared $AIOS_NODE_TOKEN; the head knows which machine answered and "
+                    "a revoked one is shut out")
     add_model_flags(sw)
+    nk = sub.add_parser("node-keys", help="per-machine tokens for `aios swarm --nodes --node-keys FILE`")
+    nk.add_argument("action", choices=["add", "revoke", "list"],
+                    help="add: make (or replace) NAME's token and print it once; revoke: shut NAME out; list")
+    nk.add_argument("name", nargs="?", help="the worker machine's name (also its name in the head's audit)")
+    nk.add_argument("--file", required=True, help="the keys file (only token hashes are kept in it)")
     nd = sub.add_parser("node", help="be one worker machine of a multi-machine swarm (`aios swarm --nodes` on the head)")
     nd.add_argument("--head", required=True, metavar="URL", help="the head, e.g. https://head.example:8780 "
                     "(token from $AIOS_NODE_TOKEN; plain http only to this machine)")
@@ -5245,15 +5259,41 @@ def cli():
                          "(or keep 127.0.0.1 behind an https reverse proxy or tunnel)")
             if (t := os.environ.get("AIOS_NODE_TOKEN")) and len(t) < 16:
                 ap.error("$AIOS_NODE_TOKEN must be at least 16 characters")
-        elif a.node_cert or a.node_key:
-            ap.error("--node-cert / --node-key go with --nodes")
+            if a.node_keys:
+                try:
+                    aios_node.NodeKeys(a.node_keys)
+                except (OSError, ValueError) as e:
+                    ap.error(f"--node-keys: {e}")
+        elif a.node_cert or a.node_key or a.node_keys:
+            ap.error("--node-cert / --node-key / --node-keys go with --nodes")
         try:
             raise SystemExit(asyncio.run(swarm_cmd(policy, a.tasks, a.agent, a.out, a.home, provider, budget,
                                                    a.reduce, a.reduce_task, approve_timeout(a, ap), a.a2a,
                                                    a.timeout, 1 if a.nodes else a.workers or auto_workers(), argv,
-                                                   a.nodes, a.node_cert, a.node_key)))
+                                                   a.nodes, a.node_cert, a.node_key, a.node_keys)))
         except OSError as e:  # the --nodes port is taken, or the certificate cannot be read
             ap.error(f"--nodes {a.nodes}: {e}")
+    if a.cmd == "node-keys":
+        import aios_node
+        if a.action == "list":
+            keys = aios_node.read_keys(a.file) if os.path.exists(a.file) else {}
+            print("\n".join(sorted(keys)) or "(no node keys)")
+            raise SystemExit(0)
+        if not a.name:
+            ap.error(f"node-keys {a.action} needs a NAME")
+        if a.action == "revoke":
+            if not aios_node.revoke_key(a.file, a.name):
+                print(f"no key for {a.name} in {a.file}", file=sys.stderr)
+                raise SystemExit(1)
+            print(f"revoked {a.name}: the head refuses it from its next request")
+            raise SystemExit(0)
+        try:
+            token = aios_node.add_key(a.file, a.name)
+        except ValueError as e:
+            ap.error(str(e))
+        print(f"token for {a.name} (shown once; only its hash is kept in {a.file}):\n{token}\n"
+              f"on that machine: AIOS_NODE_TOKEN=<token> aios node --head <URL> --name {a.name} --policy ...")
+        raise SystemExit(0)
     if a.cmd == "node":
         import socket
         provider, budget = build_model(a, ap, default_tokens=50_000)  # unattended: always capped

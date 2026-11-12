@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Per-machine node tokens** (`aios node-keys add|revoke|list --file F`, `aios swarm --nodes ...
+  --node-keys F`): each worker machine gets its own token (the file keeps SHA-256 hashes only); the
+  head names a node by its token instead of the name it sends, and `revoke` shuts one machine out at
+  its next request. The shared `$AIOS_NODE_TOKEN` still works without `--node-keys`. Answers are now
+  accepted only from a node the task was handed to.
 - **Hardening from the Oct-Nov 2026 agent-security incidents**:
   - Audit log: values with the shape of a known credential (GitHub, OpenAI, Anthropic, AWS, Slack,
     Google, GitLab, Hugging Face tokens, PEM private keys) are masked as `[redacted]` in arguments and
