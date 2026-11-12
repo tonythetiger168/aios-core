@@ -7,6 +7,16 @@
   head names a node by its token instead of the name it sends, and `revoke` shuts one machine out at
   its next request. The shared `$AIOS_NODE_TOKEN` still works without `--node-keys`. Answers are now
   accepted only from a node the task was handed to.
+- **Hardening from the Oct-Nov 2026 agent-security incidents**:
+  - Audit log: values with the shape of a known credential (GitHub, OpenAI, Anthropic, AWS, Slack,
+    Google, GitLab, Hugging Face tokens, PEM private keys) are masked as `[redacted]` in arguments and
+    tool results alike, before the hash is computed.
+  - Self-improvement: lessons that loosen oversight (monitors, alerts, watchdog, supervisor, hooks,
+    `--no-verify`, `--force`, skipping tests or checks) are flagged and wait for a person.
+  - Skills: `aios skills scan` reports `loosens-oversight` (medium) for such directives.
+  - Scopes: a path with a trailing dot or space in any part, or a `:` (an NTFS data stream), matches
+    no `paths` / `auto_paths` rule, because Windows would open a different name than the rule saw;
+    on Windows the rules ignore case like NTFS does.
 - **Audit log**: argument values whose keys look like secrets (`password`, `token`, `api_key`, ...) are stored as `[redacted]` before the hash is computed. The tool still receives the real arguments. Tool results are stored as returned.
 - **3D office** (`aios_office`, console → Office): agents walk between an open office, library, server
   room, talk lounge (two agents talking, with speech bubbles), meeting room (discussions of three or

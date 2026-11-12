@@ -233,6 +233,11 @@ RULES = [
     ("high", "weakens-safety", re.compile(
         r"auto-?approve|disable\s+(the\s+)?(approval|audit\w*|logging|sandbox)|"
         r"turn\s+off\s+(the\s+)?(approval|audit\w*|sandbox)", _I), "any"),
+    ("medium", "loosens-oversight", re.compile(  # about 1 in 17 public skills carries one of these
+        r"--no-verify\b|--no-gpg-sign\b|core\.hooksPath|git\s+push\b[^\n]*\s(-f|--force)\b|"
+        r"(disable|remove|silence|suppress|turn\s+off)\s+(the\s+|all\s+|any\s+)?"
+        r"(monitor\w*|alerts?|watchdog|hooks?|checks?|linters?|warnings?)|"
+        r"skip\w*\s+(the\s+|all\s+)?(tests?|checks?|review|verification|ci)\b", _I), "any"),
     ("high", "exfiltration", re.compile(
         r"(send|post|upload|forward|exfiltrat\w+)\b[^.\n]{0,60}"
         r"(api[_ -]?keys?|passwords?|credentials|secrets?|\.env\b|tokens?)", _I), "any"),

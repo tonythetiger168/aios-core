@@ -576,8 +576,10 @@ class Store:
     @staticmethod
     def audit_row(agent: str, tool: str, args: dict, result: str, status: str) -> tuple:
         """One chained audit entry. Values of argument keys that look like secrets are stored as
-        "[redacted]", and the hash covers that text. A secret under an ordinary key, or inside a
-        tool result, is still stored: results are the evidence of what the tool returned."""
+        "[redacted]", and the hash covers that text. Strings with the shape of a known credential
+        (GitHub / OpenAI / Anthropic / AWS / Slack / Google keys, PEM private keys) are masked
+        wherever they appear, results included; any other secret under an ordinary key or in a
+        result is still stored: results are the evidence of what the tool returned."""
         clip = lambda t: t if len(t) <= AUDIT_MAX else t[:AUDIT_MAX] + "...(truncated)"
         if isinstance(result, list):  # content blocks: describe images/PDFs, never store their data
             import aios_media
@@ -585,7 +587,8 @@ class Store:
         import aios_auditout
         args = aios_auditout.redact_args(args)  # copy; the tool already ran with the real arguments
         return (datetime.now().isoformat(timespec="seconds"), agent, tool,
-                clip(json.dumps(args, ensure_ascii=False, default=str)), clip(str(result)), status)
+                clip(json.dumps(args, ensure_ascii=False, default=str)),
+                clip(aios_auditout.redact_text(str(result))), status)
 
     def append_audit(self, rows: list[tuple]):
         """Append audit_row()s in one transaction, each chained to the one before."""
@@ -757,10 +760,17 @@ def _norm_path(raw) -> str | None:
     p = posixpath.normpath(str(raw or ".").replace("\\", "/"))
     if p.startswith("/") or re.match(r"^[A-Za-z]:", p) or p == ".." or p.startswith("../"):
         return None
-    return p
+    # Windows drops a trailing dot or space ("a.mcp.json." opens a.mcp.json) and reads "name:x" as
+    # an alternate data stream of "name": such a path would not match the rule written for the
+    # file it really opens, so it matches no rule at all.
+    if ":" in p or any(c != "." and c[-1:] in (".", " ") for c in p.split("/")):
+        return None
+    return p.lower() if os.name == "nt" else p  # NTFS ignores case: so do the rules there
 
 
 def _path_matches(p: str, patterns) -> bool:
+    if os.name == "nt":
+        patterns = [pat.lower() for pat in patterns]
     return any(fnmatch.fnmatchcase(p, pat) or (pat.endswith("/*") and p == pat[:-2]) for pat in patterns)
 
 

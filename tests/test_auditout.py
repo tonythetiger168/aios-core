@@ -104,6 +104,24 @@ class ShipTests(Case):
         self.assertEqual(sent[0]["entries"][0]["args"], "[unparsed: clipped]")
 
 
+class RedactTests(unittest.TestCase):
+    def test_credential_shaped_values_are_masked_anywhere(self):
+        gh, aws = "ghp_" + "a1B2" * 9, "AKIA" + "ABCDEFGHIJKLMNOP"
+        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+        self.assertEqual(ao.redact_text(f"token {gh} and {aws}\n{pem} end"),
+                         "token [redacted] and [redacted]\n[redacted] end")
+        self.assertEqual(ao.redact_args({"cmd": f"git push https://{gh}@github.com/x", "n": 3}),
+                         {"cmd": "git push https://[redacted]@github.com/x", "n": 3})
+        plain = "sk-learn is a package; ghp_short; the AKIA prefix"
+        self.assertEqual(ao.redact_text(plain), plain)
+
+    def test_audit_rows_mask_credentials_in_results_too(self):
+        key = "sk-ant-" + "x" * 30
+        row = aios.Store.audit_row("a", "run_python", {"code": "print(1)"}, f"leaked {key}", "ok")
+        self.assertNotIn(key, row[4])
+        self.assertIn("[redacted]", row[4])
+
+
 class Collector(http.server.BaseHTTPRequestHandler):
     batches, status, auth = [], 200, []
 
