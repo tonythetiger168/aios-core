@@ -135,7 +135,7 @@ class OpenAICompatProvider:
         # again every DIGEST_RECHECK seconds. A re-pulled or swapped model (weights can carry a
         # backdoor that ordinary evals never trigger) stops the run instead of answering.
         self.digest = normalize_digest(digest) if digest else None
-        self._digest_checked = 0.0
+        self._digest_checked: float | None = None  # monotonic time of the last good check
         # urllib blocks a thread per call: give the provider its own pool, as large as the kernel's
         # model slots (Python's shared default pool has min(32, CPUs + 4) threads, so a swarm on a
         # 4-core machine could only reach the model server 8 calls at a time).
@@ -251,7 +251,10 @@ class OpenAICompatProvider:
             from concurrent.futures import ThreadPoolExecutor
             self._pool = ThreadPoolExecutor(min(self.workers or MODEL_SLOTS, MODEL_THREADS_MAX),
                                             thread_name_prefix="aios-model")
-        if self.digest and time.monotonic() - self._digest_checked > DIGEST_RECHECK:
+        # never compare with a zero start: monotonic() counts from boot on Windows, so a machine up
+        # for less than DIGEST_RECHECK seconds would skip the first check
+        if self.digest and (self._digest_checked is None
+                            or time.monotonic() - self._digest_checked > DIGEST_RECHECK):
             await asyncio.get_running_loop().run_in_executor(self._pool, self.verify_digest)
         return self.from_wire(await asyncio.get_running_loop().run_in_executor(self._pool, self._post, payload))
 

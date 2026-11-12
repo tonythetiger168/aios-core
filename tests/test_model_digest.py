@@ -8,6 +8,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -78,6 +79,14 @@ class DigestTests(unittest.TestCase):
         FakeOllama.digest = "c" * 64
         p = aios.OpenAICompatProvider("gemma4:12b", self.url, digest=GOOD[:12])
         with self.assertRaisesRegex(RuntimeError, "re-pulled or replaced"):
+            self.call(p)
+        self.assertEqual(CALLS, [])
+
+    def test_first_call_is_checked_even_soon_after_boot(self):
+        # time.monotonic() counts from boot on Windows: a fresh machine must not skip the first check
+        FakeOllama.digest = "c" * 64
+        p = aios.OpenAICompatProvider("gemma4:12b", self.url, digest=GOOD[:12])
+        with mock.patch.object(aios.time, "monotonic", return_value=5.0), self.assertRaises(RuntimeError):
             self.call(p)
         self.assertEqual(CALLS, [])
 
