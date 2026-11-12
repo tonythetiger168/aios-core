@@ -91,7 +91,7 @@ python start.py swarm --parallel 64 --model-slots 64 ...        # 降低並行
 python start.py chat --embed-model nomic-embed-text --embed-url http://localhost:11434/v1   # 語意搜尋記憶（需要 Ollama）
 ```
 
-**選模型：** 沒有防護時，qwen2.5:7b 在注入測試中被騙 27 次中 15 次，llama3.1:8b 是 3 次；開啟 AIOS 防護後兩者都是 0 次。中文內容 Qwen 通常比較好，對安全要求高的工作可以考慮 Llama。
+**選模型：** 建議用非中國的 Apache 2.0 模型：32 GB 顯示卡用 `gemma4:26b`（MoE，約 16–18 GB）或 `gemma4:31b`（約 19 GB），也可用 `gpt-oss:20b`（約 13–14 GB）。沒有防護時，各模型在注入測試中被騙 27 次中 2 到 20 次（llama3.1:8b 最少，gemma4:e4b 最多）；開啟 AIOS 防護後每個模型都是 0 次，所以安全靠的是 AIOS 的防護，不是挑模型。
 
 ## 什麼時候該升級
 

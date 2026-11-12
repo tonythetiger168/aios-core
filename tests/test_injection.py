@@ -11,7 +11,7 @@ approver that says yes), because that is the dangerous setting.
 A real model can be measured too (an OpenAI-compatible server such as Ollama). The payload is then
 plain-language instructions instead of @@CALL, and each attack is tried several times:
 
-    python tests/test_injection.py --report --model http://127.0.0.1:11434/v1 qwen2.5:3b
+    python tests/test_injection.py --report --model http://127.0.0.1:11434/v1 gemma4:e4b
     AIOS_TEST_CHAT_URL=... AIOS_TEST_CHAT_MODEL=... python -m unittest tests.test_injection
 """
 import asyncio

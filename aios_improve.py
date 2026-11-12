@@ -509,7 +509,7 @@ async def round_(store, key: str, cases, sha: str, provider, budget, policy=None
     paid = not is_free(provider)
     if paid and daily_cost is None:
         why = ("evals skipped: the model is paid and no USD cap (--daily-cost) was set; use a local model "
-               "(--provider openai --model qwen2.5:3b) to improve for free")
+               "(--provider openai --model gemma4:e4b) to improve for free")
         if sig["calls"] or sig["stops"]:
             await propose(store, key)  # counting the audit log is free; the candidate waits
         mark_round(store.db, key, started)

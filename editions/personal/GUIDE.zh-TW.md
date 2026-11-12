@@ -26,7 +26,7 @@
 1. 安裝 [Ollama](https://ollama.com)，下載模型：
 
    ```bash
-   ollama pull qwen2.5:3b            # 對話模型（約 2 GB）
+   ollama pull gemma4:e4b            # 對話模型（Google Gemma 4，約 6.6 GB）
    ollama pull nomic-embed-text      # 記憶語意搜尋用
    ```
 
@@ -80,7 +80,7 @@ Personal 預設同時 64 個任務、64 個模型呼叫。
 ## 調整
 
 ```bash
-python start.py chat --model qwen2.5:7b               # 換 7B（4-bit 量化，16 GB 放得下，較慢但較聰明）
+python start.py chat --model gemma4:12b               # 換 12B（約 8 GB，16 GB 放得下，較慢但較聰明）
 python start.py swarm --parallel 16 ...               # 顯示卡太熱或太慢時降低並行
 ```
 

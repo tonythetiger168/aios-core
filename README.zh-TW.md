@@ -292,12 +292,12 @@ python aios.py undo --run 20261026-101500-ab12   # 指定 --list 列出的某次
 ```bash
 python aios.py improve propose --agent notes          # 從上一輪以來的審計日誌整理心得（不呼叫模型）
 python aios.py improve list                           # 版本：* 使用中、? 候選；評測花費；待審修補
-python aios.py improve eval --agent notes --cases evals.jsonl --provider openai --model qwen2.5:3b
+python aios.py improve eval --agent notes --cases evals.jsonl --provider openai --model gemma4:e4b
 python aios.py improve adopt --agent notes 3          # 由人採用某個版本（下一次執行起生效）
 python aios.py improve rollback --agent notes         # 退回上一版（--to 0：不用手冊）
 # 無限循環：提出 -> 評測 -> 採用，每小時一輪，不限輪數，使用免費的本機模型
 python aios.py improve loop --agent notes --agent reporter --cases evals.jsonl --every 1h \
-    --provider openai --model qwen2.5:3b --policy policy.toml
+    --provider openai --model gemma4:e4b --policy policy.toml
 ```
 
 `evals.jsonl` 每行一個任務：純文字，或 `{"task": "...", "expect": "正規表達式", "forbid": "正規表達式"}`，用來檢查回答（被中止的執行算失敗）。
@@ -406,7 +406,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 ```bash
 export AIOS_BOT_TOKEN=123456:ABC...   # 用 @BotFather 建立的機器人（請和 `aios telegram` 用不同的機器人）
 python aios.py bot --policy policy.example.toml --agent researcher --allow-chat -1001234567890 \
-    --provider openai --model qwen2.5:7b    # 本機模型：回答不花錢
+    --provider openai --model gemma4:12b    # 本機模型：回答不花錢
 ```
 
 - **什麼時候回答**：在群組裡，提到 `@your_bot`、以 `/ask` 開頭、或回覆它某則回答的訊息（追問不用再標記）。在私訊裡，每則訊息都回答。它會回覆那則訊息（在論壇主題裡就回在同一個主題）；太長的回答最多分成 3 則串接的訊息。
@@ -571,6 +571,18 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 | **合計** | **15/27** | **3/27** | **0/27** |
 
 模型越大不代表越安全：qwen2.5:7b 照做的注入指令比 qwen2.5:3b 還多（27 次中 15 次，3b 是 9 次），llama3.1:8b 則是 3 次。有防護時，對每個模型都沒有任何攻擊成功。
+
+第二次量測，2026 年 11 月，產品線預設模型從 Qwen 改為 Google Gemma 4（Apache 2.0）之後。每項試 3 次，共 27 次：
+
+| 模型 | 無防護 | 污染政策 + 範圍限制 |
+|---|:-:|:-:|
+| gemma4:e4b（新預設） | 20/27 | 0/27 |
+| gemma4:12b | 10/27 | 0/27 |
+| granite4.2:8b | 18/27 | 0/27 |
+| qwen2.5:7b | 18/27 | 0/27 |
+| llama3.1:8b | 2/27 | 0/27 |
+
+無防護的數字每次量測都會變（qwen2.5:7b 從 15 變 18），沒有哪個模型單靠自己是安全的。有防護的那欄對每個模型都是 0，所以挑預設模型看的是品質和授權，不是注入抵抗力。gemma4:12b 和 gpt-oss:20b 在雲端測試機上記憶體不夠跑完整套測試，要在自己的機器上手動跑。
 
 ## Roadmap
 

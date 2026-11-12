@@ -10,7 +10,7 @@ From the source tree:
     python editions/start.py --edition personal chat
 
 Edition flags come first, so anything you add after the command wins (argparse keeps the last value),
-e.g. `python start.py chat --model qwen2.5:7b`. Variables in aios.env (KEY=value) are loaded unless
+e.g. `python start.py chat --model gemma4:12b`. Variables in aios.env (KEY=value) are loaded unless
 already set in the environment. Standard library only.
 """
 import os
