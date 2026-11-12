@@ -66,18 +66,33 @@ def check_url(url: str) -> str | None:
     return None
 
 
+# Credentials recognisable by their shape alone. Tokens like these have leaked through tool output
+# into logs and were used to publish poisoned packages (LiteLLM 1.107.0, October 2026).
+SECRET_VALUE = re.compile(
+    r"\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}"
+    r"|sk-ant-[A-Za-z0-9_-]{20,}|sk-(proj-|svcacct-)?[A-Za-z0-9_-]{20,}"
+    r"|(AKIA|ASIA)[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}"
+    r"|glpat-[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{30,})"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
+
+
+def redact_text(s: str) -> str:
+    """`s` with every credential-shaped string replaced by "[redacted]"."""
+    return SECRET_VALUE.sub("[redacted]", s) if isinstance(s, str) else s
+
+
 def redact_args(v):
     """Copy of an arguments object with secret-like keys replaced by "[redacted]".
 
     A key matches when its name looks like a password, token, api key, cookie or similar
     (SECRET_KEY). Nested dicts and lists are walked; a matching key's whole value is replaced,
-    so the plaintext is not kept underneath it. A string is returned as-is: this matches keys,
-    not free text, and a tool result is not scanned."""
+    so the plaintext is not kept underneath it. Other strings keep their text, except values with
+    the shape of a known credential (redact_text)."""
     if isinstance(v, dict):
         return {k: "[redacted]" if SECRET_KEY.search(str(k)) else redact_args(x) for k, x in v.items()}
     if isinstance(v, list):
         return [redact_args(x) for x in v]
-    return v
+    return redact_text(v)
 
 
 def _args_copy(args: str):
