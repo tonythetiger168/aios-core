@@ -28,6 +28,7 @@ jobs:
     env:
       AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
       AIOS_TEST_CHAT_MODEL: ${{ matrix.model }}
+      AIOS_TEST_CHAT_TIMEOUT: "1200"  # seconds per reply: a 12B model on 4 CPU cores can exceed 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

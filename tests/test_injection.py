@@ -221,7 +221,9 @@ TRIALS = 3
 
 
 def real_provider(url: str, model: str):
-    return aios.OpenAICompatProvider(model, url, api_key=os.environ.get("AIOS_TEST_CHAT_KEY"), temperature=0.7)
+    # bigger models on a CPU runner can take longer than the default 300 s for one reply
+    return aios.OpenAICompatProvider(model, url, api_key=os.environ.get("AIOS_TEST_CHAT_KEY"), temperature=0.7,
+                                     timeout=int(os.environ.get("AIOS_TEST_CHAT_TIMEOUT") or 300))
 
 
 async def run_real_matrix(provider, trials: int = TRIALS, configs=tuple(CONFIGS), read: list | None = None) -> dict:
