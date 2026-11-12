@@ -728,6 +728,21 @@ class OpenAICompatTests(unittest.IsolatedAsyncioTestCase):
             urllib.request.urlopen = old
         self.assertIn("cannot reach model server", str(cm.exception))
 
+    def test_a_dropped_or_slow_server_is_a_runtime_error_too(self):
+        import http.client
+        import urllib.request
+        old = urllib.request.urlopen
+        for exc in (http.client.RemoteDisconnected("closed"), TimeoutError("timed out")):
+            def boom(*a, **k):
+                raise exc
+            urllib.request.urlopen = boom
+            try:
+                with self.assertRaises(RuntimeError) as cm:
+                    self.P("m", "http://localhost:9")._post({})
+            finally:
+                urllib.request.urlopen = old
+            self.assertIn("model server at http://localhost:9 failed", str(cm.exception))
+
     def test_api_key_is_sent_but_not_in_errors(self):
         import urllib.error
         import urllib.request

@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import base64
 import importlib.util
+import http.client
 import json
 import os
 import shlex
@@ -220,6 +221,8 @@ class OpenAICompatProvider:
                                f"{e.read().decode('utf-8', 'replace')[:300]}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(f"cannot reach model server at {self.base_url}: {e.reason}") from None
+        except (OSError, http.client.HTTPException, ValueError) as e:  # timeout, dropped, not JSON
+            raise RuntimeError(f"model server at {self.base_url} failed: {type(e).__name__}: {e}") from None
 
     async def complete(self, system: str, messages: list[dict], tools: list[dict],
                        max_tokens: int = 1024) -> Completion:
