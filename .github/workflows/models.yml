@@ -3,6 +3,10 @@ name: larger models
 # (that one uses qwen2.5:3b). CPU-only runners make each model take an hour or more, so this runs
 # weekly, by hand (Actions > larger models > Run workflow, any Ollama model name), and when this
 # file changes. Results are printed in the log and kept as the `injection-<model>` artifact.
+# The default list measures the non-China candidates for the editions' default model (Google Gemma 4,
+# IBM Granite 4.2) next to the current qwen2.5 default and llama3.1:8b. gpt-oss:20b (13-14 GB) does
+# not fit beside the suite in a hosted runner's 16 GB of RAM, and the Ollama server died one third of
+# the way through gemma4:12b there (Nov 2026): run those by hand on a bigger machine.
 on:
   schedule:
     - cron: "17 3 * * 1"
@@ -21,10 +25,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: ${{ fromJSON(github.event.inputs.model && format('["{0}"]', github.event.inputs.model) || '["qwen2.5:7b","llama3.1:8b"]') }}
+        model: ${{ fromJSON(github.event.inputs.model && format('["{0}"]', github.event.inputs.model) || '["qwen2.5:7b","llama3.1:8b","gemma4:e4b","granite4.2:8b"]') }}
     env:
       AIOS_TEST_CHAT_URL: http://127.0.0.1:11434/v1
       AIOS_TEST_CHAT_MODEL: ${{ matrix.model }}
+      AIOS_TEST_CHAT_TIMEOUT: "1200"  # seconds per reply: a 12B model on 4 CPU cores can exceed 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
