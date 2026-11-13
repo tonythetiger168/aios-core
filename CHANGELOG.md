@@ -8,6 +8,10 @@
   without `--context`, and sends replies with mentions switched off. LINE listens for signed
   webhook calls on `127.0.0.1:--port` (expose it with a tunnel), answers with the free reply API and
   falls back to push for slow answers (`--no-push` to drop them). `--allow-chat` now takes text ids.
+- **Site: "Why AIOS" comparison** (`#compare` on the product page): AIOS next to OpenFang, OpenClaw,
+  OpenHands, Letta and the Rutgers research AIOS on isolation, injection defence (measured 0/27),
+  audit, multi-machine, self-improvement, chat platforms, local models and price, with an honest
+  note on where the others lead.
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the
