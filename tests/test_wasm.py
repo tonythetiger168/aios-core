@@ -48,7 +48,7 @@ class SetupTests(unittest.TestCase):
         box = aios_wasm.WasmSandbox(lambda: ws["p"], wasm="/x/python.wasm")
         ws["p"] = "/later"
         job = box.job("print(1)", "/o", "/t")
-        self.assertEqual((job["workspace"], job["tmp"], job["wasm"]), ("/later", "/t", "/x/python.wasm"))
+        self.assertEqual((job["workspace"], job["tmp"], job["wasm"]), (str(Path("/later")), "/t", "/x/python.wasm"))
         self.assertIn("READ_ONLY, w.FilePerms.READ_ONLY", aios_wasm.RUNNER)
         self.assertIn('"/workspace"', aios_wasm.RUNNER)
 
