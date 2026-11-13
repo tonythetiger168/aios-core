@@ -63,7 +63,7 @@ Full list in [CHANGELOG.md](CHANGELOG.md); a self-audit against classical OS mec
 - **Agent swarms**: hand hundreds of sub-tasks to helper agents at once with the `swarm` tool or `aios swarm`, under a worker pool, a process-wide limit on model calls in flight, a shared token/cost budget and per-task timeouts, optionally combined by a reducer agent, on one machine or spread over several (`aios node`). Same permissions, approvals, taint and audit as one delegation (see below). Docker and microVM sandboxes for `run_python` start only while their memory limits fit in the host's free memory (`MemAvailable` on Linux, Windows' free physical memory; 512 MiB kept in reserve, `AIOS_SANDBOX_RESERVE_MB`); the rest wait their turn instead of pushing the host into swap or its OOM killer (`AIOS_SANDBOX_MAX` caps the count, `AIOS_SANDBOX_WAIT` how long a call may wait, default 300 s). `aios doctor` shows how many fit.
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign|publish|search|install`, optional publisher signatures, a static skill registry, `chat --skill <folder>` (see below). The scanner also reports `loosens-oversight` for directives that tell an agent to turn off monitors, hooks or checks.
-- **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
+- **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client, and with `--mcp` guards other MCP servers so another agent (OpenClaw, OpenHands, ...) can only use them through AIOS's policy, approvals and audit (see below). `python aios.py audit` prints the audit log from the shell.
 - **Approvals from your phone**: `python aios.py telegram` sends approval requests from the daemon, `serve` and `swarm` (`--approvals console`) to a Telegram chat with Approve/Deny buttons (see Scheduled jobs).
 - **Agents as chat bots**: `python aios.py bot` puts a policy agent in Telegram, Discord or LINE chats (`--platform`). Tag it under a message (`@your_bot is this true?`), use `/ask`, or reply to its answer, and it replies in the thread with that message and the earlier exchange as context, like the assistants you can tag on social media (see below). Chat members are strangers: every question is a fresh tainted run, read-only by default, with per-person and daily limits.
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript (except the 3D office below, which never turns log text into HTML), so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
@@ -390,6 +390,18 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 - Nobody can answer a `[y/N]` prompt over stdio, so risky tools (`write_file`, `run_python`, `remember` after tainting) are **refused** unless the policy pre-allows a path with `auto_paths`. Once the session has read a file, even those are refused until the server restarts.
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
 - **Status**: works with the official `mcp` SDK 1.x and 2.x, and with MCP 2026-07-28 clients (stateless: `server/discover` instead of `initialize`; needs `mcp` 2.3+ on the AIOS side). CI drives `aios serve` with the SDK's own stdio client (initialize, list, call, refusals, audit) on both versions, plus a 2026-07-28 client on the latest SDK, and connects aios to a real SDK server. Not yet tried with Claude Desktop or other GUI clients: if yours does not connect or lists no tools, please open an issue with the stderr output.
+
+**Guard another agent (OpenClaw, OpenHands, Claude Desktop, ...).** `serve` takes the same `--mcp`, `--confine-mcp`, `--offline-mcp` and `--mcp-egress` flags as `chat`. Point the other agent at AIOS instead of at its MCP servers, and AIOS sits in between: the agent sees a server's tools only as the policy grants them (`permissions = ["fs__*"]`), and every call goes through scopes, approvals, taint, rate limits and the audit log, while the server itself runs confined.
+
+```bash
+python aios.py serve --home ~/aios-data --agent outside --policy policy.toml \
+    --mcp "fs=npx -y @modelcontextprotocol/server-filesystem /home/me/project" --confine-mcp fs \
+    --approvals console          # answer its risky calls in `aios console --approve` or on Telegram
+```
+
+- MCP tools always need a scope (`auto_args`) or a person: with nobody watching they are refused, never run silently.
+- The guard only covers what goes through it: turn off the other agent's own shell and file tools (or run it in a container without them), so AIOS is its only way to act.
+- Everything the other agent did is in `aios audit` / the console, under the `--agent` name.
 
 ## Talk to other agents (A2A)
 

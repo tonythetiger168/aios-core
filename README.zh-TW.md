@@ -63,7 +63,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。`run_python` 的 Docker 與 microVM 沙箱只有在記憶體上限放得進主機的可用記憶體時才會啟動（Linux 讀 `MemAvailable`，Windows 讀可用實體記憶體；保留 512 MiB，`AIOS_SANDBOX_RESERVE_MB` 可調），其餘的會排隊等候，而不是把主機推進 swap 或觸發 OOM killer（`AIOS_SANDBOX_MAX` 限制同時數量，`AIOS_SANDBOX_WAIT` 是最長等待秒數，預設 300）。`aios doctor` 會顯示能同時放幾個。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。掃描器也會對叫代理關掉監控、hooks 或檢查的指示回報 `loosens-oversight`。
-- **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
+- **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端；加上 `--mcp` 還能保護其他 MCP 伺服器，讓別家 agent（OpenClaw、OpenHands……）只能透過 AIOS 的政策、核准與審計來使用它們（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
 - **代理當聊天機器人**：`python aios.py bot` 把一個政策代理放進 Telegram、Discord 或 LINE 聊天室（`--platform`）。在某則訊息底下標記它（`@your_bot 這是真的嗎？`）、用 `/ask`，或回覆它的回答，它就會在串裡回覆，並把那則訊息和先前的對話當成上下文，就像社群媒體上可以標記的 AI 助理（見下）。聊天室成員都是陌生人：每個問題都是全新、被污染的一次執行，預設只能用唯讀工具，並有每人與每日上限。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面不執行 JavaScript（下面的 3D 辦公室除外，它從不把日誌文字當成 HTML），所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
@@ -390,6 +390,18 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 - stdio 上沒有人能回答 `[y/N]`，所以高風險工具（`write_file`、`run_python`、被污染後的 `remember`）一律**拒絕**，除非政策用 `auto_paths` 預先允許某些路徑。只要這次連線讀過檔案，連這些也會被拒絕，直到伺服器重啟。
 - `max_calls` 以伺服器連線為單位計算。所有資料都放在 `--home` 底下（`aios.db`、`workspace/`）。
 - **狀態**：支援官方 `mcp` SDK 1.x 與 2.x，也支援 MCP 2026-07-28 客戶端（無狀態：以 `server/discover` 取代 `initialize`；AIOS 這邊需要 `mcp` 2.3+）。CI 會用 SDK 自己的 stdio 客戶端驅動 `aios serve`（初始化、列出、呼叫、拒絕、稽核），兩個版本都測，最新 SDK 上另外用 2026-07-28 客戶端測，也會讓 aios 連上真正的 SDK 伺服器。尚未用 Claude Desktop 或其他圖形介面客戶端試過：如果你的客戶端連不上或列不出工具，請開 issue 並附上 stderr 輸出。
+
+**保護別家 agent（OpenClaw、OpenHands、Claude Desktop……）。** `serve` 也接受和 `chat` 相同的 `--mcp`、`--confine-mcp`、`--offline-mcp`、`--mcp-egress` 參數。讓別家 agent 改連 AIOS，而不是直接連它的 MCP 伺服器，AIOS 就擋在中間：那個 agent 只看得到政策允許的工具（`permissions = ["fs__*"]`），每次呼叫都要經過範圍、核准、污染標記、速率限制與審計日誌，伺服器本身也被關在受限環境裡。
+
+```bash
+python aios.py serve --home ~/aios-data --agent outside --policy policy.toml \
+    --mcp "fs=npx -y @modelcontextprotocol/server-filesystem /home/me/project" --confine-mcp fs \
+    --approvals console          # 在 `aios console --approve` 或 Telegram 上回答它的高風險呼叫
+```
+
+- MCP 工具一律需要範圍（`auto_args`）或有人核准：沒人看著時會被拒絕，絕不會偷偷執行。
+- 只有經過 AIOS 的動作受到保護：請關掉那個 agent 自己的 shell 與檔案工具（或把它放在沒有這些工具的容器裡），讓 AIOS 成為它唯一能做事的管道。
+- 那個 agent 做過的每件事都在 `aios audit`／控制台裡，記在 `--agent` 的名稱底下。
 
 ## 與其他代理對話（A2A）
 
