@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Chat bots on Discord and LINE** (`aios bot --platform discord|line`): the same BotCore as the
+  Telegram bot (mentions, `/ask`, replies to its answers, quoted posts, tainted runs, per-user and
+  daily limits). Discord uses a standard-library WebSocket to the gateway, needs no privileged intent
+  without `--context`, and sends replies with mentions switched off. LINE listens for signed
+  webhook calls on `127.0.0.1:--port` (expose it with a tunnel), answers with the free reply API and
+  falls back to push for slow answers (`--no-push` to drop them). `--allow-chat` now takes text ids.
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the

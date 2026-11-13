@@ -23,8 +23,8 @@ Security model: everything in a chat is written by people who are not your user.
 - Every run is in the audit log like any other, under the agent's name.
 - Chat text goes to the model you choose: use a local model for chats whose content is private.
 
-The platform part is small (TelegramAdapter); BotCore decides when to answer and what context to
-give, so other chat platforms can be added as adapters.
+The platform part is small (TelegramAdapter here, DiscordAdapter in aios_discord, LineAdapter in
+aios_line); BotCore decides when to answer and what context to give, the same on every platform.
 """
 import asyncio
 import collections
@@ -77,7 +77,7 @@ class BotCore:
                  clock=time.monotonic, log=None):
         self.answer = answer
         self.username = username.lstrip("@").lower()
-        self.allow_chats = allow_chats
+        self.allow_chats = None if allow_chats is None else {str(c) for c in allow_chats}  # ids as text: LINE uses strings
         self.per_user = per_user
         self.context = context
         self.clock = clock
@@ -89,7 +89,7 @@ class BotCore:
 
     # -- when to answer --
     def addressed(self, m: dict) -> bool:
-        if m["private"]:
+        if m["private"] or m.get("mentioned"):  # mentioned: the adapter saw a platform mention of the bot
             return True
         text = m["text"]
         if self.mention and self.mention.search(text):
@@ -100,7 +100,7 @@ class BotCore:
         return bool(r and r.get("from_bot"))
 
     def allowed(self, m: dict) -> bool:
-        return self.allow_chats is None or m["chat"] in self.allow_chats
+        return self.allow_chats is None or str(m["chat"]) in self.allow_chats
 
     def over_limit(self, user) -> bool:
         if not self.per_user:

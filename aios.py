@@ -3305,8 +3305,9 @@ def make_bot_answerer(k: Kernel, agent_name: str, policy: dict | None, budget: B
 async def bot_cmd(agent_name: str, policy: dict | None, home: str, provider=None, budget: Budget | None = None,
                   allow_chats: set | None = None, per_user: int = 20, context: int = 0, parallel: int = 2,
                   daily_tokens: int | None = None, daily_cost: float | None = None, timeout: float = 300,
-                  api=None) -> int:
-    """`aios bot`: a policy agent answering @mentions in Telegram chats (aios_bot)."""
+                  api=None, platform: str = "telegram", port: int = 8790, push: bool = True) -> int:
+    """`aios bot`: a policy agent answering @mentions in Telegram, Discord or LINE chats (aios_bot,
+    aios_discord, aios_line). The rules for when to answer and what the agent sees are the same."""
     import aios_bot
     global WORKSPACE
     base = Path(home).resolve()
@@ -3316,8 +3317,15 @@ async def bot_cmd(agent_name: str, policy: dict | None, home: str, provider=None
     install_builtin_tools(k)
     install_agent_tools(k, policy)
     try:
-        return await aios_bot.run(make_bot_answerer(k, agent_name, policy, budget, daily_tokens, daily_cost, timeout),
-                                  allow_chats, per_user, context, parallel, api, f"as the agent '{agent_name}'")
+        answer = make_bot_answerer(k, agent_name, policy, budget, daily_tokens, daily_cost, timeout)
+        describe = f"as the agent '{agent_name}'"
+        if platform == "discord":
+            import aios_discord
+            return await aios_discord.run(answer, allow_chats, per_user, context, parallel, api, describe)
+        if platform == "line":
+            import aios_line
+            return await aios_line.run(answer, allow_chats, per_user, context, parallel, api, describe, port, push)
+        return await aios_bot.run(answer, allow_chats, per_user, context, parallel, api, describe)
     finally:
         await k.close()
         k.store.db.close()
@@ -5100,12 +5108,21 @@ def parser() -> argparse.ArgumentParser:
                     help="chat to send requests to (your user id for a private chat; default $AIOS_TELEGRAM_CHAT)")
     tg.add_argument("--allow-user", type=int, action="append", default=[], metavar="USER_ID",
                     help="Telegram user allowed to answer (repeatable; default: the chat id, i.e. you in a private chat)")
-    bt = sub.add_parser("bot", help="let people @mention an agent in Telegram chats; it replies in the thread")
+    bt = sub.add_parser("bot", help="let people @mention an agent in Telegram, Discord or LINE chats; it replies in the thread")
+    bt.add_argument("--platform", choices=["telegram", "discord", "line"], default="telegram",
+                    help="chat platform (default telegram; tokens: $AIOS_BOT_TOKEN, $AIOS_DISCORD_TOKEN, "
+                         "$AIOS_LINE_TOKEN + $AIOS_LINE_SECRET)")
+    bt.add_argument("--port", type=int, default=8790,
+                    help="line: local webhook port on 127.0.0.1, expose it with a tunnel (default 8790)")
+    bt.add_argument("--no-push", action="store_true",
+                    help="line: drop answers that take longer than the reply token lives instead of pushing them "
+                         "(push messages count against the account's monthly quota)")
     bt.add_argument("--agent", default="main", help="policy section to answer as (default: main)")
     bt.add_argument("--policy", help="TOML policy; without it only read-only tools are offered")
     bt.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
-    bt.add_argument("--allow-chat", type=int, action="append", default=[], metavar="CHAT_ID",
-                    help="chat that gets answers (repeatable; group ids start with -100)")
+    bt.add_argument("--allow-chat", action="append", default=[], metavar="CHAT_ID",
+                    help="chat that gets answers (repeatable). Telegram: group ids start with -100; "
+                         "Discord: channel id; LINE: group C..., room R... or user U... id")
     bt.add_argument("--public", action="store_true", help="answer in every chat the bot is in (instead of --allow-chat)")
     bt.add_argument("--per-user", type=int, default=20, metavar="N",
                     help="answers per person per hour (default 20; 0 = no limit)")
@@ -5424,6 +5441,14 @@ def cli():
         check_daily_flags(a, ap)
         if bool(a.allow_chat) == a.public:
             ap.error("give --allow-chat CHAT_ID (repeatable) or --public, not both or neither")
+        allow = set()
+        for c in a.allow_chat:
+            c = c.strip()
+            if a.platform == "telegram" and not c.lstrip("-").isdigit():
+                ap.error(f"--allow-chat {c!r}: Telegram chat ids are numbers")
+            allow.add(int(c) if a.platform == "telegram" else c)
+        if not 0 < a.port < 65536:
+            ap.error("--port must be 1-65535")
         if a.per_user < 0 or a.context < 0 or a.parallel < 1 or a.timeout <= 0:
             ap.error("--per-user/--context must be 0 or more, --parallel at least 1, --timeout positive")
         daily = a.daily_max_tokens if a.daily_max_tokens is not None or a.daily_max_cost is not None else 200_000
@@ -5434,8 +5459,9 @@ def cli():
             except (OSError, ValueError) as e:
                 ap.error(f"--policy {a.policy}: {e}")
         raise SystemExit(asyncio.run(bot_cmd(a.agent, policy, a.home, provider, budget,
-                                             None if a.public else set(a.allow_chat), a.per_user, a.context,
-                                             a.parallel, daily, a.daily_max_cost, a.timeout)))
+                                             None if a.public else allow, a.per_user, a.context,
+                                             a.parallel, daily, a.daily_max_cost, a.timeout,
+                                             platform=a.platform, port=a.port, push=not a.no_push)))
     if a.cmd == "console":
         import aios_console
         raise SystemExit(aios_console.run(a.home, a.port, a.open, a.approve))
