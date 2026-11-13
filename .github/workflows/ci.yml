@@ -158,6 +158,29 @@ jobs:
       - name: Prompt-injection suite against a real model
         run: python -m unittest tests.test_injection -v
 
+  wasm:
+    # The wasm backend counts as verified only by this job: real wasmtime, real CPython-in-WASI
+    # (pinned by sha256, same pin as aios_wasm.PYTHON_WASM_SHA256), the evidence printed in the log.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt "wasmtime==50.0.1"
+      - name: Fetch the WASI CPython interpreter (pinned by sha256)
+        shell: bash
+        run: |
+          url=$(python -c "import aios_wasm; print(aios_wasm.PYTHON_WASM_URL)")
+          sha=$(python -c "import aios_wasm; print(aios_wasm.PYTHON_WASM_SHA256)")
+          curl -fsSL -o "$RUNNER_TEMP/python.wasm" "$url"
+          echo "$sha  $RUNNER_TEMP/python.wasm" | sha256sum -c -
+          echo "AIOS_WASM_PYTHON=$RUNNER_TEMP/python.wasm" >> "$GITHUB_ENV"
+      - name: Run the wasm tests
+        env:
+          AIOS_TEST_WASM: "1"
+        run: python -m unittest tests.test_wasm -v
+
   microvm:
     # The microVM backend counts as verified only by this job (see docs/microvm-sandbox.md).
     runs-on: ubuntu-latest

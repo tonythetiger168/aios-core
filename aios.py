@@ -45,7 +45,7 @@ WORKSPACE = Path("./workspace").resolve()
 DB_PATH = "aios.db"
 HISTORY_LIMIT = 40  # messages reloaded per agent
 MCP_MAX_RESULT = 20_000  # chars kept from one MCP tool result
-SANDBOXES = ("auto", "process", "docker", "microvm", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
+SANDBOXES = ("auto", "process", "docker", "microvm", "wasm", "off")  # run_python backends (--sandbox / AIOS_SANDBOX)
 SANDBOX_CHOICE = None  # set by the CLI's --sandbox; else $AIOS_SANDBOX; else "auto"
 DOCKER_IMAGE = "python:3.12-slim"  # never pulled implicitly: `docker pull` it yourself; pin with $AIOS_DOCKER_IMAGE
 DIGEST_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
@@ -2701,6 +2701,12 @@ def make_sandbox(choice: str | None = None):
         if why:
             raise RuntimeError(f"--sandbox microvm: {why}")
         return MicroVMSandbox()
+    if choice == "wasm":
+        import aios_wasm
+        why = aios_wasm.unavailable()
+        if why:
+            raise RuntimeError(f"--sandbox wasm: {why}")
+        return aios_wasm.WasmSandbox(lambda: WORKSPACE)  # read at each call: commands set it late
     if choice == "auto" and IS_WINDOWS and not DockerSandbox.unavailable(docker_image()):
         for note in DockerSandbox.provenance(docker_image()):  # the only real isolation on Windows
             print(f"[sandbox] {note}", file=sys.stderr)
@@ -2724,6 +2730,10 @@ def install_builtin_tools(k: Kernel, sandbox: str | None = None):
         elif box.name == "microvm":
             isolation = ("Fresh Firecracker microVM per call (own kernel, KVM); no network device, "
                          "no host files, read-only root, runs as nobody. ")
+        elif box.name == "wasm":
+            isolation = ("CPython compiled to WebAssembly (wasmtime + WASI): no network, the workspace "
+                         "read-only at /workspace, a throwaway writable /tmp, CPU and memory budgets; pure-"
+                         "Python standard library only (no pip packages, threads or subprocesses). ")
         else:
             network = {True: "network namespace enabled", "tcp": "no TCP connections",
                        "all": "no network"}.get(box.net_isolated, "network NOT isolated")
@@ -4946,6 +4956,9 @@ def doctor_cmd(home: str) -> int:
     why = MicroVMSandbox.unavailable()
     row("--" if why else "ok", "microvm", why or "Firecracker with KVM" +
         (" (jailer)" if MicroVMSandbox.jailer_wanted() else ""))
+    import aios_wasm
+    why = aios_wasm.unavailable()
+    row("--" if why else "ok", "wasm", why or "CPython in WebAssembly (wasmtime), pinned interpreter")
     import aios_admit
     g = aios_admit.MemoryGate()
     free, fits = aios_admit.available_mb(), g.capacity(256)
@@ -5384,7 +5397,8 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--sandbox", choices=SANDBOXES,
                        help="run_python backend: process (local child process), docker (throwaway "
                             f"container, needs `docker pull {DOCKER_IMAGE}`), microvm (Firecracker VM "
-                            "per call, Linux+KVM, see docs/microvm-sandbox.md), off, or auto (default: "
+                            "per call, Linux+KVM, see docs/microvm-sandbox.md), wasm (CPython in WebAssembly via "
+                            "wasmtime, any OS, see aios_wasm), off, or auto (default: "
                             "process; docker on Windows when available). Also $AIOS_SANDBOX")
     return ap
 
