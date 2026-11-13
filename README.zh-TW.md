@@ -69,7 +69,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 需要 Python 3.11 以上與 [Anthropic API key](https://platform.claude.com/settings/keys)（或下方的本機模型）。可以在原始碼目錄裡用 `python aios.py` 執行，也可以安裝成 `aios` 指令（只用標準函式庫；extras 會另外裝 Anthropic SDK 與 MCP SDK）：
 
 ```bash
-pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # 之後：aios chat、aios doctor……
+pip install "aios-os[all] @ git+https://github.com/tonythetiger168/aios-core"   # 之後：aios chat、aios doctor……
 ```
 
 在原始碼目錄裡：
@@ -598,7 +598,7 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 
 明確的非目標：現階段不寫真正的 OS 核心。
 
-套件發布備註：PyPI 上的 `aios-core` 名稱已被 [agiresearch/AIOS](https://github.com/agiresearch/AIOS) 使用（2024-11 起），因此要上架 PyPI 必須換一個套件名稱。在那之前，請照上面的方式從 GitHub 安裝。
+套件發布備註：PyPI 上的套件名稱是 **`aios-os`**（`pip install "aios-os[all]"`，指令仍然是 `aios`），因為 PyPI 上的 `aios-core` 屬於 [agiresearch/AIOS](https://github.com/agiresearch/AIOS)。設定好 PyPI 的 trusted publishing 後，每個新版本都會由發行流程自動上架（見 `.github/workflows/release.yml`）；第一次上架之前，請照上面的方式從 GitHub 安裝。
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 

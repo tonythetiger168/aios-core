@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **PyPI name `aios-os`**: the package is renamed from `aios-core` (taken on PyPI by another
+  project); the command stays `aios`. The release workflow uploads each released tag to PyPI with
+  trusted publishing once the owner enables it (`PYPI_PUBLISH` repository variable).
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the

@@ -36,3 +36,46 @@ jobs:
           fi
           printf '\nEditions (Lite, Personal, Workstation, Server): https://aios-registry-47b.pages.dev/\n' >> notes.md
           gh release create "$tag" --target "$GITHUB_SHA" --title "AIOS $version" --notes-file notes.md --latest
+
+  # PyPI: the released tag is built and uploaded as "aios-os" with trusted publishing (no token).
+  # One-time setup by the owner: on pypi.org > Publishing, add a pending publisher (project aios-os,
+  # owner tonythetiger168, repository aios-core, workflow release.yml, environment pypi), then set the
+  # repository variable PYPI_PUBLISH=true. Without the variable this job is skipped.
+  pypi:
+    needs: release
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find the released version
+        id: v
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/aios-os/$version/json")
+          if [ "$code" = 200 ]; then echo "aios-os $version is already on PyPI"; echo "skip=1" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.v.outputs.skip != '1'
+        with:
+          ref: v${{ steps.v.outputs.version }}
+      - uses: actions/setup-python@v5
+        if: steps.v.outputs.skip != '1'
+        with:
+          python-version: "3.12"
+      - name: Build
+        if: steps.v.outputs.skip != '1'
+        run: |
+          name=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
+          if [ "$name" != "aios-os" ]; then
+            echo "::notice::the tag is named $name, not aios-os (released before the rename): nothing to upload"
+            exit 0
+          fi
+          python -m pip install --upgrade build
+          python -m build
+          ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.v.outputs.skip != '1' && hashFiles('dist/*') != ''
