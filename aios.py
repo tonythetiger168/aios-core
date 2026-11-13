@@ -4051,6 +4051,9 @@ def start_webhook_listener(db_path: str, port: int):
     return srv
 
 
+CONSOLIDATE_DELAY = 60  # seconds after the daemon starts before its first memory consolidation round
+
+
 async def daemon(home: str = ".", policy: dict | None = None, provider=None, budget: Budget | None = None,
                  tick_seconds: float = 10, once: bool = False, max_runs_per_day: int = 200,
                  timeout: float = 300, webhook_port: int | None = None,
@@ -4058,7 +4061,8 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                  daily_tokens: int | None = None, daily_cost: float | None = None,
                  mcp_specs: list[str] | None = None, confine_mcp=frozenset(), offline_mcp=frozenset(),
                  egress_mcp: dict | None = None, audit_sink: str | None = None,
-                 anchor_path: str | None = None, anchor_every: float = 3600, supervise: bool = True):
+                 anchor_path: str | None = None, anchor_every: float = 3600, supervise: bool = True,
+                 consolidate_every: float = 0):
     global WORKSPACE
     base = Path(home).resolve()
     WORKSPACE = (base / "workspace").resolve()
@@ -4118,11 +4122,30 @@ async def daemon(home: str = ".", policy: dict | None = None, provider=None, bud
                 print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
     beat_info = f"pid={os.getpid()} tick={tick_seconds:g} timeout={timeout:g}"
     next_anchor = time.monotonic()
+    next_tidy = time.monotonic() + CONSOLIDATE_DELAY  # sleep-time memory consolidation: first round
+
+    async def consolidate_now():  # proposals only: nothing changes until a person accepts them
+        import aios_consolidate as mc
+        local = provider if isinstance(provider, OpenAICompatProvider) else None  # never a paid API
+        try:
+            rep = await mc.run_all(k.store.db, mc.model_completer(local) if local else None)
+        except Exception as e:  # noqa: BLE001 - a local model that is down must not stop the jobs
+            print(f"[aios] memory consolidation: {type(e).__name__}: {e}", file=sys.stderr)
+            return
+        if rep["proposed"]:
+            al = wd.alert(k.store.db, "memory-proposals", "memory",
+                          f"{rep['proposed']} memory merge proposal(s) wait for you: aios memory proposals")
+            if al:
+                print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
     try:
         while True:
             wd.beat(k.store.db, "daemon", beat_info)  # supervisor: the daemon is alive
-            for r in await sched.tick():
+            ran = await sched.tick()
+            for r in ran:
                 print(f"[aios] job {r['job']}: {r['status']}", file=sys.stderr)
+            if consolidate_every and not once and not ran and time.monotonic() >= next_tidy:  # idle
+                await consolidate_now()
+                next_tidy = time.monotonic() + consolidate_every * 3600
             wd.beat(k.store.db, "daemon", beat_info)
             for al in wd.check(k.store.db):  # watchdog: rules over the audit log, no model involved
                 print(f"[aios] ALERT {al['severity']} {al['rule']}: {al['detail']}", file=sys.stderr)
@@ -4727,7 +4750,7 @@ def undo_cmd(home: str, run: str | None = None, agent: str | None = None, list_o
 
 
 def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None, days: int = 30,
-               dry_run: bool = False, now=None) -> int:
+               dry_run: bool = False, now=None, provider=None) -> int:
     import aios_keeper as mk
     db = Path(home).resolve() / "aios.db"
     if not db.exists():
@@ -4757,6 +4780,8 @@ def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None
                    "exists": f"{args[0]}/{args[1]} exists again; remove it first (/forget) to restore the old one",
                    "missing": f"{args[0]}/{args[1]} is not in the archive"}[res])
             return 0 if res == "restored" else 1
+        if action in ("consolidate", "proposals", "accept", "reject"):
+            return consolidate_cmd(store, action, args, agent, provider, now)
         if action == "archived":
             rows = mk.archived(store.db, agent)
             for r in rows:
@@ -4775,6 +4800,39 @@ def memory_cmd(action: str, args: list[str], home: str, agent: str | None = None
         return 0
     finally:
         store.db.close()
+
+
+def consolidate_cmd(store, action: str, args: list[str], agent: str | None, provider, now=None) -> int:
+    """`aios memory consolidate|proposals|accept|reject` (aios_consolidate): merges a person accepts."""
+    import aios_consolidate as mc
+    one = lambda t: " ".join(str(t).split())[:160]
+    if action in ("accept", "reject"):
+        if len(args) != 1 or not args[0].isdigit():
+            print(f"usage: aios memory {action} <proposal id>   (see: aios memory proposals)")
+            return 2
+        pid = int(args[0])
+        if action == "reject":
+            ok = mc.reject(store.db, pid, now)
+            print(f"rejected proposal {pid}" if ok else f"no pending proposal {pid}")
+            return 0 if ok else 1
+        res = mc.accept(store.db, pid, now)
+        print({"accepted": f"accepted proposal {pid}: the old notes are archived (aios memory archived)",
+               "changed": f"proposal {pid} is stale: one of its notes changed since; run consolidate again",
+               "missing": f"no pending proposal {pid}"}[res])
+        return 0 if res == "accepted" else 1
+    if action == "consolidate":
+        rep = asyncio.run(mc.run_all(store.db, mc.model_completer(provider) if provider else None, agent, now))
+        for d in rep["dropped"]:
+            print(f"dropped a model suggestion: {d}")
+        print(f"{rep['proposed']} new proposal(s)" + ("" if provider else " (exact duplicates only; "
+              "--provider openai --model M lets a local model propose merges)"))
+    rows = mc.proposals(store.db, agent)
+    for p in rows:
+        print(f"#{p['id']} {p['agent']} [{p['origin']}] {', '.join(p['keys'])} -> {p['new_key']}: {one(p['new_value'])}")
+        if p["why"]:
+            print(f"    why: {one(p['why'])}")
+    print("accept one with: aios memory accept <id>   (or reject <id>)" if rows else "(no proposals waiting)")
+    return 0
 
 
 def status_cmd(home: str, now=None) -> int:
@@ -5158,6 +5216,10 @@ def parser() -> argparse.ArgumentParser:
     dm.add_argument("--policy", help="TOML policy: each job runs with the permissions of its --agent section")
     dm.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
     dm.add_argument("--once", action="store_true", help="run what is due now, then exit (for cron / Task Scheduler)")
+    dm.add_argument("--consolidate-every", type=float, default=0, metavar="HOURS",
+                    help="sleep-time memory consolidation: when no job is running, every HOURS propose merges "
+                         "of agents' notes for you to accept (`aios memory proposals`); a local --provider "
+                         "openai model also proposes merges, a paid API is never used for it (default 0 = off)")
     dm.add_argument("--tick", type=float, default=10, help="seconds between checks (default 10)")
     dm.add_argument("--timeout", type=float, default=300, help="seconds one job may run (default 300)")
     dm.add_argument("--max-runs-per-day", type=int, default=200, help="per job, a runaway guard (default 200)")
@@ -5182,9 +5244,17 @@ def parser() -> argparse.ArgumentParser:
     jb.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
     jb.add_argument("-n", type=int, default=20, help="history: how many entries")
     me = sub.add_parser("memory", help="review, confirm and tidy agents' notes (nothing tidy does is lost)")
-    me.add_argument("action", choices=["review", "confirm", "tidy", "archived", "restore"])
-    me.add_argument("args", nargs="*", help="confirm/restore: <agent> <key>")
-    me.add_argument("--agent", help="review/archived: only this agent")
+    me.add_argument("action", choices=["review", "confirm", "tidy", "archived", "restore",
+                                       "consolidate", "proposals", "accept", "reject"])
+    me.add_argument("args", nargs="*", help="confirm/restore: <agent> <key>; accept/reject: <proposal id>")
+    me.add_argument("--agent", help="review/archived/consolidate/proposals: only this agent")
+    me.add_argument("--provider", choices=["openai"],
+                    help="consolidate: also let a local model propose merges (OpenAI-compatible server only, "
+                         "so it costs nothing; without it only exact duplicates are proposed)")
+    me.add_argument("--model", help="consolidate: model name on that server (e.g. gemma4:e4b)")
+    me.add_argument("--base-url", default="http://localhost:11434/v1", help="consolidate: server (default Ollama)")
+    me.add_argument("--model-digest", default=os.environ.get("AIOS_MODEL_DIGEST"),
+                    help="consolidate: pinned weights, as for chat")
     me.add_argument("--days", type=int, default=30, help="tidy: archive unverified notes older than this (default 30)")
     me.add_argument("--dry-run", action="store_true", help="tidy: show what would change, change nothing")
     me.add_argument("--home", default=".", help="folder holding aios.db (default: current)")
@@ -5442,7 +5512,16 @@ def cli():
     if a.cmd == "memory":
         if a.days < 1:
             ap.error("--days must be at least 1")
-        raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run))
+        provider = None
+        if a.action == "consolidate" and (a.provider or a.model):
+            if not a.model:
+                ap.error("--provider openai needs --model (e.g. --model gemma4:e4b)")
+            try:
+                provider = OpenAICompatProvider(a.model, a.base_url, os.environ.get("OPENAI_API_KEY"),
+                                                digest=a.model_digest)
+            except ValueError as e:
+                ap.error(f"--model-digest: {e}")
+        raise SystemExit(memory_cmd(a.action, a.args, a.home, a.agent, a.days, a.dry_run, provider=provider))
     if a.cmd == "improve":
         import aios_improve
         raise SystemExit(aios_improve.cli(a, ap, build_model, load_policy))
@@ -5474,13 +5553,15 @@ def cli():
         check_mcp_flags(a, ap)
         if a.audit_sink and (why := aios_auditout.check_url(a.audit_sink)):
             ap.error(f"--audit-sink {a.audit_sink}: {why}")
+        if a.consolidate_every < 0:
+            ap.error("--consolidate-every must be 0 (off) or more hours")
         if a.anchor_every <= 0:
             ap.error("--anchor-every must be positive")
         return asyncio.run(daemon(a.home, policy, provider, budget, a.tick, a.once, a.max_runs_per_day, a.timeout,
                                   a.webhook_port, approve_timeout(a, ap), a.a2a, a.daily_max_tokens, a.daily_max_cost,
                                   a.mcp, set(a.confine_mcp), set(a.offline_mcp), a.mcp_egress,
                                   audit_sink=a.audit_sink, anchor_path=a.anchor, anchor_every=a.anchor_every,
-                                  supervise=not a.no_supervise))
+                                  supervise=not a.no_supervise, consolidate_every=a.consolidate_every))
     if a.cmd == "a2a-serve":
         provider, budget = build_model(a, ap, default_tokens=50_000)  # strangers' requests: always capped
         check_daily_flags(a, ap)

@@ -269,6 +269,20 @@ python aios.py memory archived              # 不會遺失：memory restore <代
 - tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
 - restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
 
+**閒置時整理記憶（sleep-time）。** 代理的記憶會越積越多、互相重疊。AIOS 可以把它們整理成更少、更清楚的筆記，但只會提出建議，由你接受：
+
+```bash
+python aios.py memory consolidate                                       # 免費：只找完全重複的記憶
+python aios.py memory consolidate --provider openai --model gemma4:e4b  # 本機模型也會建議合併
+python aios.py memory proposals                                         # 等你決定的建議
+python aios.py memory accept 3                                          # 或：memory reject 3
+python aios.py daemon ... --consolidate-every 24                        # 沒有任務在跑時自動進行
+```
+
+- 你接受之前什麼都不會改。接受後舊記憶會移到封存（隨時可以還原），合併後的記憶算是你的。建議提出後若有記憶被改過，該建議會因過期被拒絕。
+- 未驗證的記憶絕不會給模型看，也絕不合併：請先檢查它們。模型的建議會先經過檢查（不能覆蓋其他記憶、合併後不能比原本的還長）才會交給你。
+- 守護程式只有在使用本機 `--provider openai` 伺服器時才會用模型來做這件事，所以閒置整理絕不花錢；否則只建議完全重複的記憶。有新建議時會發出 info 告警（`aios status`、Telegram）。
+
 ## 還原一次執行
 
 `write_file` 建立或覆寫檔案之前，AIOS 會把原本的內容存進 `aios.db`。`aios undo` 可以把工作區還原成某次執行之前的樣子：

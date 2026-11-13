@@ -269,6 +269,20 @@ python aios.py memory archived              # nothing is lost: memory restore <a
 - Tidy moves old unverified notes to an archive instead of deleting them, and never touches your notes or the model's. It also drops cached vectors whose note changed or is gone (they are rebuilt on demand), and lists notes with the same text under several keys without changing them.
 - Restore puts the note back as unverified, and refuses if a newer note with that key exists. No model is involved: deciding what an agent keeps believing is what an injected note would like to influence.
 
+**Consolidating while idle (sleep-time).** Agents pile up overlapping notes. AIOS can tidy them into fewer, clearer ones, but only as proposals you accept:
+
+```bash
+python aios.py memory consolidate                                       # free: exact duplicates only
+python aios.py memory consolidate --provider openai --model gemma4:e4b  # a local model also proposes merges
+python aios.py memory proposals                                         # what waits for you
+python aios.py memory accept 3                                          # or: memory reject 3
+python aios.py daemon ... --consolidate-every 24                        # by itself, when no job is running
+```
+
+- Nothing changes until you accept. Accepting archives the old notes (restore them any time) and writes the merged note as yours. A proposal whose notes changed since is refused as stale.
+- Unverified notes are never shown to the model and never merged: review them first. The model's suggestions are checked (no overwriting another note, no merged note longer than what it replaces) before they reach you.
+- The daemon uses a model for this only when its provider is a local `--provider openai` server, so idle consolidation never spends money; otherwise it proposes exact duplicates only. New proposals raise an info alert (`aios status`, Telegram).
+
 ## Undoing a run
 
 Before `write_file` creates or overwrites a file, AIOS saves what was there in `aios.db`. `aios undo` puts the workspace back the way it was before a run:
