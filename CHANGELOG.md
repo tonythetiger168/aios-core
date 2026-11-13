@@ -51,7 +51,8 @@
   needs a person), and a broken audit chain puts everything in safe mode. Rule-based, no model calls; it
   only ever tightens, and only `aios supervisor --release` (a person) undoes an action.
 - **Site**: the homepage leads with self-improvement and has sections for self-supervision, the chat
-  bot and the 3D office (with a screenshot).
+  bot and the 3D office (with a screenshot). A price list sits right under the hero. The site and READMEs list
+  what is new since 0.2.0 (Gemma 4 default, `--model-digest`, `node-keys`, the security hardening).
 
 ## 0.2.0 (2026-11-06)
 

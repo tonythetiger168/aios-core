@@ -40,6 +40,8 @@ class ProductTests(unittest.TestCase):
             for plan in ("Core", "Team", "Cloud", "Enterprise", "NT$490", "NT$790"):
                 self.assertIn(plan, page)
             self.assertIn("自我進化的 AIOS", page)
+            for feature in ("Gemma 4", "--model-digest", "node-keys", "遮蔽"):
+                self.assertIn(feature, page)
             price_list = page.split('id="pricing"', 1)[1].split("</section>", 1)[0]
             for item in ("Core", "Team", "Cloud", "Enterprise", "免費", "NT$490", "NT$790", "NT$650,000",
                          *(f"AIOS {title}" for title in products.TITLES.values() if title != "Cloud")):
