@@ -6,6 +6,13 @@
 
 **Status: early alpha.** This is a working prototype, not a hardened product. Read [Security status](#security-status) before giving it access to anything you care about.
 
+## Start here
+
+- **New to AIOS?** Follow the [Quick start](#quick-start) for Python 3.11+, installation, local-model options and a first run.
+- **Evaluating safety?** Read [Security status](#security-status) and run `aios doctor` before enabling tools or connecting sensitive data. The early-alpha label is intentional: available safeguards are not a guarantee of production readiness.
+- **Building with agents?** See [Agent swarms](#agent-swarms), [MCP server](#use-it-as-an-mcp-server) and [Self-improvement](#self-improvement).
+- **Comparing plans?** See [Editions](#editions). Core capabilities and paid Team/Cloud services are described separately.
+
 ## Why
 
 Agents need an operating-system-like layer: who may call which tool, what is remembered, what runs in isolation, what gets logged. Big vendors are building this into their own OS or enterprise platform. The popular open-source personal agents proved the demand but shipped with weak security (see [Landscape](#landscape)). `aios-core` aims at the gap: a **local-first, cross-platform, model-agnostic runtime for individuals and small teams, secure by default**.
