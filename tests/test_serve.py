@@ -317,7 +317,7 @@ class ServeGlueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(got["names"], {"now", "box__shell"})  # box__peek is not granted
             self.assertIn("not approved", got["error"])  # nobody to ask, no scope: refused
             self.assertEqual(ran, [])
-            self.assertNotIn("WARNING", stderr)  # confined
+            self.assertNotIn("runs with all your rights", stderr)  # confined: no MCP warning
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 aios.audit_cmd(None, 10, d)
