@@ -27,6 +27,8 @@ with no failures, timeouts past ~5,500; see [docs/stress-test.md](../docs/stress
 | **Cloud** (hosted) | NT$790/seat/month incl. 2,000 runs/seat/month (pooled); NT$320 per 1,000 extra runs; bring your own model key | not launched |
 | **Enterprise** | quote, from about NT$650,000/year | on request |
 
+Self-improvement is in Core, paid models included: it uses a free local model by default, and a paid one once you set a USD cap (`--daily-cost`). Team adds a shared review queue for patch proposals.
+
 Safety features are never paywalled. A run is one task end to end; a task over 20 model calls counts
 once more per 20; runs refused by policy are free.
 
