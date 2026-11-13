@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Site: "Why AIOS" comparison** (`#compare` on the product page): AIOS next to OpenFang, OpenClaw,
+  OpenHands, Letta and the Rutgers research AIOS on isolation, injection defence (measured 0/27),
+  audit, multi-machine, self-improvement, chat platforms, local models and price, with an honest
+  note on where the others lead.
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the

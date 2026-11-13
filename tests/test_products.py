@@ -46,8 +46,12 @@ class ProductTests(unittest.TestCase):
                 self.assertIn(item, price_list)
             self.assertLess(page.index('id="pricing"'), page.index('id="about"'))
             self.assertIn('href="#pricing"', page.split("</header>", 1)[0])
-            for anchor in ("pricing", "evolve", "bot", "office", "multi", "new"):
+            for anchor in ("pricing", "compare", "evolve", "bot", "office", "multi", "new"):
                 self.assertIn(f'id="{anchor}"', page)
+            compare = page.split('id="compare"', 1)[1].split("</section>", 1)[0]
+            for name in ("OpenFang", "OpenClaw", "OpenHands", "Letta", "0/27", "NT$490"):
+                self.assertIn(name, compare)
+            self.assertIn('href="#compare"', page.split("</header>", 1)[0])
             for src in ("img/office-3d.webp",):
                 self.assertIn(f'src="{src}"', page)
                 self.assertTrue((out / src).is_file(), src)
