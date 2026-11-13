@@ -12,6 +12,17 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 
 「不綁特定模型」：可用 Anthropic，或任何相容 OpenAI 的伺服器，包括本機模型（見下方「模型供應商」）。
 
+## 0.2.0 之後的新功能
+
+- **自我進化，即時生效**（`aios improve`）：代理從自己的執行紀錄學到心得；新版心得手冊要在你的評測上表現不輸才上線，變差就自動退回。改程式碼、改政策一律要人批准。
+- **自己監督自己**（`aios supervisor`）：守護程式會自己暫停一直失敗或疑似被注入的任務、扣住有風險的代理，只有人能解除。
+- **代理當聊天機器人**（`aios bot`）：在 Telegram 聊天室標記代理，它就在串裡回答，每次都是受污染、有上限的執行。
+- **3D 辦公室**（控制台 → Office）：看代理工作、在洽談區互相對話、在會議室開會討論。
+- **預設本機模型改為 Gemma 4**（`gemma4:e4b`，Apache 2.0）；在有防護的設定下，27 種提示注入攻擊沒有一種成功。
+- **固定模型權重**（`--model-digest`）：本機模型的摘要一旦改變，就不會被呼叫。
+- **每台機器各自的節點 token**（`aios node-keys`、`swarm --node-keys`）：每台 worker 一個 token，可以只撤銷其中一台。
+- **針對 2026 年 10–11 月代理安全事件的強化**：審計日誌遮蔽憑證、會放鬆監督的心得與技能會標記出來等人確認，Windows 路徑花招（結尾的點、`:` 資料流、大小寫）不再能繞過範圍規則。
+
 ## 0.2.0 新功能
 
 - **代理群可分散到多台機器**：`aios swarm --nodes` 讓這台機器成為叢集的 head，其他機器執行 `aios node --head URL` 加入成為 worker。worker 主動拉任務，不必開 port；沉默的 worker 手上的任務會改派給別台；每次呼叫都要 `$AIOS_NODE_TOKEN`，head 對其他機器開放時必須用 TLS。見[代理群（Swarm）](#代理群swarm)。
@@ -42,7 +53,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **人工審批**：`write_file`、`run_python` 與所有 MCP 工具執行前都會詢問 `[y/N]`。沒有設定審批者時（例如 `demo`、當函式庫使用）這些工具會被拒絕。`--auto-approve` 可關閉詢問，不安全。
 - **不可信內容標記＋污染政策**：`read_file`、`view_file`、`list_files`、`run_python` 與所有 MCP 工具的輸出，以及你用 `/attach` 附加的檔案，都會用 `<untrusted>` 標籤包起來（內容裡偽造的結束標籤會被拆除），並在系統提示詞要求模型絕不服從其中的指令。只要這類內容還在上下文裡，這次執行就算「被污染」：`--auto-approve` 不再生效、每次高風險呼叫都必須有人在提示前確認（並顯示警告），`remember` 也需要審批，避免注入的文字悄悄污染記憶。
 - **參數來源追蹤**：被污染的執行裡，AIOS 還會檢查高風險呼叫的*每個參數是從哪裡來的*。如果某個參數重複了不可信內容（工具結果裡出現過、但你從沒打過的約 30 個字元，或網址的主機名稱），這次呼叫就不適用任何 `auto_args`、`auto_paths` 或 `auto_when_tainted` 規則：必須由人核准，而且提示（終端機、控制台或 Telegram）會顯示 `!! copied from untrusted content: url <- fetch_url`。這項檢查會以 `(provenance)` 寫進審計日誌，並發出 `untrusted-args` 警示。它看的是來源而不是語意，所以結果是確定的：模型改寫過的值抓不到，這也是被污染的執行預設仍要有人核准高風險呼叫的原因。
-- **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。
+- **能力範圍（scopes）**：除了工具名稱，還能限制工具只能碰哪些工作區路徑（`paths`）、哪些安全路徑在乾淨執行時免詢問（`auto_paths`）、每次執行最多呼叫幾次（`max_calls`）。參數規則（`args`）可用萬用字元樣式與長度上限，允許或拒絕任何參數的值，MCP 工具因此不再是全有或全無（例如只能抓 `https://docs.python.org/*` 的 fetch 工具）；`auto_args` 則像 `auto_paths` 一樣，讓預先核可的值免詢問。可在程式中設定（`Agent(..., scopes=...)`），或用 TOML：`--policy policy.example.toml`（需要 Python 3.11+）。政策檔打錯字會直接報錯，而不是默默放行。任何一段結尾有點或空白、或含 `:`（NTFS 資料流）的路徑，不符合任何 `paths`／`auto_paths` 規則，因為 Windows 實際開啟的檔名會和規則看到的不同；在 Windows 上規則也像 NTFS 一樣不分大小寫。
 - **速率限制**（移植自 [agent-bastion](https://github.com/tonythetiger168/agent-bastion)）：政策中的代理可以在滑動時間窗內限制模型呼叫與工具呼叫次數，例如 `[agents.reporter.rate]` 底下寫 `model = "30/min"` 與 `tools = { "*" = "200/hour", fetch_url = "10/min" }`（單位為 `s`、`min`、`hour`、`day`，可加倍數如 `5/30s`；符合的工具限制全部都要遵守）。和 `max_calls` 不同，它跨越多次執行：次數記在 `aios.db`，所以同一代理的所有對話、定時任務、協作代理與 `serve`/`a2a-serve` 連線共用同一額度，跨程序、重新啟動後也不會歸零。超過限制的工具呼叫會被拒絕（狀態 `denied`，並告知多久後可重試）；超過限制的模型呼叫最多等 60 秒，等不到就停止這次執行，狀態為 `rate`。
 - **記憶來源標記**：每條記憶都記錄是誰寫的（`user` 你親自寫入、`model` 模型保存、`tainted` 在讀過不可信內容的執行中保存）與時間。被污染的記憶會以「未驗證」呈現給模型，而看到這種記憶的執行（不論是在提示詞裡，或透過 `recall`、`list_facts`、`search_memory` 讀到）本身也視為受污染：在你用 `aios memory confirm` 確認該記憶之前，不會自動放行高風險呼叫；你用 `/remember` 親自設定的記憶，模型無法覆蓋；記憶內容裡的換行無法偽造系統提示詞的額外行。舊版 `aios.db` 會自動升級。
 - **需要時自動帶入的記憶**（`recall_on`）：在代理的政策裡設定 `recall_on = ["read_file", "web__*"]` 後，每次呼叫這些工具，AIOS 會在結果後面附上最多 3 條和這次呼叫相關（依參數與結果開頭比對）、而且還不在提示詞裡的記憶，記憶很多的代理不必自己想到要搜尋。每條記憶在一次執行中只附一次，標示方式與提示詞相同（未驗證的記憶會讓這次執行受污染），每次附加都以 `(recall)` 寫入審計日誌。預設關閉。
@@ -51,7 +62,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **多代理協作**：政策檔裡的每個代理，都能透過名為 `agent__<名稱>` 的工具接手子任務，授權方式和其他工具一樣（`permissions = ["agent__notes"]`）。接手的代理用**自己的**權限、範圍與記憶工作，每個子任務都從空白開始（不保存歷史），並沿用呼叫者的預算。委派無法用來「洗白」提示注入：呼叫者讀過不可信內容時，接手的代理一開始就被視為被污染（沒有自動核准、`auto_paths` 失效），它的回覆也會被標記為不可信。循環委派會被拒絕，深度最多 2 層。`chat` 與 `daemon` 任務都能使用。呼叫者也可以縮小幫手拿到的權限：在呼叫者設定 `narrow = true`，幫手只保留呼叫者自己也有的工具；`[agents.lead.delegate] writer = ["write_file"]` 則把某個幫手限制在清單內。這些上限會沿著委派鏈往下傳（幫手再找的幫手也受限），所以委派只會縮小一個請求能做的事，不會擴大。
 - **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。`run_python` 的 Docker 與 microVM 沙箱只有在記憶體上限放得進主機的可用記憶體時才會啟動（Linux 讀 `MemAvailable`，Windows 讀可用實體記憶體；保留 512 MiB，`AIOS_SANDBOX_RESERVE_MB` 可調），其餘的會排隊等候，而不是把主機推進 swap 或觸發 OOM killer（`AIOS_SANDBOX_MAX` 限制同時數量，`AIOS_SANDBOX_WAIT` 是最長等待秒數，預設 300）。`aios doctor` 會顯示能同時放幾個。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
-- **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。
+- **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。掃描器也會對叫代理關掉監控、hooks 或檢查的指示回報 `loosens-oversight`。
 - **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
 - **代理當聊天機器人**：`python aios.py bot` 把一個政策代理放進 Telegram、Discord 或 LINE 聊天室（`--platform`）。在某則訊息底下標記它（`@your_bot 這是真的嗎？`）、用 `/ask`，或回覆它的回答，它就會在串裡回覆，並把那則訊息和先前的對話當成上下文，就像社群媒體上可以標記的 AI 助理（見下）。聊天室成員都是陌生人：每個問題都是全新、被污染的一次執行，預設只能用唯讀工具，並有每人與每日上限。
@@ -59,7 +70,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **3D 辦公室**（控制台 → Office）：每個代理都是辦公室裡的一個人，會依照它此刻在做的事（從審計日誌、審批、暫停與任務讀出）走到對應的地方：工作時坐在自己的辦公桌，用記憶或上網時在圖書室，跑程式碼或 MCP 工具時在機房；**兩個代理互相對話**（`agent__<name>`／`a2a__<name>`）時一起到**洽談區**，頭上會有對話泡泡顯示說了什麼；**三個以上一起討論**（`swarm`，或一連串的轉交）時到**會議室**；**大廳**有接待櫃台、代理排隊等你核准的審批櫃台，以及即將執行的任務坐的等候區；被監督者暫停或剛被規則拒絕時在保全室，閒置時在茶水間。可拖曳旋轉、滾輪縮放、點一個人看它正在做什麼。這是控制台唯一有 JavaScript 的頁面：它的 CSP 只允許控制台自己固定的腳本，腳本只讀 `/office.json`，所有名字與訊息都以文字繪製（canvas／`textContent`），從不當成 HTML。沒有 JavaScript 時，頁面會以表格顯示同樣的內容。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
 - **提示注入測試集**：`python tests/test_injection.py --report` 會印出各種防護下哪些攻擊能得逞（見下表）。
-- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。
+- **審計日誌**（SQLite，程式介面只能新增）：每次工具呼叫都會記錄代理、工具、參數、結果與狀態（`ok` / `error` / `denied`），用 `/audit` 查看。每筆紀錄以雜湊串成鏈，`python aios.py audit --verify` 查得出被修改、刪除或插入的紀錄，守護程式的看門狗也會每次 tick 檢查。守護程式還能把每筆紀錄複製到日誌收集端（`--audit-sink URL`），並把鏈頭存到別處的檔案（`--anchor FILE`），連整條鏈被重算也抓得到（見「aios.db 以外的副本」）。機密不會寫進日誌：鍵名像機密的參數（`password`、`token`、`api_key` 等），以及長得像已知憑證的值（GitHub、OpenAI、Anthropic、AWS、Slack、Google、GitLab、Hugging Face 的 token 與 PEM 私鑰），不論在參數或工具結果裡，都會在計算雜湊前存成 `[redacted]`；工具本身仍拿到真正的參數。
 - **匯出給外部掃描器**：`python aios.py export --agent main > main.json` 會把代理保存的對話寫成 OpenAI 格式的聊天 JSON（含 `tool_calls` 的 user／assistant、工具結果，不可信輸出仍保留標籤，圖片略過），這是代理安全掃描器與 LLM 評審常讀的格式（例如 Cisco 開源的 Project Quarry）。改用 `--from-audit -n 5` 則從審計日誌重建最近幾次執行，不保存歷史的定時任務、幫手與 A2A 執行也能檢查（被拒絕的呼叫也在內，並附狀態）。完全離線，不會送出任何東西。
 - **測試**：`python -m unittest discover -s tests -v`（只用標準函式庫，不需要 API key）；CI 在 Linux 與 Windows 上執行。
 - **CLI**：互動式對話，支援 `/attach <檔案>`、`/detach`、`/facts`、`/search <words>`、`/remember <key> <value>`、`/forget <key>`、`/audit`、`/summary`、`/reset`、`/quit`。
@@ -304,7 +315,7 @@ python aios.py improve loop --agent notes --agent reporter --cases evals.jsonl -
 
 - **心得從哪來**：審計日誌裡的統計（哪個工具被拒、失敗或重複呼叫，執行怎麼結束），從不取用工具輸出，所以攻擊者埋的文字不會變成心得。`--use-model` 會讓模型依這些統計寫心得。被授予 `suggest_lesson` 的代理可以自己加一條；讀過不可信內容後提出的心得會標記為受污染。
 - **把關**：候選版本會和目前版本一起，在 `aios.db` 與工作區的拋棄式副本上跑你的評測任務（你的記憶、審計、速率計數和檔案都不會變；沒人回答提示，所以高風險呼叫除非政策預先允許，否則會被拒）。只有通過的案例不少於、錯誤工具呼叫不多於目前版本，才會採用。目前版本的分數按評測檔快取，不會重複花錢。
-- **一定要人決定的**：受污染的候選，以及提到權限、政策、審批、沙箱、審計、範圍等的心得。它們會等 `aios improve adopt`。
+- **一定要人決定的**：受污染的候選，以及提到權限、政策、審批、沙箱、審計、範圍等，或會放鬆監督（監控、告警、看門狗或監督者、hooks、`--no-verify`、`--force`、跳過測試或檢查）的心得。它們會等 `aios improve adopt`。
 - **健康檢查**：新版本跑了 5 次之後，如果失敗率明顯高於之前，就會自動退回並發出 `improve-rollback` 警示（`aios improve check` 可手動執行；循環每輪都會做）。
 - **花費**：自上一輪以來沒有新狀況的那一輪不呼叫模型。評測只用免費模型（本機的模型伺服器，例如 Ollama），除非你用 `--daily-cost` 和 `--price-in/--price-out` 設了美元上限；用付費模型又沒設上限時，該輪只從審計日誌提出候選、跳過評測。`--daily-tokens`（預設每 24 小時 50,000，0 = 不限）用完時循環會暫停並發出 `improve-paused` 警示。
 - **永遠改不了的**：心得手冊只是提示文字，不授予任何工具、路徑或參數，不管它寫什麼，AIOS 都照樣執行政策、範圍、審批與審計。被授予 `propose_patch` 的代理可以對一個 AIOS 程式碼或政策檔提交 unified diff；`aios improve patches` 列出它們，只有人能用 `aios improve approve-patch N` 套用（`--check "python -m unittest discover -s tests"` 指定自己的健康檢查；預設：編譯或解析該檔並 import aios）。檢查失敗就立刻撤回修補。正在執行的 AIOS 程序要重新啟動才會載入套用後的程式碼。每次採用、退回與修補決定都以代理 `improve` 記在審計日誌。
