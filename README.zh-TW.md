@@ -63,9 +63,9 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 - **代理群（Swarm）**：用 `swarm` 工具或 `aios swarm` 一次把上百個子任務交給幫手代理，有 worker 池、全行程的模型呼叫並行上限、共享的 token／成本預算與每個任務的逾時，並可由彙整代理合併結果；可在一台機器上跑，也可分散到多台（`aios node`）。權限、審批、污染標記與審計和單次委派完全相同（見下方）。`run_python` 的 Docker 與 microVM 沙箱只有在記憶體上限放得進主機的可用記憶體時才會啟動（Linux 讀 `MemAvailable`，Windows 讀可用實體記憶體；保留 512 MiB，`AIOS_SANDBOX_RESERVE_MB` 可調），其餘的會排隊等候，而不是把主機推進 swap 或觸發 OOM killer（`AIOS_SANDBOX_MAX` 限制同時數量，`AIOS_SANDBOX_WAIT` 是最長等待秒數，預設 300）。`aios doctor` 會顯示能同時放幾個。
 - **其他機器上的代理（A2A）**：用 `aios a2a-serve` 把代理開放給其他 A2A 代理，或把遠端代理當成 `a2a__<名稱>` 工具呼叫（見下）。陌生人的請求一律以被污染狀態執行，只能用政策授權的工具（預設唯讀），並有預算上限。
 - **技能：摘要固定與掃描**，採用開放的 Agent Skills `SKILL.md` 格式：`aios skills scan|trust|list|untrust|sign|publish|search|install`，可選的發布者簽章、靜態技能註冊中心、`chat --skill <資料夾>`（見下）。掃描器也會對叫代理關掉監控、hooks 或檢查的指示回報 `loosens-oversight`。
-- **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端（見下）。`python aios.py audit` 可在命令列查看審計日誌。
+- **MCP 伺服器模式**：`python aios.py serve` 把受管控的工具提供給任何 MCP 客戶端；加上 `--mcp` 還能保護其他 MCP 伺服器，讓別家 agent（OpenClaw、OpenHands……）只能透過 AIOS 的政策、核准與審計來使用它們（見下）。`python aios.py audit` 可在命令列查看審計日誌。
 - **用手機審批**：`python aios.py telegram` 會把守護程式、`serve` 與 `swarm`（`--approvals console`）的審批請求送到 Telegram 聊天室，附上 Approve／Deny 按鈕（見「定時任務」）。
-- **代理當聊天機器人**：`python aios.py bot` 把一個政策代理放進 Telegram 聊天室。在某則訊息底下標記它（`@your_bot 這是真的嗎？`）、用 `/ask`，或回覆它的回答，它就會在串裡回覆，並把那則訊息和先前的對話當成上下文，就像社群媒體上可以標記的 AI 助理（見下）。聊天室成員都是陌生人：每個問題都是全新、被污染的一次執行，預設只能用唯讀工具，並有每人與每日上限。
+- **代理當聊天機器人**：`python aios.py bot` 把一個政策代理放進 Telegram、Discord 或 LINE 聊天室（`--platform`）。在某則訊息底下標記它（`@your_bot 這是真的嗎？`）、用 `/ask`，或回覆它的回答，它就會在串裡回覆，並把那則訊息和先前的對話當成上下文，就像社群媒體上可以標記的 AI 助理（見下）。聊天室成員都是陌生人：每個問題都是全新、被污染的一次執行，預設只能用唯讀工具，並有每人與每日上限。
 - **本機 Web 控制台**（`python aios.py console`）：在瀏覽器以唯讀方式查看審計日誌（可依代理、工具、狀態篩選）、被拒絕的呼叫、任務與執行紀錄、各代理的記憶與寫入者，以及已信任的技能。它只聽 127.0.0.1、需要用它印出的一次性連結進入、以唯讀模式開啟資料庫，而且頁面不執行 JavaScript（下面的 3D 辦公室除外，它從不把日誌文字當成 HTML），所以攻擊者藏在日誌裡的文字無法在你的瀏覽器中作怪。加上 `--approve` 時，也可以在瀏覽器回答守護程式與 `serve` 的審批請求（見「定時任務」）。
 - **3D 辦公室**（控制台 → Office）：每個代理都是辦公室裡的一個人，會依照它此刻在做的事（從審計日誌、審批、暫停與任務讀出）走到對應的地方：工作時坐在自己的辦公桌，用記憶或上網時在圖書室，跑程式碼或 MCP 工具時在機房；**兩個代理互相對話**（`agent__<name>`／`a2a__<name>`）時一起到**洽談區**，頭上會有對話泡泡顯示說了什麼；**三個以上一起討論**（`swarm`，或一連串的轉交）時到**會議室**；**大廳**有接待櫃台、代理排隊等你核准的審批櫃台，以及即將執行的任務坐的等候區；被監督者暫停或剛被規則拒絕時在保全室，閒置時在茶水間。可拖曳旋轉、滾輪縮放、點一個人看它正在做什麼。這是控制台唯一有 JavaScript 的頁面：它的 CSP 只允許控制台自己固定的腳本，腳本只讀 `/office.json`，所有名字與訊息都以文字繪製（canvas／`textContent`），從不當成 HTML。沒有 JavaScript 時，頁面會以表格顯示同樣的內容。
 - **記憶檢索**：`search_memory` 工具與 `/search` 可用關鍵字（BM25，純 Python，支援中文）搜尋記憶。加上 `--embed-model nomic-embed-text`（任何 OpenAI 相容的 `/embeddings` 伺服器，例如 Ollama）後，也能依語意比對，兩種排名會合併。記憶超過 30 條時，提示詞只放與這次任務相關的，其餘讓模型用 `search_memory` 去查。
@@ -80,7 +80,7 @@ Agent 需要一層類似作業系統的基礎：誰能呼叫哪個工具、記�
 需要 Python 3.11 以上與 [Anthropic API key](https://platform.claude.com/settings/keys)（或下方的本機模型）。可以在原始碼目錄裡用 `python aios.py` 執行，也可以安裝成 `aios` 指令（只用標準函式庫；extras 會另外裝 Anthropic SDK 與 MCP SDK）：
 
 ```bash
-pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # 之後：aios chat、aios doctor……
+pip install "aios-os[all] @ git+https://github.com/tonythetiger168/aios-core"   # 之後：aios chat、aios doctor……
 ```
 
 在原始碼目錄裡：
@@ -280,6 +280,20 @@ python aios.py memory archived              # 不會遺失：memory restore <代
 - tidy 會把舊的未驗證記憶移到封存而不是刪除，也絕不動你或模型寫的記憶。它還會丟掉記憶已改變或已不存在的快取向量（需要時會重建），並列出不同鍵下內容相同的記憶，但不修改它們。
 - restore 會把記憶以「未驗證」狀態放回；若該鍵已有較新的記憶則拒絕。整個過程不使用模型：決定代理要繼續相信什麼，正是注入的記憶最想影響的事。
 
+**閒置時整理記憶（sleep-time）。** 代理的記憶會越積越多、互相重疊。AIOS 可以把它們整理成更少、更清楚的筆記，但只會提出建議，由你接受：
+
+```bash
+python aios.py memory consolidate                                       # 免費：只找完全重複的記憶
+python aios.py memory consolidate --provider openai --model gemma4:e4b  # 本機模型也會建議合併
+python aios.py memory proposals                                         # 等你決定的建議
+python aios.py memory accept 3                                          # 或：memory reject 3
+python aios.py daemon ... --consolidate-every 24                        # 沒有任務在跑時自動進行
+```
+
+- 你接受之前什麼都不會改。接受後舊記憶會移到封存（隨時可以還原），合併後的記憶算是你的。建議提出後若有記憶被改過，該建議會因過期被拒絕。
+- 未驗證的記憶絕不會給模型看，也絕不合併：請先檢查它們。模型的建議會先經過檢查（不能覆蓋其他記憶、合併後不能比原本的還長）才會交給你。
+- 守護程式只有在使用本機 `--provider openai` 伺服器時才會用模型來做這件事，所以閒置整理絕不花錢；否則只建議完全重複的記憶。有新建議時會發出 info 告警（`aios status`、Telegram）。
+
 ## 還原一次執行
 
 `write_file` 建立或覆寫檔案之前，AIOS 會把原本的內容存進 `aios.db`。`aios undo` 可以把工作區還原成某次執行之前的樣子：
@@ -391,6 +405,18 @@ MCP 客戶端設定（Claude Desktop 的 `claude_desktop_config.json` 所用的�
 - `max_calls` 以伺服器連線為單位計算。所有資料都放在 `--home` 底下（`aios.db`、`workspace/`）。
 - **狀態**：支援官方 `mcp` SDK 1.x 與 2.x，也支援 MCP 2026-07-28 客戶端（無狀態：以 `server/discover` 取代 `initialize`；AIOS 這邊需要 `mcp` 2.3+）。CI 會用 SDK 自己的 stdio 客戶端驅動 `aios serve`（初始化、列出、呼叫、拒絕、稽核），兩個版本都測，最新 SDK 上另外用 2026-07-28 客戶端測，也會讓 aios 連上真正的 SDK 伺服器。尚未用 Claude Desktop 或其他圖形介面客戶端試過：如果你的客戶端連不上或列不出工具，請開 issue 並附上 stderr 輸出。
 
+**保護別家 agent（OpenClaw、OpenHands、Claude Desktop……）。** `serve` 也接受和 `chat` 相同的 `--mcp`、`--confine-mcp`、`--offline-mcp`、`--mcp-egress` 參數。讓別家 agent 改連 AIOS，而不是直接連它的 MCP 伺服器，AIOS 就擋在中間：那個 agent 只看得到政策允許的工具（`permissions = ["fs__*"]`），每次呼叫都要經過範圍、核准、污染標記、速率限制與審計日誌，伺服器本身也被關在受限環境裡。
+
+```bash
+python aios.py serve --home ~/aios-data --agent outside --policy policy.toml \
+    --mcp "fs=npx -y @modelcontextprotocol/server-filesystem /home/me/project" --confine-mcp fs \
+    --approvals console          # 在 `aios console --approve` 或 Telegram 上回答它的高風險呼叫
+```
+
+- MCP 工具一律需要範圍（`auto_args`）或有人核准：沒人看著時會被拒絕，絕不會偷偷執行。
+- 只有經過 AIOS 的動作受到保護：請關掉那個 agent 自己的 shell 與檔案工具（或把它放在沒有這些工具的容器裡），讓 AIOS 成為它唯一能做事的管道。
+- 那個 agent 做過的每件事都在 `aios audit`／控制台裡，記在 `--agent` 的名稱底下。
+
 ## 與其他代理對話（A2A）
 
 [A2A](https://a2a-protocol.org) 讓不同廠商的代理可以互相呼叫。aios 支援目前使用中的兩個版本 1.0 與 0.3（JSON-RPC），並已用官方 `a2a-sdk` 雙向驗證過。
@@ -410,7 +436,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 - **推播通知**預設關閉，要先指定可以推播到哪裡：`a2a-serve --push-to 'https://hooks.example.com/a2a/*'`（可重複；固定的 `http(s)://主機/` 加上路徑樣式）。之後呼叫方可以替任務登記網址（`CreateTaskPushNotificationConfig` / `tasks/pushNotificationConfig/set`，或寫在送出訊息的 `configuration` 裡）。任務結束時（完成、失敗、被拒或取消），完整任務會 POST 到該網址一次。`token` 放在 `X-A2A-Notification-Token` 標頭，`authentication` 放在 `Authorization`。不符合樣式的網址會被拒絕。主機名稱必須只解析到公開位址，而且 POST 只會連到檢查過的那個位址。要送到本機或內網服務，請在樣式裡直接寫它的位址（或 `localhost`）。不跟隨轉址；token 或憑證除了送往本機以外，絕不經由明文 `http` 傳送。每個任務最多 4 組設定；Get/List 不會回傳憑證。已用官方 a2a-sdk 客戶端驗證兩個版本。
 - 尚未支援：檔案。
 
-## 代理當聊天機器人（Telegram）
+## 代理當聊天機器人（Telegram、Discord、LINE）
 
 讓大家在原本就在用的地方跟代理說話：在群組裡的貼文底下標記它，它就在串裡回答，就像社群媒體上可以標記的 AI 助理。
 
@@ -426,6 +452,22 @@ python aios.py bot --policy policy.example.toml --agent researcher --allow-chat 
 - **安全**：跟 A2A 一樣，聊天室裡每個人對代理來說都是陌生人。每個問題都是政策代理全新的一次執行，從一開始就被污染，也沒有人能核准：需要核准的工具會被拒絕，`auto_paths`／`auto_args` 永遠不適用。沒有 `--policy` 時只能用唯讀工具。回答一律是純文字，不會被當成 Markdown／HTML 解析。每次執行都以代理名稱記在審計日誌。
 - **費用**：每個回答有上限（預設 20,000 tokens，`--max-tokens`），每人每小時最多 `--per-user N` 個回答（預設 20），所有聊天室共用每日預算（預設 200,000 tokens；`--daily-max-tokens`／`--daily-max-cost`）。用完時機器人會直接說明，不會再呼叫模型。用本機模型完全不花錢。
 - 聊天內容會送到你選的模型：私密的聊天請用本機模型。`--parallel N` 同時回答 N 個問題（預設 2），`--timeout` 限制單一回答的時間（預設 300 秒）。對話串只記在記憶體裡（最近 2000 個回答），重新啟動就忘記。只用標準函式庫。
+
+**Discord 與 LINE。** 同一個機器人可以用 `--platform` 跑在其他平台；上面的規則（何時回答、看得到什麼、安全、費用）完全相同。
+
+```bash
+export AIOS_DISCORD_TOKEN=...          # Developer Portal > 你的 app > Bot（邀請時給 Send Messages + Read Message History 權限）
+python aios.py bot --platform discord --policy policy.example.toml --agent researcher --allow-chat 1234567890 \
+    --provider openai --model gemma4:12b
+
+export AIOS_LINE_TOKEN=... AIOS_LINE_SECRET=...   # LINE Developers > Messaging API channel
+python aios.py bot --platform line --policy policy.example.toml --agent researcher --allow-chat C0123... \
+    --provider openai --model gemma4:12b
+cloudflared tunnel --url http://127.0.0.1:8790    # 再到 LINE Developers 把 Webhook URL 設成 https://<tunnel>/line
+```
+
+- **Discord**：`--allow-chat` 填頻道 id（開啟開發者模式 > 在頻道上按右鍵 > 複製頻道 ID）。它用標準函式庫寫的 WebSocket 連到 gateway，除非用了 `--context`（那時要開 Message Content Intent），否則不需要特權 intent。回答一律以回覆送出，而且關閉提及，所以模型寫的任何內容都無法 ping `@everyone`、身分組或任何人。會使用 `$HTTPS_PROXY`。
+- **LINE**：LINE 是呼叫 webhook，所以機器人在 `127.0.0.1:--port`（預設 8790）上聽，再用通道（tunnel）對外公開。每個呼叫都必須帶正確的 `X-Line-Signature`（用 channel secret 算的 HMAC），否則回 401。聊天室 id 是群組 `C...`、多人聊天 `R...` 或使用者 `U...`；還沒允許的聊天室會把 id 印在日誌裡方便複製。回答用免費的 reply API 並引用原問題；超過 reply token 壽命（約一分鐘）的回答改用 push API 送出，會算進官方帳號每月的訊息額度（加 `--no-push` 就改成丟棄）。
 
 ## 代理群（Swarm）
 
@@ -603,13 +645,13 @@ AIOS 與傳統作業系統機制（排程、記憶體、保護、資訊流、隔
 |---|---|---|---|
 | **P0 打底** | 第 1 月 | 自動化測試 · 審計日誌 · 高風險工具人工批准 · 成本／步數預算 · 模型供應商抽象層（含本機模型） | 每個動作可追溯，超出預算會中止 |
 | **P1 安全核心** | 第 1–2 月 | ✅ 能力範圍（路徑、呼叫上限、參數規則）· ✅ 不可信內容標記＋污染政策 · ✅ 提示注入測試集 · ✅ 記憶來源與時間標記 · ✅ 技能固定、掃描與 OpenSSH 發布者簽章 · ✅ 記憶檢索（BM25 關鍵字，向量為選用）· ✅ 作為 MCP 伺服器運行（`aios serve`；已用官方 SDK 客戶端驗證，1.x 與 2.x）· ✅ 迴圈保護（`--max-repeats`）· ✅ 工作區還原（`aios undo`） | 通過自建的提示注入測試集（最壞情況模型已達成）；P1 功能已齊全，真實環境測試仍待進行 |
-| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ 聊天機器人（`aios bot`：在 Telegram 標記代理，它在串裡回覆）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批與 3D 辦公室）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
+| **P2 擴展** | 第 3–4 月 | ✅ 多代理委派（`agent__<名稱>`）· ✅ 代理群（`swarm`、`aios swarm`：共享上限下的高並發，`--workers` 可用多核心，`--nodes` + `aios node` 可跨多台機器，`transfer = true` 的執行可在節點間搬移）· ✅ 聊天機器人（`aios bot`：在 Telegram、Discord、LINE 標記代理，它在串裡回覆）· ✅ A2A（提供與呼叫代理，支援 1.0 與 0.3，多輪對話、串流與重新訂閱、背景任務與取消、推播通知）· ✅ 排程（`aios jobs`／`daemon`）· ✅ 檔案變動與 webhook 觸發 · ✅ 本機 Web 控制台（含瀏覽器審批與 3D 辦公室）· 可插拔沙箱後端（✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM，只以其專屬 CI job 驗證）· ✅ 多模態輸入（圖片與 PDF：`/attach`、`view_file`、MCP 截圖）· ✅ 自我改進（`aios improve`：評測把關的心得手冊、即時生效、可退回）· ✅ 自我監督（`aios supervisor`：自行暫停／扣住，只有人能解除） | 一行指令跑多 agent；Windows 也有真隔離 |
 | **P3 生態** | 第 6–9 月 | ✅ 簽章驗證的技能註冊中心（發布者簽章、靜態 `index.json` 註冊中心、`publish`／`search`／`install`）· ✅ 公開註冊中心（Cloudflare Pages，由 `registry/` 建置）· 可選的託管版本 | 有外部貢獻者提交技能 |
 | **P4 OS 層** | 第 12 月後 | WSL 映像／Linux 發行版 · 系統服務化 · 手機伴侶 App | 視前面成果再決定 |
 
 明確的非目標：現階段不寫真正的 OS 核心。
 
-套件發布備註：PyPI 上的 `aios-core` 名稱已被 [agiresearch/AIOS](https://github.com/agiresearch/AIOS) 使用（2024-11 起），因此要上架 PyPI 必須換一個套件名稱。在那之前，請照上面的方式從 GitHub 安裝。
+套件發布備註：PyPI 上的套件名稱是 **`aios-os`**（`pip install "aios-os[all]"`，指令仍然是 `aios`），因為 PyPI 上的 `aios-core` 屬於 [agiresearch/AIOS](https://github.com/agiresearch/AIOS)。設定好 PyPI 的 trusted publishing 後，每個新版本都會由發行流程自動上架（見 `.github/workflows/release.yml`）；第一次上架之前，請照上面的方式從 GitHub 安裝。
 
 詳細追蹤（差距盤點、逐項狀態、甘特圖）：[`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx)。
 

@@ -63,9 +63,9 @@ Full list in [CHANGELOG.md](CHANGELOG.md); a self-audit against classical OS mec
 - **Agent swarms**: hand hundreds of sub-tasks to helper agents at once with the `swarm` tool or `aios swarm`, under a worker pool, a process-wide limit on model calls in flight, a shared token/cost budget and per-task timeouts, optionally combined by a reducer agent, on one machine or spread over several (`aios node`). Same permissions, approvals, taint and audit as one delegation (see below). Docker and microVM sandboxes for `run_python` start only while their memory limits fit in the host's free memory (`MemAvailable` on Linux, Windows' free physical memory; 512 MiB kept in reserve, `AIOS_SANDBOX_RESERVE_MB`); the rest wait their turn instead of pushing the host into swap or its OOM killer (`AIOS_SANDBOX_MAX` caps the count, `AIOS_SANDBOX_WAIT` how long a call may wait, default 300 s). `aios doctor` shows how many fit.
 - **Agents on other machines (A2A)**: serve an agent to other A2A agents with `aios a2a-serve`, or call remote ones as `a2a__<name>` tools (see below). Strangers' requests always run tainted, with only the tools the policy grants (read-only by default) and a budget cap.
 - **Skills with digest pinning and a scanner**, in the open Agent Skills `SKILL.md` format: `aios skills scan|trust|list|untrust|sign|publish|search|install`, optional publisher signatures, a static skill registry, `chat --skill <folder>` (see below). The scanner also reports `loosens-oversight` for directives that tell an agent to turn off monitors, hooks or checks.
-- **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client (see below). `python aios.py audit` prints the audit log from the shell.
+- **MCP server mode**: `python aios.py serve` offers the governed tools to any MCP client, and with `--mcp` guards other MCP servers so another agent (OpenClaw, OpenHands, ...) can only use them through AIOS's policy, approvals and audit (see below). `python aios.py audit` prints the audit log from the shell.
 - **Approvals from your phone**: `python aios.py telegram` sends approval requests from the daemon, `serve` and `swarm` (`--approvals console`) to a Telegram chat with Approve/Deny buttons (see Scheduled jobs).
-- **Agents as chat bots**: `python aios.py bot` puts a policy agent in Telegram chats. Tag it under a message (`@your_bot is this true?`), use `/ask`, or reply to its answer, and it replies in the thread with that message and the earlier exchange as context, like the assistants you can tag on social media (see below). Chat members are strangers: every question is a fresh tainted run, read-only by default, with per-person and daily limits.
+- **Agents as chat bots**: `python aios.py bot` puts a policy agent in Telegram, Discord or LINE chats (`--platform`). Tag it under a message (`@your_bot is this true?`), use `/ask`, or reply to its answer, and it replies in the thread with that message and the earlier exchange as context, like the assistants you can tag on social media (see below). Chat members are strangers: every question is a fresh tainted run, read-only by default, with per-person and daily limits.
 - **Local web console** (`python aios.py console`): a read-only browser view of the audit log (filter by agent, tool, status), refusals, jobs and their runs, each agent's notes with who wrote them, and trusted skills. It listens on 127.0.0.1 only, needs the one-time link it prints, opens the database read-only and runs no JavaScript (except the 3D office below, which never turns log text into HTML), so text an attacker planted in the log cannot act in your browser. With `--approve` it also answers approval requests from the daemon and `serve` (see Scheduled jobs).
 - **3D office** (console → Office): every agent is a person in an office, and walks to the place that matches what it is doing right now, read from the audit log, approvals, holds and jobs: its desk while it works, the library for memory and the web, the server room for code and MCP tools, the **talk lounge** when two agents talk to each other (`agent__<name>` / `a2a__<name>`, with speech bubbles of what they said), the **meeting room** for a discussion of three or more (a `swarm`, or a chain of hand-offs), the **lobby** (reception, the approval counter where agents queue for your answer, and a waiting area for jobs due soon), the security office when held by the supervisor or just refused, and the break room when idle. Drag to turn it, scroll to zoom, click someone to read what they are doing. It is the only console page with JavaScript: its CSP allows only the console's own fixed script, which reads `/office.json` and draws every name and message as text (canvas/`textContent`), never as HTML. Without JavaScript the page shows the same as a table.
 - **Memory search**: the `search_memory` tool and `/search` find notes by keywords (BM25, pure Python, works for Chinese too). With `--embed-model nomic-embed-text` (any OpenAI-compatible `/embeddings` server, e.g. Ollama) it also matches by meaning; the two rankings are fused. With more than 30 notes the prompt shows only the ones relevant to the task, and the model uses `search_memory` for the rest.
@@ -80,7 +80,7 @@ Full list in [CHANGELOG.md](CHANGELOG.md); a self-audit against classical OS mec
 Requires Python 3.11+ and an [Anthropic API key](https://platform.claude.com/settings/keys) (or a local model, below). Run it from a checkout as `python aios.py`, or install the `aios` command (standard library only; the extras add the Anthropic SDK and the MCP SDK):
 
 ```bash
-pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # then: aios chat, aios doctor, ...
+pip install "aios-os[all] @ git+https://github.com/tonythetiger168/aios-core"   # then: aios chat, aios doctor, ...
 ```
 
 From a checkout:
@@ -280,6 +280,20 @@ python aios.py memory archived              # nothing is lost: memory restore <a
 - Tidy moves old unverified notes to an archive instead of deleting them, and never touches your notes or the model's. It also drops cached vectors whose note changed or is gone (they are rebuilt on demand), and lists notes with the same text under several keys without changing them.
 - Restore puts the note back as unverified, and refuses if a newer note with that key exists. No model is involved: deciding what an agent keeps believing is what an injected note would like to influence.
 
+**Consolidating while idle (sleep-time).** Agents pile up overlapping notes. AIOS can tidy them into fewer, clearer ones, but only as proposals you accept:
+
+```bash
+python aios.py memory consolidate                                       # free: exact duplicates only
+python aios.py memory consolidate --provider openai --model gemma4:e4b  # a local model also proposes merges
+python aios.py memory proposals                                         # what waits for you
+python aios.py memory accept 3                                          # or: memory reject 3
+python aios.py daemon ... --consolidate-every 24                        # by itself, when no job is running
+```
+
+- Nothing changes until you accept. Accepting archives the old notes (restore them any time) and writes the merged note as yours. A proposal whose notes changed since is refused as stale.
+- Unverified notes are never shown to the model and never merged: review them first. The model's suggestions are checked (no overwriting another note, no merged note longer than what it replaces) before they reach you.
+- The daemon uses a model for this only when its provider is a local `--provider openai` server, so idle consolidation never spends money; otherwise it proposes exact duplicates only. New proposals raise an info alert (`aios status`, Telegram).
+
 ## Undoing a run
 
 Before `write_file` creates or overwrites a file, AIOS saves what was there in `aios.db`. `aios undo` puts the workspace back the way it was before a run:
@@ -391,6 +405,18 @@ MCP client config (shape used by Claude Desktop's `claude_desktop_config.json`; 
 - `max_calls` counts per server session. All data lives under `--home` (`aios.db`, `workspace/`).
 - **Status**: works with the official `mcp` SDK 1.x and 2.x, and with MCP 2026-07-28 clients (stateless: `server/discover` instead of `initialize`; needs `mcp` 2.3+ on the AIOS side). CI drives `aios serve` with the SDK's own stdio client (initialize, list, call, refusals, audit) on both versions, plus a 2026-07-28 client on the latest SDK, and connects aios to a real SDK server. Not yet tried with Claude Desktop or other GUI clients: if yours does not connect or lists no tools, please open an issue with the stderr output.
 
+**Guard another agent (OpenClaw, OpenHands, Claude Desktop, ...).** `serve` takes the same `--mcp`, `--confine-mcp`, `--offline-mcp` and `--mcp-egress` flags as `chat`. Point the other agent at AIOS instead of at its MCP servers, and AIOS sits in between: the agent sees a server's tools only as the policy grants them (`permissions = ["fs__*"]`), and every call goes through scopes, approvals, taint, rate limits and the audit log, while the server itself runs confined.
+
+```bash
+python aios.py serve --home ~/aios-data --agent outside --policy policy.toml \
+    --mcp "fs=npx -y @modelcontextprotocol/server-filesystem /home/me/project" --confine-mcp fs \
+    --approvals console          # answer its risky calls in `aios console --approve` or on Telegram
+```
+
+- MCP tools always need a scope (`auto_args`) or a person: with nobody watching they are refused, never run silently.
+- The guard only covers what goes through it: turn off the other agent's own shell and file tools (or run it in a container without them), so AIOS is its only way to act.
+- Everything the other agent did is in `aios audit` / the console, under the `--agent` name.
+
 ## Talk to other agents (A2A)
 
 [A2A](https://a2a-protocol.org) lets agents from different vendors call each other. aios speaks both versions in use, 1.0 and 0.3 (JSON-RPC), and was checked against the official `a2a-sdk` in both directions.
@@ -410,7 +436,7 @@ AIOS_A2A_TOKEN_RESEARCH=<token> python aios.py chat --a2a research=http://127.0.
 - **Push notifications** are off unless you name where they may go: `a2a-serve --push-to 'https://hooks.example.com/a2a/*'` (repeatable; a fixed `http(s)://host/` then a path pattern). A caller then registers a URL for a task (`CreateTaskPushNotificationConfig` / `tasks/pushNotificationConfig/set`, or in the send's `configuration`) and the finished task is POSTed there once: completed, failed, rejected or canceled. Its `token` comes in the `X-A2A-Notification-Token` header and `authentication` as `Authorization`. URLs outside your patterns are refused. A host name must resolve only to public addresses, and the POST goes to the address that was checked. To reach a local or private service, put its literal address (or `localhost`) in the pattern. Redirects are not followed, and a token or credentials are never sent over plain `http` except to this machine. At most 4 configs per task; credentials are never sent back by Get/List. Checked with the official a2a-sdk client in both versions.
 - Not supported yet: files.
 
-## Agents as chat bots (Telegram)
+## Agents as chat bots (Telegram, Discord, LINE)
 
 Let people talk to an agent where they already are: tag it under a post in a group and it answers in the thread, like the AI assistants you can tag on social media.
 
@@ -426,6 +452,22 @@ python aios.py bot --policy policy.example.toml --agent researcher --allow-chat 
 - **Security**: everyone in a chat is a stranger to the agent, as with A2A. Each question is a fresh run of the policy agent, tainted from the start, with nobody to approve: tools that need approval are refused, and `auto_paths`/`auto_args` never apply. Without `--policy` it gets only the read-only tools. Answers are plain text, never parsed as Markdown/HTML. Every run is audited under the agent's name.
 - **Cost**: each answer is capped (20,000 tokens by default, `--max-tokens`), each person gets `--per-user N` answers an hour (default 20), and all chats together share a daily budget (200,000 tokens by default; `--daily-max-tokens` / `--daily-max-cost`). Once it is used up the bot says so instead of calling the model. With a local model nothing is spent.
 - Chat text goes to the model you choose: use a local model for private chats. `--parallel N` answers N questions at once (default 2), `--timeout` caps one answer (default 300 s). Thread memory is kept in memory only (the last 2000 answers) and forgotten on restart. Standard library only.
+
+**Discord and LINE.** The same bot runs on other platforms with `--platform`; the rules above (when it answers, what it sees, security, cost) are identical.
+
+```bash
+export AIOS_DISCORD_TOKEN=...          # Developer Portal > your app > Bot (invite it with Send Messages + Read Message History)
+python aios.py bot --platform discord --policy policy.example.toml --agent researcher --allow-chat 1234567890 \
+    --provider openai --model gemma4:12b
+
+export AIOS_LINE_TOKEN=... AIOS_LINE_SECRET=...   # LINE Developers > Messaging API channel
+python aios.py bot --platform line --policy policy.example.toml --agent researcher --allow-chat C0123... \
+    --provider openai --model gemma4:12b
+cloudflared tunnel --url http://127.0.0.1:8790    # then set Webhook URL = https://<tunnel>/line in LINE Developers
+```
+
+- **Discord**: `--allow-chat` takes channel ids (Developer Mode > right-click > Copy Channel ID). It connects to the gateway over a WebSocket written with the standard library and needs no privileged intent unless you use `--context` (then turn on Message Content Intent). Answers are replies with mentions switched off, so nothing the model writes can ping `@everyone`, a role or a person. `$HTTPS_PROXY` is honoured.
+- **LINE**: LINE calls a webhook, so the bot listens on `127.0.0.1:--port` (default 8790) and you expose it with a tunnel. Every call must carry a valid `X-Line-Signature` (HMAC with the channel secret), others get 401. Chat ids are group `C...`, room `R...` or user `U...` ids; the log prints the id of a chat that is not allowed yet. Answers use the free reply API and quote the question; an answer slower than the reply token lives (about a minute) goes out with the push API, which counts against the account's monthly quota (`--no-push` drops it instead).
 
 ## Agent swarms
 
@@ -603,13 +645,13 @@ Months are relative estimates (month 1 = project start) and will move.
 |---|---|---|---|
 | **P0 Foundations** | month 1 | Automated tests · audit log · human approval for risky tools · cost/step budgets · model-provider abstraction (incl. local models) | Every action is traceable; budget overruns stop the run |
 | **P1 Secure core** | months 1–2 | ✅ capability scopes (paths, call caps, argument rules) · ✅ untrusted-content tagging + taint policy · ✅ prompt-injection test suite · ✅ memory provenance and timestamps · ✅ skill pinning, scanning and OpenSSH publisher signatures · ✅ memory search (BM25 keywords, optional vectors) · ✅ run as an MCP server (`aios serve`; checked with the official SDK client, 1.x and 2.x) · ✅ loop guard (`--max-repeats`) · ✅ workspace undo (`aios undo`) | Passes our own injection test suite (done for the worst-case model); P1 is feature-complete, real-world testing is still open |
-| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits, multi-core with `--workers`, multi-machine with `--nodes` + `aios node`, runs move between nodes with `transfer = true`) · ✅ chat bots (`aios bot`: @mention an agent in Telegram, it replies in the thread) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals and a 3D office) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) · ✅ self-improvement (`aios improve`: eval-gated playbooks, live, rollback) · ✅ self-supervision (`aios supervisor`: pauses / holds on its own, released only by a person) | Multi-agent in one command; real isolation on Windows |
+| **P2 Expansion** | months 3–4 | ✅ multi-agent delegation (`agent__<name>`) · ✅ agent swarms (`swarm`, `aios swarm`: high concurrency under shared limits, multi-core with `--workers`, multi-machine with `--nodes` + `aios node`, runs move between nodes with `transfer = true`) · ✅ chat bots (`aios bot`: @mention an agent in Telegram, Discord or LINE, it replies in the thread) · ✅ A2A (serve and call agents, protocol 1.0 and 0.3, multi-turn, streaming and resubscribe, background tasks and cancel, push notifications) · ✅ schedules (`aios jobs`/`daemon`) · ✅ file-change and webhook triggers · ✅ local web console (with browser approvals and a 3D office) · pluggable sandbox backends (✅ Docker · ✅ Windows AppContainer · 🧪 Firecracker microVM, verified only in its own CI job) · ✅ multimodal input (images and PDFs: `/attach`, `view_file`, MCP screenshots) · ✅ self-improvement (`aios improve`: eval-gated playbooks, live, rollback) · ✅ self-supervision (`aios supervisor`: pauses / holds on its own, released only by a person) | Multi-agent in one command; real isolation on Windows |
 | **P3 Ecosystem** | months 6–9 | ✅ signed skill registry (publisher signatures, static `index.json` registry, `publish`/`search`/`install`) · ✅ public registry on Cloudflare Pages, built from `registry/` · optional hosted version | External contributors ship skills |
 | **P4 OS layer** | month 12+ | WSL image / Linux distro · system service · mobile companion | Decide based on earlier results |
 
 Explicit non-goal for now: writing an actual OS kernel.
 
-Packaging note: the name `aios-core` is already taken on PyPI (by [agiresearch/AIOS](https://github.com/agiresearch/AIOS), since 2024-11), so a PyPI release needs a different package name. Until then, install from GitHub as shown above.
+Packaging note: the PyPI package is **`aios-os`** (`pip install "aios-os[all]"`; the command is still `aios`), because `aios-core` on PyPI belongs to [agiresearch/AIOS](https://github.com/agiresearch/AIOS). Each new version is published by the release workflow once PyPI trusted publishing is set up (see `.github/workflows/release.yml`); until the first upload, install from GitHub as shown above.
 
 Detailed tracking (gap analysis, per-item status, Gantt chart): [`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx).
 

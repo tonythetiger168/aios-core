@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Chat bots on Discord and LINE** (`aios bot --platform discord|line`): the same BotCore as the
+  Telegram bot (mentions, `/ask`, replies to its answers, quoted posts, tainted runs, per-user and
+  daily limits). Discord uses a standard-library WebSocket to the gateway, needs no privileged intent
+  without `--context`, and sends replies with mentions switched off. LINE listens for signed
+  webhook calls on `127.0.0.1:--port` (expose it with a tunnel), answers with the free reply API and
+  falls back to push for slow answers (`--no-push` to drop them). `--allow-chat` now takes text ids.
+- **Site: "Why AIOS" comparison** (`#compare` on the product page): AIOS next to OpenFang, OpenClaw,
+  OpenHands, Letta and the Rutgers research AIOS on isolation, injection defence (measured 0/27),
+  audit, multi-machine, self-improvement, chat platforms, local models and price, with an honest
+  note on where the others lead.
+- **PyPI name `aios-os`**: the package is renamed from `aios-core` (taken on PyPI by another
+  project); the command stays `aios`. The release workflow uploads each released tag to PyPI with
+  trusted publishing once the owner enables it (`PYPI_PUBLISH` repository variable).
+- **Guard another agent** (`aios serve --mcp NAME=CMD`, with `--confine-mcp` / `--offline-mcp` /
+  `--mcp-egress`): AIOS sits between an outside agent (OpenClaw, OpenHands, Claude Desktop, ...) and
+  its MCP servers. The agent sees a server's tools only as the policy grants them, every call goes
+  through scopes, approvals (`--approvals console`), taint, rate limits and the audit log, and the
+  server runs confined. A server that does not start means nothing is served.
+- **Sleep-time memory consolidation** (`aios memory consolidate | proposals | accept | reject`,
+  `aios daemon --consolidate-every HOURS`): exact duplicates for free, and with a local model also
+  merges of overlapping notes, always as proposals a person accepts. Accepting archives the old
+  notes and writes the merged one as the person's; stale proposals are refused; unverified notes are
+  never shown to the model. The daemon runs it only while no job runs and never with a paid API.
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the
