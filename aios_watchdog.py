@@ -40,7 +40,7 @@ CARRY_ENTRY = "(provenance)"  # aios.CARRY_ENTRY
 SEVERITY = {"tainted-refused": "critical", "unattended-refused": "warning", "refusal-spike": "warning",
             "budget-stop": "info", "loop-stop": "warning", "job-failing": "warning", "audit-tampered": "critical",
             "audit-sink-failing": "warning", "untrusted-args": "warning",
-            "improve-paused": "info", "improve-rollback": "warning", "budget-runaway": "warning"}
+            "improve-paused": "info", "memory-proposals": "info", "improve-rollback": "warning", "budget-runaway": "warning"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(

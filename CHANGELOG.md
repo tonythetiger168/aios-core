@@ -20,6 +20,11 @@
   its MCP servers. The agent sees a server's tools only as the policy grants them, every call goes
   through scopes, approvals (`--approvals console`), taint, rate limits and the audit log, and the
   server runs confined. A server that does not start means nothing is served.
+- **Sleep-time memory consolidation** (`aios memory consolidate | proposals | accept | reject`,
+  `aios daemon --consolidate-every HOURS`): exact duplicates for free, and with a local model also
+  merges of overlapping notes, always as proposals a person accepts. Accepting archives the old
+  notes and writes the merged one as the person's; stale proposals are refused; unverified notes are
+  never shown to the model. The daemon runs it only while no job runs and never with a paid API.
 - **Default local model is now Google Gemma 4** (`gemma4:e4b`, Apache 2.0) instead of Qwen 2.5: the
   Personal edition, the per-PR `ollama` CI job and the examples in the docs. `gemma4:12b` is the
   suggested step up on a 16 GB card. Injection results for five models are in the README; the
