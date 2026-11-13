@@ -80,7 +80,7 @@ Full list in [CHANGELOG.md](CHANGELOG.md); a self-audit against classical OS mec
 Requires Python 3.11+ and an [Anthropic API key](https://platform.claude.com/settings/keys) (or a local model, below). Run it from a checkout as `python aios.py`, or install the `aios` command (standard library only; the extras add the Anthropic SDK and the MCP SDK):
 
 ```bash
-pip install "aios-core[all] @ git+https://github.com/tonythetiger168/aios-core"   # then: aios chat, aios doctor, ...
+pip install "aios-os[all] @ git+https://github.com/tonythetiger168/aios-core"   # then: aios chat, aios doctor, ...
 ```
 
 From a checkout:
@@ -625,7 +625,7 @@ Months are relative estimates (month 1 = project start) and will move.
 
 Explicit non-goal for now: writing an actual OS kernel.
 
-Packaging note: the name `aios-core` is already taken on PyPI (by [agiresearch/AIOS](https://github.com/agiresearch/AIOS), since 2024-11), so a PyPI release needs a different package name. Until then, install from GitHub as shown above.
+Packaging note: the PyPI package is **`aios-os`** (`pip install "aios-os[all]"`; the command is still `aios`), because `aios-core` on PyPI belongs to [agiresearch/AIOS](https://github.com/agiresearch/AIOS). Each new version is published by the release workflow once PyPI trusted publishing is set up (see `.github/workflows/release.yml`); until the first upload, install from GitHub as shown above.
 
 Detailed tracking (gap analysis, per-item status, Gantt chart): [`docs/landscape-and-roadmap.xlsx`](docs/landscape-and-roadmap.xlsx).
 

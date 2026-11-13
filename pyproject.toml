@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aios-core"
+name = "aios-os"  # "aios-core" on PyPI belongs to another project (agiresearch/AIOS)
 version = "0.2.0"
 description = "Secure-by-default, local-first runtime for AI agents: scheduler, permissions, memory, sandboxed tools and MCP"
 readme = "README.md"
@@ -20,7 +20,9 @@ all = ["anthropic", "mcp"]
 aios = "aios:cli"
 
 [project.urls]
-Homepage = "https://github.com/tonythetiger168/aios-core"
+Homepage = "https://aios-registry-47b.pages.dev/"
+Source = "https://github.com/tonythetiger168/aios-core"
+Changelog = "https://github.com/tonythetiger168/aios-core/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 # every aios*.py module; tests/test_packaging.py fails when a new one is missing here
