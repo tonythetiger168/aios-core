@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **WebAssembly sandbox** (`--sandbox wasm`, `pip install "aios-os[wasm]"`): `run_python` in CPython
+  compiled to WASI under wasmtime, on any OS: no network, the workspace read-only, a throwaway
+  `/tmp`, fuel and memory budgets plus a timeout. The interpreter is pinned by SHA-256; asking for
+  it when it cannot run is an error, never a silent fallback. Verified by the new `wasm` CI job.
 - **Chat bots on Discord and LINE** (`aios bot --platform discord|line`): the same BotCore as the
   Telegram bot (mentions, `/ask`, replies to its answers, quoted posts, tainted runs, per-user and
   daily limits). Discord uses a standard-library WebSocket to the gateway, needs no privileged intent

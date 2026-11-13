@@ -14,6 +14,7 @@ dependencies = []  # standard library only; providers and MCP are extras
 [project.optional-dependencies]
 anthropic = ["anthropic"]
 mcp = ["mcp"]
+wasm = ["wasmtime==50.0.1"]
 all = ["anthropic", "mcp"]
 
 [project.scripts]
@@ -30,4 +31,4 @@ py-modules = ["aios", "aios_a2a", "aios_admit", "aios_appcontainer", "aios_audit
               "aios_discord", "aios_line",
               "aios_console", "aios_egress", "aios_export", "aios_fetch", "aios_improve", "aios_keeper", "aios_media", "aios_memory", "aios_office",
               "aios_microvm_init", "aios_node", "aios_schedule", "aios_service", "aios_skills", "aios_supervisor", "aios_swarm",
-              "aios_telegram", "aios_watchdog"]
+              "aios_telegram", "aios_wasm", "aios_watchdog"]
