@@ -3725,7 +3725,12 @@ class Gateway:
 
 
 async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str = ".",
-                approve_timeout: float | None = None):
+                approve_timeout: float | None = None, mcp_specs: list[str] | None = None,
+                confine_mcp=frozenset(), offline_mcp=frozenset(), egress_mcp: dict | None = None):
+    """`aios serve`: the governed tools to any MCP client. With --mcp it is also a guard in front of
+    other MCP servers: a client (another agent: OpenClaw, OpenHands, Claude Desktop, ...) that
+    connects to AIOS instead of to those servers gets their tools only as the policy grants them,
+    each call behind scopes, approvals, taint, rate limits and the audit log."""
     global WORKSPACE
     from mcp.server.lowlevel import Server  # pip install mcp
     from mcp.server.stdio import stdio_server
@@ -3739,6 +3744,17 @@ async def serve(agent_name: str = "mcp", policy: dict | None = None, home: str =
     # scope pre-allows them, or (--approvals console) a person answers them in the web console.
     k = Kernel(store=store, approver=ConsoleApprover(store, approve_timeout) if approve_timeout else None)
     install_builtin_tools(k)
+    if mcp_specs:  # guarded servers: granted through the policy ('<name>__*'), always behind a scope or a person
+        try:
+            for name in await attach_mcp(k, mcp_specs, confine_mcp, offline_mcp, egress_mcp):
+                if name not in confine_mcp:
+                    print(f"[aios] WARNING: MCP server '{name}' runs with all your rights; "
+                          f"--confine-mcp {name} keeps it away from your files", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 - a server that does not start: say so, serve nothing
+            print(f"[aios] --mcp: {type(e).__name__}: {e}", file=sys.stderr)
+            await k.close()
+            store.db.close()
+            return 1
     pol = (policy or {}).get(agent_name)
     explicit = bool(pol and pol["permissions"] is not None)
     agent = Agent(agent_name, set(pol["permissions"]) if explicit else set(SERVE_DEFAULT_TOOLS),
@@ -5076,6 +5092,7 @@ def parser() -> argparse.ArgumentParser:
     sv.add_argument("--agent", default="mcp", help="policy name to serve as (default: mcp)")
     sv.add_argument("--policy", help="TOML policy; without it only read-only tools are offered")
     sv.add_argument("--home", default=".", help="folder holding aios.db and workspace/ (default: current)")
+    add_mcp_flags(sv)  # guard other MCP servers: clients get their tools only through the policy
     aa = sub.add_parser("a2a-serve", help="let other agents call one of yours over the A2A protocol (127.0.0.1)")
     aa.add_argument("--agent", default="main", help="policy section to serve (default: main)")
     aa.add_argument("--policy", help="TOML policy; without it only read-only tools are offered")
@@ -5511,7 +5528,9 @@ def cli():
             except (OSError, ValueError) as e:
                 ap.error(f"--policy {a.policy}: {e}")
         try:
-            return asyncio.run(serve(a.agent, policy, a.home, approve_timeout(a, ap)))
+            check_mcp_flags(a, ap)
+            return asyncio.run(serve(a.agent, policy, a.home, approve_timeout(a, ap), a.mcp, set(a.confine_mcp),
+                                     set(a.offline_mcp), a.mcp_egress))
         except ImportError:
             ap.error("serve needs the MCP SDK: pip install mcp")
     provider, budget = build_model(a, ap)

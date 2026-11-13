@@ -284,6 +284,55 @@ class ServeGlueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(got["names"], {"now", "write_file"})
             self.assertEqual((Path(d) / "workspace" / "o" / "a.txt").read_text(encoding="utf-8"), "hi")
 
+    async def test_guards_other_mcp_servers(self):
+        """--mcp: an outside agent reaches another server's tools only through the policy and approvals."""
+        ran = []
+
+        async def fake_attach(k, specs, confine, offline, egress):
+            async def shell(**args):
+                ran.append(args)
+                return "done"
+            k.tools.register_raw("box__shell", "run a command", {"type": "object", "properties": {}}, shell,
+                                 untrusted=True)
+            k.tools.register_raw("box__peek", "read-only", {"type": "object", "properties": {}}, shell,
+                                 untrusted=True)
+            k.needs_approval.update({"box__shell", "box__peek"})  # as connect_mcp does for every MCP tool
+            self.attached = (specs, set(confine))
+            return ["box"]
+
+        pol = {"gw": {"permissions": {"now", "box__shell"}, "scopes": {}}}
+        got = {}
+
+        async def client(seen):
+            got["names"] = {t.name for t in await seen["list_tools"]()}
+            try:
+                await seen["call_tool"]("box__shell", {"cmd": "rm -rf ~"})
+            except RuntimeError as e:
+                got["error"] = str(e)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(aios, "attach_mcp", fake_attach):
+            _, _, stderr = await self.serve(d, client, agent_name="gw", policy=pol,
+                                            mcp_specs=["box=python box.py"], confine_mcp={"box"})
+            self.assertEqual(self.attached, (["box=python box.py"], {"box"}))
+            self.assertEqual(got["names"], {"now", "box__shell"})  # box__peek is not granted
+            self.assertIn("not approved", got["error"])  # nobody to ask, no scope: refused
+            self.assertEqual(ran, [])
+            self.assertNotIn("WARNING", stderr)  # confined
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                aios.audit_cmd(None, 10, d)
+            self.assertIn("box__shell", out.getvalue())
+            self.assertIn("denied", out.getvalue())
+
+    async def test_a_guarded_server_that_fails_to_start_serves_nothing(self):
+        async def broken(*a, **kw):
+            raise FileNotFoundError("no such program: box")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(aios, "attach_mcp", broken):
+            seen, _, stderr = await self.serve(d, mcp_specs=["box=nope"])
+            self.assertNotIn("ran", seen)
+            self.assertIn("--mcp: FileNotFoundError", stderr)
+
     async def test_audit_lands_in_the_home_database(self):
         async def client(seen):
             await seen["call_tool"]("now", {})
@@ -344,6 +393,11 @@ class CliTests(unittest.TestCase):
         r = self.run_cli("serve")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("pip install mcp", r.stderr)
+
+    def test_serve_takes_the_mcp_guard_flags(self):
+        r = self.run_cli("serve", "--confine-mcp", "box")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("names no --mcp server", r.stderr)
 
     def test_bad_policy_fails_before_serving(self):
         with tempfile.TemporaryDirectory() as d:
