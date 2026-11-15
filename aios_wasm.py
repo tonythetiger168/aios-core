@@ -48,8 +48,8 @@ wc.argv = ["python", "-I", "-c", job["code"]]
 wc.env = [["TMPDIR", "/tmp"], ["HOME", "/tmp"], ["PYTHONDONTWRITEBYTECODE", "1"]]
 wc.stdout_file = job["out"]
 wc.stderr_file = job["out"]
-wc.preopen_dir(job["workspace"], "/workspace", w.DirPerms.READ_ONLY, w.FilePerms.READ_ONLY)
-wc.preopen_dir(job["tmp"], "/tmp", w.DirPerms.READ_WRITE, w.FilePerms.READ_WRITE)
+wc.preopen_dir(job["workspace"], "/workspace", False)  # fs_mutable=False: read-only
+wc.preopen_dir(job["tmp"], "/tmp", True)
 store.set_wasi(wc)
 code = 0
 try:
@@ -58,9 +58,10 @@ except w.ExitTrap as e:
     code = e.code
 except w.Trap as e:
     msg = str(e).splitlines()[0] if str(e) else "trap"
-    code = 137 if "fuel" in msg else 134
+    fuel = getattr(e, "trap_code", None) == w.TrapCode.OUT_OF_FUEL or "fuel" in str(e).lower()
+    code = 137 if fuel else 134
     with open(job["out"], "a") as f:
-        f.write("\n[wasm] stopped: " + ("CPU budget (fuel) used up" if "fuel" in msg else msg))
+        f.write("\n[wasm] stopped: " + ("CPU budget (fuel) used up" if fuel else msg))
 except w.WasmtimeError as e:
     code = 134
     with open(job["out"], "a") as f:
@@ -137,8 +138,9 @@ class WasmSandbox:
                 await proc.wait()
                 return f"killed: timeout after {self.timeout}s"
             text = Path(out).read_text(encoding="utf-8", errors="replace")
-            if proc.returncode not in (0, 1) and err:  # the host side failed (bad module, wasmtime error)
-                text += "\n[wasm host] " + err.decode(errors="replace").strip().splitlines()[-1]
+            err = err.decode(errors="replace").strip()
+            if err:  # the guest writes only to the file: anything here is the host side failing
+                text += "\n[wasm host] " + err.splitlines()[-1]
             if len(text) > self.max_out:
                 text = text[:self.max_out] + f"\n... ({len(text) - self.max_out} more characters cut)"
             return f"exit={proc.returncode}\n{text}"

@@ -49,7 +49,7 @@ class SetupTests(unittest.TestCase):
         ws["p"] = "/later"
         job = box.job("print(1)", "/o", "/t")
         self.assertEqual((job["workspace"], job["tmp"], job["wasm"]), (str(Path("/later")), "/t", "/x/python.wasm"))
-        self.assertIn("READ_ONLY, w.FilePerms.READ_ONLY", aios_wasm.RUNNER)
+        self.assertIn('"/workspace", False)', aios_wasm.RUNNER)
         self.assertIn('"/workspace"', aios_wasm.RUNNER)
 
     def test_tool_description_names_the_backend(self):
